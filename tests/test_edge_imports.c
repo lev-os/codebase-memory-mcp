@@ -894,6 +894,74 @@ TEST(ei_py_external_import_never_binds_project_symbol) {
     PASS();
 }
 
+/* A JS/TS import specifier names a module, never a symbol. A bare specifier
+ * that module resolution misses (`path`, a dependency outside the graph) is
+ * external: Strategy 3 bound it to any project symbol named like a path
+ * segment (`path` -> Router.path(), `@acme/config` -> a function `config`),
+ * and every call of the imported name became an import_map CALLS edge at
+ * 0.95. A pnpm workspace package whose exports point at gitignored dist/
+ * must resolve through its TypeScript source condition, subpaths included,
+ * so the real function keeps both callers. */
+static int ei_ts_bare_specifier_case(int pad) {
+    enum { EI_TSB_BASE = 10, EI_TSB_MAX = EI_TSB_BASE + 64 };
+    static char names[EI_TSB_MAX][32];
+    EILangFile f[EI_TSB_MAX];
+    int n = 0;
+    f[n++] = (EILangFile){"pnpm-workspace.yaml", "packages:\n  - 'pkgs/*'\n"};
+    f[n++] = (EILangFile){"package.json", "{\"name\":\"root\",\"private\":true}\n"};
+    f[n++] = (EILangFile){
+        "pkgs/config/package.json",
+        "{\"name\":\"@acme/config\",\"type\":\"module\",\"exports\":{"
+        "\".\":{\"types\":\"./src/index.ts\",\"import\":\"./dist/index.js\"},"
+        "\"./xdg-paths\":{\"types\":\"./src/xdg-paths.ts\",\"import\":\"./dist/xdg-paths.js\"}}}\n"};
+    f[n++] = (EILangFile){"pkgs/config/src/xdg-paths.ts",
+                          "export function getStatePath(): string { return '/state'; }\n"};
+    f[n++] = (EILangFile){"pkgs/config/src/index.ts", "export { getStatePath } from './xdg-paths';\n"};
+    f[n++] = (EILangFile){"pkgs/app/src/use-subpath.ts",
+                          "import { getStatePath } from '@acme/config/xdg-paths';\n"
+                          "export function viaSubpath(): string { return getStatePath(); }\n"};
+    f[n++] = (EILangFile){"pkgs/app/src/use-root.ts",
+                          "import { getStatePath } from '@acme/config';\n"
+                          "export function viaRoot(): string { return getStatePath(); }\n"};
+    f[n++] = (EILangFile){"pkgs/app/src/use-node.ts",
+                          "import { join } from 'path';\n"
+                          "export function joined(): string { return join('a', 'b'); }\n"};
+    f[n++] = (EILangFile){"pkgs/other/src/decoy.ts",
+                          "export function config(flow: string): number { return flow.length; }\n"};
+    f[n++] = (EILangFile){"pkgs/other/src/router.ts",
+                          "export class Router { path(): string { return '/'; } }\n"};
+    for (int i = 0; i < pad && n < EI_TSB_MAX; i++) {
+        snprintf(names[n], sizeof(names[n]), "pad/mod_%02d.ts", i);
+        f[n] = (EILangFile){names[n], "export function filler(): number { return 0; }\n"};
+        n++;
+    }
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, n);
+    int bad = store ? ei_inbound_edges_on(store, lp.project, "path", "Method", "IMPORTS") : -1;
+    bad += store ? ei_inbound_edges_on(store, lp.project, "path", "Method", "CALLS") : 0;
+    bad += store ? ei_inbound_edges_on(store, lp.project, "config", "Function", "IMPORTS") : 0;
+    bad += store ? ei_inbound_edges_on(store, lp.project, "config", "Function", "CALLS") : 0;
+    int good =
+        store ? ei_inbound_edges_on(store, lp.project, "getStatePath", "Function", "CALLS") : -1;
+    int ok = bad == 0 && good >= 2;
+    if (!ok) {
+        fprintf(stderr,
+                "  [ts bare specifier pad=%d] decoy IMPORTS+CALLS=%d (want 0); "
+                "getStatePath CALLS=%d (want >=2)\n",
+                pad, bad, good);
+    }
+    ei_cleanup(&lp, store);
+    return ok;
+}
+
+TEST(ei_ts_bare_specifier_never_binds_project_symbol) {
+    int sequential_ok = ei_ts_bare_specifier_case(0);
+    int parallel_ok = ei_ts_bare_specifier_case(60);
+    ASSERT_TRUE(sequential_ok);
+    ASSERT_TRUE(parallel_ok);
+    PASS();
+}
+
 /* Base-class helper: INHERITS edges out of the (single) Class named `src`
  * (return value), and how many land on a node whose QN ends with
  * `want_qn_suffix` (*to_want); -1 when the class is missing. */
@@ -2514,6 +2582,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_go_two_consumers_same_package);
     RUN_TEST(ei_go_import_never_binds_symbol);
     RUN_TEST(ei_py_external_import_never_binds_project_symbol);
+    RUN_TEST(ei_ts_bare_specifier_never_binds_project_symbol);
     RUN_TEST(ei_py_external_base_never_inherits_project_class);
     RUN_TEST(ei_cpp_header_include_targets_header_file);
 

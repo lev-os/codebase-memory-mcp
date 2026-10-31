@@ -247,13 +247,49 @@ static char *extract_quoted(const char *p, const char *end) {
 
 /* ── Language-specific manifest parsers ────────────────────────── */
 
-/* Resolve JS/TS entry point from exports["."] object. */
+/* A TypeScript source file, not a declaration file (.d.ts / .d.mts / .d.cts). */
+static bool is_ts_source_path(const char *p) {
+    if (!p) {
+        return false;
+    }
+    size_t n = strlen(p);
+    static const char *decl[] = {".d.ts", ".d.mts", ".d.cts", NULL};
+    for (const char **d = decl; *d; d++) {
+        size_t dl = strlen(*d);
+        if (n >= dl && strcmp(p + n - dl, *d) == 0) {
+            return false;
+        }
+    }
+    static const char *src[] = {".ts", ".tsx", ".mts", ".cts", NULL};
+    for (const char **s = src; *s; s++) {
+        size_t sl = strlen(*s);
+        if (n > sl && strcmp(p + n - sl, *s) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Resolve the JS/TS target of one exports entry (exports["."] or a subpath).
+ * A condition that names a TypeScript source file wins: in a source-first
+ * workspace "types" points at src/ while "import" points at gitignored build
+ * output that has no graph node (#1732). Otherwise the runtime conditions. */
 static const char *resolve_exports_dot(yyjson_val *dot) {
     if (yyjson_is_str(dot)) {
         return yyjson_get_str(dot);
     }
     if (!yyjson_is_obj(dot)) {
         return NULL;
+    }
+    size_t ci;
+    size_t cmax;
+    yyjson_val *ck;
+    yyjson_val *cv;
+    yyjson_obj_foreach(dot, ci, cmax, ck, cv) {
+        (void)ck;
+        if (yyjson_is_str(cv) && is_ts_source_path(yyjson_get_str(cv))) {
+            return yyjson_get_str(cv);
+        }
     }
     static const char *keys[] = {"import", "default", "require"};
     for (int i = 0; i < (int)(sizeof(keys) / sizeof(keys[0])); i++) {
@@ -309,14 +345,42 @@ static void parse_package_json(const char *source, int source_len, const char *r
     }
 
     const char *entry = resolve_pkg_entry(root);
-    if (entry) {
-        char *dir = path_dirname(rel_path);
+    char *dir = path_dirname(rel_path);
+    if (entry && dir) {
         char *resolved = join_and_strip(dir, entry);
         if (resolved) {
             pkg_entries_push(entries, strdup(name), resolved);
         }
-        free(dir);
     }
+
+    /* Subpath exports: `"./xdg-paths": {...}` makes `<name>/xdg-paths` an
+     * importable specifier with its own target. Without it the subpath was
+     * glued onto the root entry's QN and named no node. Star patterns are
+     * left to the existing prefix fallback. */
+    yyjson_val *exports = yyjson_obj_get(root, "exports");
+    if (dir && yyjson_is_obj(exports)) {
+        size_t ei;
+        size_t emax;
+        yyjson_val *ek;
+        yyjson_val *ev;
+        yyjson_obj_foreach(exports, ei, emax, ek, ev) {
+            const char *sub = yyjson_get_str(ek);
+            if (!sub || sub[0] != '.' || sub[SKIP_ONE] != '/' || strchr(sub, '*')) {
+                continue;
+            }
+            const char *target = resolve_exports_dot(ev);
+            if (!target) {
+                continue;
+            }
+            char key[PKGMAP_PATH_BUF];
+            snprintf(key, sizeof(key), "%s%s", name, sub + SKIP_ONE);
+            char *resolved = join_and_strip(dir, target);
+            if (resolved) {
+                pkg_entries_push(entries, strdup(key), resolved);
+            }
+        }
+    }
+    free(dir);
 
     yyjson_doc_free(doc);
 }
@@ -1819,6 +1883,44 @@ bool cbm_import_symbol_fallback_allowed(CBMLanguage lang) {
     return lang != CBM_LANG_GO;
 }
 
+/* A JS/TS import specifier always names a module, never a symbol: the
+ * imported names live in local_name. A bare specifier (`path`, `node:fs`,
+ * `@scope/pkg/sub`) that Strategy 1 (relative path, tsconfig paths, package
+ * manifests) did not resolve is a Node built-in or a dependency outside the
+ * graph, and the correct result is NO edge. The name-guess fallbacks instead
+ * matched a path segment against any project symbol (`path` -> Router.path(),
+ * `@acme/config` -> a test's local `config`), and the import map then sent
+ * every call of the imported name there at import_map confidence. */
+static bool js_external_bare_specifier(CBMLanguage lang, const char *module_path) {
+    if (lang != CBM_LANG_JAVASCRIPT && lang != CBM_LANG_TYPESCRIPT && lang != CBM_LANG_TSX) {
+        return false;
+    }
+    if (!module_path || !module_path[0]) {
+        return false;
+    }
+    if (strncmp(module_path, "node:", strlen("node:")) == 0) {
+        return true;
+    }
+    /* Only an npm package-name shape: `pkg[/sub]` or `@scope/pkg[/sub]`.
+     * Bundler aliases (`@/x`, `~/x`) and `#x` subpath imports keep the
+     * fallbacks, since no package name spells them. */
+    const char *s = module_path;
+    if (*s == '@') {
+        s++;
+        if (!isalnum((unsigned char)*s)) {
+            return false;
+        }
+        while (*s && *s != '/') {
+            s++;
+        }
+        if (*s != '/') {
+            return false;
+        }
+        s++;
+    }
+    return isalnum((unsigned char)*s) != 0;
+}
+
 /* A Python def or class declared inside a function body -- a closure, a
  * decorator's `wrapper`, a test's local class -- is a local of that function:
  * no import can name it. Its QN extends a Function/Method node's
@@ -2412,6 +2514,11 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
             }
         }
         return target;
+    }
+
+    /* A bare JS/TS specifier Strategy 1 missed is external: no edge. */
+    if (js_external_bare_specifier(src_lang, imp->module_path)) {
+        return NULL;
     }
 
     /* Name-guess fallbacks below (Strategy 1b sibling-file, Strategy 3
