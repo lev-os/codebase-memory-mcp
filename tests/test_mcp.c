@@ -9316,6 +9316,8 @@ TEST(trace_evidence_strategy_class_vocabulary_is_closed) {
         ASSERT_NOT_NULL(cls);
         ASSERT_STR_EQ(cls, "heuristic");
     }
+    ASSERT_STR_EQ(cbm_mcp_edge_strategy_class("suffix_match"), "name_guess");
+    ASSERT_STR_EQ(cbm_mcp_edge_strategy_class("unique_name"), "name_guess");
     /* A failed LSP resolution is reported as unresolved, not as "lsp" — the
      * caller's question is whether the edge is trustworthy, and "we tried LSP
      * and it did not resolve" answers no. */
