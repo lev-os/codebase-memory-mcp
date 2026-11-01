@@ -1,0 +1,42 @@
+name: Sync upstream into lev
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-lev
+  cancel-in-progress: false
+
+jobs:
+  merge-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: lev
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+
+      - name: Merge upstream main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/DeusData/codebase-memory-mcp.git
+          git fetch upstream main
+          git merge --no-edit upstream/main
+
+      - name: Build merged source
+        env:
+          MAKEFLAGS: -j6
+        run: scripts/build.sh
+
+      - name: Publish lev branch
+        run: git push origin HEAD:lev
