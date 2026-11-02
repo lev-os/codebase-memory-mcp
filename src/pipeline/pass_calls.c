@@ -1035,6 +1035,168 @@ static const cbm_gbuf_node_t *calls_field_target(cbm_pipeline_ctx_t *ctx, const 
     return target_node;
 }
 
+/* ── Java build roots (see pipeline_internal.h) ─────────────────────
+ *
+ * This thread's answers, keyed by the repository-relative directory and
+ * valued by its build root ("" = the repository root, or no build file
+ * anywhere above). tl_br_repo names the repository they belong to. */
+static CBM_TLS CBMHashTable *tl_br_cache;
+static CBM_TLS char *tl_br_repo;
+
+static void br_free_entry(const char *key, void *value, void *ud) {
+    (void)ud;
+    free((void *)key);
+    free(value);
+}
+
+void cbm_pipeline_build_root_cache_clear(void) {
+    if (tl_br_cache) {
+        cbm_ht_foreach(tl_br_cache, br_free_entry, NULL);
+        cbm_ht_free(tl_br_cache);
+        tl_br_cache = NULL;
+    }
+    free(tl_br_repo);
+    tl_br_repo = NULL;
+}
+
+static bool br_dir_has_build_file(const char *repo_path, const char *dir) {
+    static const char *const files[] = {"settings.gradle", "settings.gradle.kts", "build.gradle",
+                                        "build.gradle.kts", "pom.xml"};
+    char path[CBM_SZ_4K];
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        int n = snprintf(path, sizeof(path), "%s%s%s/%s", repo_path, dir[0] ? "/" : "", dir,
+                         files[i]);
+        if (n <= 0 || (size_t)n >= sizeof(path)) {
+            continue;
+        }
+        cbm_path_info_t info;
+        if (cbm_path_info_utf8(path, &info) == CBM_PATH_INFO_OK && info.is_regular) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The build root of repository-relative directory `dir` (cached). NULL only
+ * when memory runs out. */
+static const char *br_root_of_dir(const char *repo_path, const char *dir) {
+    if (!tl_br_repo || strcmp(tl_br_repo, repo_path) != 0) {
+        cbm_pipeline_build_root_cache_clear();
+        tl_br_repo = strdup(repo_path);
+        tl_br_cache = cbm_ht_create(CBM_SZ_256);
+        if (!tl_br_repo || !tl_br_cache) {
+            cbm_pipeline_build_root_cache_clear();
+            return NULL;
+        }
+    }
+    const char *hit = cbm_ht_get(tl_br_cache, dir);
+    if (hit) {
+        return hit;
+    }
+    const char *root = NULL;
+    char *owned = NULL;
+    if (br_dir_has_build_file(repo_path, dir)) {
+        owned = strdup(dir);
+    } else if (dir[0]) {
+        char parent[CBM_SZ_4K];
+        snprintf(parent, sizeof(parent), "%s", dir);
+        char *slash = strrchr(parent, '/');
+        if (slash) {
+            *slash = '\0';
+        } else {
+            parent[0] = '\0';
+        }
+        root = br_root_of_dir(repo_path, parent);
+        owned = root ? strdup(root) : NULL;
+    } else {
+        owned = strdup("");
+    }
+    char *key = strdup(dir);
+    if (!owned || !key) {
+        free(owned);
+        free(key);
+        return NULL;
+    }
+    cbm_ht_set(tl_br_cache, key, owned);
+    return owned;
+}
+
+/* Build root of a repository-relative file path, copied into out. */
+static bool br_root_of_file(const char *repo_path, const char *rel, char *out, size_t out_size) {
+    char dir[CBM_SZ_4K];
+    int n = snprintf(dir, sizeof(dir), "%s", rel);
+    if (n < 0 || (size_t)n >= sizeof(dir)) {
+        return false;
+    }
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        *slash = '\0';
+    } else {
+        dir[0] = '\0';
+    }
+    const char *root = br_root_of_dir(repo_path, dir);
+    if (!root) {
+        return false;
+    }
+    n = snprintf(out, out_size, "%s", root);
+    return n >= 0 && (size_t)n < out_size;
+}
+
+const cbm_gbuf_node_t *cbm_pipeline_java_same_build_root(const cbm_gbuf_t *gbuf,
+                                                         const char *project,
+                                                         const char *repo_path, CBMLanguage lang,
+                                                         const char *caller_rel,
+                                                         const cbm_gbuf_node_t *target) {
+    if (lang != CBM_LANG_JAVA || !gbuf || !project || !repo_path || !repo_path[0] ||
+        !caller_rel || !target || !target->file_path || !target->qualified_name ||
+        !target->name || !target->label) {
+        return target;
+    }
+    char croot[CBM_SZ_4K];
+    char troot[CBM_SZ_4K];
+    if (!br_root_of_file(repo_path, caller_rel, croot, sizeof(croot)) ||
+        !br_root_of_file(repo_path, target->file_path, troot, sizeof(troot)) ||
+        strcmp(croot, troot) == 0) {
+        return target;
+    }
+    /* The target's path below its build root, and its QN below the root's
+     * folder QN: both must be moved together. */
+    size_t tlen = strlen(troot);
+    const char *rest = target->file_path + tlen;
+    if (tlen > 0) {
+        if (strncmp(target->file_path, troot, tlen) != 0 || *rest != '/') {
+            return target;
+        }
+        rest++;
+    }
+    char *tprefix = cbm_pipeline_fqn_folder(project, troot);
+    char *cprefix = cbm_pipeline_fqn_folder(project, croot);
+    const cbm_gbuf_node_t *better = target;
+    size_t plen = tprefix ? strlen(tprefix) : 0;
+    if (tprefix && cprefix && plen > 0 && strncmp(target->qualified_name, tprefix, plen) == 0 &&
+        target->qualified_name[plen] == '.') {
+        const char *tail = target->qualified_name + plen;
+        size_t need = strlen(cprefix) + strlen(tail) + SKIP_ONE;
+        char *qn = malloc(need);
+        if (qn) {
+            snprintf(qn, need, "%s%s", cprefix, tail);
+            const cbm_gbuf_node_t *cand = cbm_gbuf_find_by_qn(gbuf, qn);
+            char want[CBM_SZ_4K];
+            int n = snprintf(want, sizeof(want), "%s%s%s", croot, croot[0] ? "/" : "", rest);
+            if (cand && cand != target && n > 0 && (size_t)n < sizeof(want) && cand->file_path &&
+                strcmp(cand->file_path, want) == 0 && cand->name &&
+                strcmp(cand->name, target->name) == 0 && cand->label &&
+                strcmp(cand->label, target->label) == 0) {
+                better = cand;
+            }
+            free(qn);
+        }
+    }
+    free(tprefix);
+    free(cprefix);
+    return better;
+}
+
 static bool calls_emit_lsp_target(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                   const CBMResolvedCall *lsp, bool allow_tail, CBMLanguage lang,
                                   const CBMImportArray *imports, const cbm_gbuf_node_t *source_node,
@@ -1051,6 +1213,9 @@ static bool calls_emit_lsp_target(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                                                     lsp->callee_qn, allow_tail)
                               : cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name,
                                                              lsp->callee_qn, allow_tail);
+    /* The caller's own build module first. MUST match pass_parallel.c. */
+    target_node = cbm_pipeline_java_same_build_root(ctx->gbuf, ctx->project_name, ctx->repo_path,
+                                                    lang, source_node->file_path, target_node);
     if (!target_node || source_node->id == target_node->id) {
         return false;
     }
@@ -1370,6 +1535,12 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     }
 
     const cbm_gbuf_node_t *target_node = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+    /* The caller's own build module first. MUST match pass_parallel.c. */
+    target_node = cbm_pipeline_java_same_build_root(ctx->gbuf, ctx->project_name, ctx->repo_path,
+                                                    lang, source_node->file_path, target_node);
+    if (target_node) {
+        res.qualified_name = target_node->qualified_name;
+    }
     if (!target_node || source_node->id == target_node->id) {
         return 0;
     }
@@ -1523,6 +1694,8 @@ static CBMFileResult *calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx,
 
 int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count) {
     cbm_log_info("pass.start", "pass", "calls", "files", itoa_log(file_count));
+    /* Build files may have changed since the last run on this thread. */
+    cbm_pipeline_build_root_cache_clear();
 
     /* ObjectScript: build the method-return-type table from the definitions
      * already in the graph buffer so `Set x = obj.Method()` can resolve x's

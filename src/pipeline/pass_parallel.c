@@ -3671,6 +3671,16 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         } else {
             target_node = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
         }
+        /* The caller's own build module first. MUST match pass_calls.c. */
+        if (target_node) {
+            const cbm_gbuf_node_t *own = cbm_pipeline_java_same_build_root(
+                rc->main_gbuf, rc->project_name, rc->repo_path, lang, source_node->file_path,
+                target_node);
+            if (own != target_node) {
+                target_node = own;
+                res.qualified_name = own->qualified_name;
+            }
+        }
         atomic_fetch_add_explicit(&rc->time_ns_rc_target, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         /* A call that resolved onto a struct Field: refused across languages
@@ -4376,6 +4386,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
     cbm_service_pattern_cache_begin();
     cbm_pxc_thread_scratch_begin();
     file_node_cache_clear();
+    cbm_pipeline_build_root_cache_clear();
 
     while (SKIP_ONE) {
         int file_idx =
@@ -4693,6 +4704,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
     cbm_service_pattern_cache_end();
     cbm_pxc_thread_scratch_end();
     file_node_cache_clear();
+    cbm_pipeline_build_root_cache_clear();
 }
 
 int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
