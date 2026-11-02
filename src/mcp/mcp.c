@@ -644,7 +644,8 @@ static const tool_def_t TOOLS[] = {
      "\"description\":\"tree chooses smaller complete direct/grouped output; json uses stable "
      "grouped tables.\"},"
      "\"include_evidence\":{\"type\":\"boolean\",\"default\":false,"
-     "\"description\":\"Add resolver class and confidence.\"}},"
+     "\"description\":\"Add resolver class and confidence; name_guess marks "
+     "suffix_match and unique_name edges.\"}},"
      "\"required\":[\"function_name\",\"project\"]}"},
 
     {"get_code_snippet",
@@ -9382,8 +9383,11 @@ const char *cbm_mcp_edge_strategy_class(const char *strategy) {
     if (strncmp(strategy, "php_", 4) == 0 || strncmp(strategy, "perl_", 5) == 0) {
         return "language_rule";
     }
+    if (strcmp(strategy, "suffix_match") == 0 || strcmp(strategy, "unique_name") == 0) {
+        return "name_guess";
+    }
     /* Everything else is a name/shape heuristic: callee_suffix,
-     * field_type_hint, service_pattern, fastapi_depends, unique_name, ... */
+     * field_type_hint, service_pattern, fastapi_depends, ... */
     return "heuristic";
 }
 
