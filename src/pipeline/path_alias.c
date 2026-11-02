@@ -173,8 +173,14 @@ static int cmp_scope_by_specificity(const void *a, const void *b) {
 /* Parse compilerOptions.paths and compilerOptions.baseUrl into an alias map.
  * dir_prefix is the directory of the config file relative to the repo root
  * (e.g. "apps/manager", or "" for repo root). Returns NULL if the file is
- * missing, malformed, or has neither a usable paths block nor a baseUrl. */
-static cbm_path_alias_map_t *load_tsconfig_file(const char *abs_path, const char *dir_prefix) {
+ * missing, malformed, or has neither a usable paths block nor a baseUrl.
+ * When has_extends is non-NULL it is set to true if the file declares a
+ * top-level "extends" (the loader does not follow it). */
+static cbm_path_alias_map_t *load_tsconfig_file(const char *abs_path, const char *dir_prefix,
+                                                bool *has_extends) {
+    if (has_extends) {
+        *has_extends = false;
+    }
     FILE *f = cbm_fopen(abs_path, "r");
     if (!f) {
         return NULL;
@@ -202,6 +208,9 @@ static cbm_path_alias_map_t *load_tsconfig_file(const char *abs_path, const char
         return NULL;
     }
     yyjson_val *root = yyjson_doc_get_root(doc);
+    if (has_extends && yyjson_obj_get(root, "extends")) {
+        *has_extends = true;
+    }
     yyjson_val *compiler_opts = yyjson_obj_get(root, "compilerOptions");
     if (!compiler_opts) {
         yyjson_doc_free(doc);
@@ -380,6 +389,7 @@ char *cbm_path_alias_resolve(const cbm_path_alias_map_t *map, const char *module
 typedef struct {
     char abs[CBM_SZ_512];
     char rel[CBM_SZ_256];
+    char fallback_abs[CBM_SZ_512]; /* jsconfig.json beside a tsconfig.json, or "" */
 } alias_config_hit_t;
 
 static const char *const TS_CONFIG_NAMES[] = {"tsconfig.json", "jsconfig.json"};
@@ -396,18 +406,28 @@ static void find_alias_files(const char *abs_dir, const char *rel_dir, alias_con
         return;
     }
 
-    /* One config file per directory: prefer tsconfig.json over jsconfig.json. */
+    /* One config file per directory: prefer tsconfig.json over jsconfig.json.
+     * A jsconfig.json beside the tsconfig.json is kept as the fallback the
+     * loader uses when the tsconfig.json declares no paths. */
+    bool found = false;
     for (int i = 0; i < TS_CONFIG_NAMES_COUNT && *count < max_count; i++) {
         char check[CBM_SZ_512];
         snprintf(check, sizeof(check), "%s/%s", abs_dir, TS_CONFIG_NAMES[i]);
         FILE *f = cbm_fopen(check, "r");
-        if (f) {
-            fclose(f);
-            snprintf(out[*count].abs, sizeof(out[*count].abs), "%s", check);
-            snprintf(out[*count].rel, sizeof(out[*count].rel), "%s", rel_dir);
-            (*count)++;
+        if (!f) {
+            continue;
+        }
+        fclose(f);
+        if (found) {
+            snprintf(out[*count - 1].fallback_abs, sizeof(out[*count - 1].fallback_abs), "%s",
+                     check);
             break;
         }
+        snprintf(out[*count].abs, sizeof(out[*count].abs), "%s", check);
+        snprintf(out[*count].rel, sizeof(out[*count].rel), "%s", rel_dir);
+        out[*count].fallback_abs[0] = '\0';
+        (*count)++;
+        found = true;
     }
 
     cbm_dirent_t *ent;
@@ -481,12 +501,35 @@ cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_pat
     }
 
     for (int i = 0; i < count; i++) {
-        cbm_path_alias_map_t *map = load_tsconfig_file(hits[i].abs, hits[i].rel);
+        bool has_extends = false;
+        cbm_path_alias_map_t *map = load_tsconfig_file(hits[i].abs, hits[i].rel, &has_extends);
+        const char *selected_abs = hits[i].abs;
+        /* jsconfig.json fallback. A tsconfig.json that declares no paths and
+         * extends nothing gives the folder no aliases; a jsconfig.json in the
+         * same folder that declares paths then supplies them. The tsconfig
+         * baseUrl stays when it set one, so the result never loses what the
+         * tsconfig alone gave. A tsconfig with "extends" may inherit paths
+         * from its base, so it keeps precedence. */
+        if (hits[i].fallback_abs[0] && !has_extends && (!map || map->count == 0)) {
+            cbm_path_alias_map_t *js = load_tsconfig_file(hits[i].fallback_abs, hits[i].rel, NULL);
+            if (js && js->count > 0) {
+                if (map && map->base_url) {
+                    free(js->base_url);
+                    js->base_url = map->base_url;
+                    map->base_url = NULL;
+                }
+                free_alias_map(map);
+                map = js;
+                selected_abs = hits[i].fallback_abs;
+            } else {
+                free_alias_map(js);
+            }
+        }
         if (!map) {
             continue;
         }
-        const char *base = strrchr(hits[i].abs, '/');
-        base = base ? base + 1 : hits[i].abs;
+        const char *base = strrchr(selected_abs, '/');
+        base = base ? base + 1 : selected_abs;
         char selected_rel[CBM_SZ_512];
         if (hits[i].rel[0]) {
             snprintf(selected_rel, sizeof(selected_rel), "%s/%s", hits[i].rel, base);
