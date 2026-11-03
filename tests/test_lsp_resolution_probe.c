@@ -1481,12 +1481,13 @@ static char *lrp_edge_set(const char *db_path) {
     sqlite3 *db = NULL;
     sqlite3_stmt *st = NULL;
     if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK ||
-        sqlite3_prepare_v2(db,
-                           "SELECT e.type || ' ' || replace(s.qualified_name, e.project || '.', '') "
-                           "|| ' -> ' || replace(t.qualified_name, e.project || '.', '') "
-                           "FROM edges e JOIN nodes s ON s.id = e.source_id "
-                           "JOIN nodes t ON t.id = e.target_id ORDER BY 1",
-                           -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_prepare_v2(
+            db,
+            "SELECT e.type || ' ' || replace(s.qualified_name, e.project || '.', '') "
+            "|| ' -> ' || replace(t.qualified_name, e.project || '.', '') "
+            "FROM edges e JOIN nodes s ON s.id = e.source_id "
+            "JOIN nodes t ON t.id = e.target_id ORDER BY 1",
+            -1, &st, NULL) != SQLITE_OK) {
         sqlite3_close(db);
         return NULL;
     }
