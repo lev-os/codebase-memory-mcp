@@ -1142,11 +1142,69 @@ static bool br_root_of_file(const char *repo_path, const char *rel, char *out, s
     return n >= 0 && (size_t)n < out_size;
 }
 
-const cbm_gbuf_node_t *cbm_pipeline_java_same_build_root(const cbm_gbuf_t *gbuf,
-                                                         const char *project,
-                                                         const char *repo_path, CBMLanguage lang,
-                                                         const char *caller_rel,
-                                                         const cbm_gbuf_node_t *target) {
+/* The QN segment before the last one (the owner type of a method), or NULL. */
+static bool br_owner_segment(const char *qn, const char **start, size_t *len) {
+    const char *last = strrchr(qn, '.');
+    if (!last || last == qn) {
+        return false;
+    }
+    const char *seg = last;
+    while (seg > qn && seg[-1] != '.') {
+        seg--;
+    }
+    *start = seg;
+    *len = (size_t)(last - seg);
+    return *len > 0;
+}
+
+static bool br_strategy_is_name_guess(const char *strategy) {
+    return strategy && strncmp(strategy, "lsp_", 4) != 0 && strcmp(strategy, "import_map") != 0 &&
+           strcmp(strategy, "same_module") != 0;
+}
+
+/* The one registered symbol in build root `croot` with the target's name,
+ * label and owner segment; NULL when there is none or more than one. */
+static const cbm_gbuf_node_t *br_unique_owner_match(const cbm_gbuf_t *gbuf,
+                                                    const cbm_registry_t *registry,
+                                                    const char *repo_path, const char *croot,
+                                                    const cbm_gbuf_node_t *target) {
+    const char *towner = NULL;
+    size_t tolen = 0;
+    if (!registry || !br_owner_segment(target->qualified_name, &towner, &tolen)) {
+        return NULL;
+    }
+    const char **cands = NULL;
+    int count = 0;
+    cbm_registry_find_by_name(registry, target->name, &cands, &count);
+    const cbm_gbuf_node_t *found = NULL;
+    for (int i = 0; i < count; i++) {
+        const char *owner = NULL;
+        size_t olen = 0;
+        if (!cands[i] || strcmp(cands[i], target->qualified_name) == 0 ||
+            !br_owner_segment(cands[i], &owner, &olen) || olen != tolen ||
+            strncmp(owner, towner, tolen) != 0) {
+            continue;
+        }
+        const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(gbuf, cands[i]);
+        char root[CBM_SZ_4K];
+        if (!n || n == found || !n->file_path || !n->name || strcmp(n->name, target->name) != 0 ||
+            !n->label || strcmp(n->label, target->label) != 0 ||
+            !br_root_of_file(repo_path, n->file_path, root, sizeof(root)) ||
+            strcmp(root, croot) != 0) {
+            continue;
+        }
+        if (found) {
+            return NULL; /* two in the caller's module: no guess */
+        }
+        found = n;
+    }
+    return found;
+}
+
+const cbm_gbuf_node_t *cbm_pipeline_java_same_build_root(
+    const cbm_gbuf_t *gbuf, const cbm_registry_t *registry, const char *project,
+    const char *repo_path, CBMLanguage lang, const char *caller_rel, const char *strategy,
+    const cbm_gbuf_node_t *target) {
     if (lang != CBM_LANG_JAVA || !gbuf || !project || !repo_path || !repo_path[0] ||
         !caller_rel || !target || !target->file_path || !target->qualified_name ||
         !target->name || !target->label) {
@@ -1194,6 +1252,12 @@ const cbm_gbuf_node_t *cbm_pipeline_java_same_build_root(const cbm_gbuf_t *gbuf,
     }
     free(tprefix);
     free(cprefix);
+    if (better == target && br_strategy_is_name_guess(strategy)) {
+        const cbm_gbuf_node_t *own = br_unique_owner_match(gbuf, registry, repo_path, croot, target);
+        if (own) {
+            better = own;
+        }
+    }
     return better;
 }
 
@@ -1214,8 +1278,9 @@ static bool calls_emit_lsp_target(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                               : cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name,
                                                              lsp->callee_qn, allow_tail);
     /* The caller's own build module first. MUST match pass_parallel.c. */
-    target_node = cbm_pipeline_java_same_build_root(ctx->gbuf, ctx->project_name, ctx->repo_path,
-                                                    lang, source_node->file_path, target_node);
+    target_node = cbm_pipeline_java_same_build_root(ctx->gbuf, ctx->registry, ctx->project_name,
+                                                    ctx->repo_path, lang, source_node->file_path,
+                                                    lsp->strategy, target_node);
     if (!target_node || source_node->id == target_node->id) {
         return false;
     }
@@ -1536,8 +1601,9 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
 
     const cbm_gbuf_node_t *target_node = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
     /* The caller's own build module first. MUST match pass_parallel.c. */
-    target_node = cbm_pipeline_java_same_build_root(ctx->gbuf, ctx->project_name, ctx->repo_path,
-                                                    lang, source_node->file_path, target_node);
+    target_node = cbm_pipeline_java_same_build_root(ctx->gbuf, ctx->registry, ctx->project_name,
+                                                    ctx->repo_path, lang, source_node->file_path,
+                                                    res.strategy, target_node);
     if (target_node) {
         res.qualified_name = target_node->qualified_name;
     }

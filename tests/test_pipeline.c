@@ -3443,9 +3443,10 @@ TEST(pipeline_cross_file_method_defines_method_venue_parity) {
 }
 
 /* Java multi-module build (two Gradle modules in one repository). Both modules
- * declare com.acme.Util with the same methods; each module's caller must bind
- * to its own module's copy, through a static call (import-bound) and through
- * a field whose name hints its type (field_type_hint). */
+ * declare com.acme.Util with the same methods, and each declares a Helper of
+ * its own package (com.acme.alpha / com.acme.beta). Each module's caller must
+ * bind to its own module's copy, through a static call (import-bound) and
+ * through fields whose names hint their types (field_type_hint). */
 static const char JMB_UTIL_JAVA[] = "package com.acme;\n"
                                     "\n"
                                     "public class Util {\n"
@@ -3477,18 +3478,29 @@ static int write_java_modules_fixture(const char *dir, int pad) {
         if (jmb_write(dir, rel, JMB_UTIL_JAVA) != 0) {
             return -1;
         }
+        snprintf(rel, sizeof(rel), "%s/src/main/java/com/acme/%s/Helper.java", mods[m],
+                 mods[m]);
+        snprintf(src, sizeof(src),
+                 "package com.acme.%s;\n\npublic class Helper {\n    public int go() { return 3; "
+                 "}\n}\n",
+                 mods[m]);
+        if (jmb_write(dir, rel, src) != 0) {
+            return -1;
+        }
         snprintf(rel, sizeof(rel), "%s/src/main/java/com/acme/app/%sMain.java", mods[m],
                  m == 0 ? "Alpha" : "Beta");
         snprintf(src, sizeof(src),
                  "package com.acme.app;\n"
                  "\n"
                  "import com.acme.Util;\n"
+                 "import com.acme.%s.Helper;\n"
                  "\n"
                  "public class %sMain {\n"
                  "    private Util util;\n"
-                 "    public int run%s() { return Util.ping() + util.pong(); }\n"
+                 "    private Helper helper;\n"
+                 "    public int run%s() { return Util.ping() + util.pong() + helper.go(); }\n"
                  "}\n",
-                 m == 0 ? "Alpha" : "Beta", m == 0 ? "Alpha" : "Beta");
+                 mods[m], m == 0 ? "Alpha" : "Beta", m == 0 ? "Alpha" : "Beta");
         if (jmb_write(dir, rel, src) != 0) {
             return -1;
         }
@@ -3532,13 +3544,13 @@ static int jmb_calls_into(cbm_store_t *s, const char *project, const char *calle
 typedef struct {
     int run_rc;
     bool store_opened;
-    int own[4];   /* alpha->alpha ping, pong; beta->beta ping, pong */
-    int cross[4]; /* alpha->beta ping, pong; beta->alpha ping, pong */
+    int own[6];   /* alpha->alpha ping, pong, go; beta->beta ping, pong, go */
+    int cross[6]; /* alpha->beta ping, pong, go; beta->alpha ping, pong, go */
 } JavaModulesObservation;
 
 static JavaModulesObservation run_java_modules_case(bool parallel, int pad) {
     JavaModulesObservation o = {.run_rc = -1};
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 6; i++) {
         o.own[i] = o.cross[i] = -1;
     }
     char tmp[256];
@@ -3557,12 +3569,12 @@ static JavaModulesObservation run_java_modules_case(bool parallel, int pad) {
             cbm_store_t *store = cbm_store_open_path(db_path);
             o.store_opened = store != NULL;
             if (store && project) {
-                static const char *const callee[] = {"ping", "pong"};
-                for (int c = 0; c < 2; c++) {
+                static const char *const callee[] = {"ping", "pong", "go"};
+                for (int c = 0; c < 3; c++) {
                     o.own[c] = jmb_calls_into(store, project, "runAlpha", callee[c], "alpha/");
-                    o.own[2 + c] = jmb_calls_into(store, project, "runBeta", callee[c], "beta/");
+                    o.own[3 + c] = jmb_calls_into(store, project, "runBeta", callee[c], "beta/");
                     o.cross[c] = jmb_calls_into(store, project, "runAlpha", callee[c], "beta/");
-                    o.cross[2 + c] =
+                    o.cross[3 + c] =
                         jmb_calls_into(store, project, "runBeta", callee[c], "alpha/");
                 }
             }
@@ -3579,14 +3591,15 @@ static JavaModulesObservation run_java_modules_case(bool parallel, int pad) {
 
 static int java_modules_expect(const char *venue, JavaModulesObservation o) {
     bool ok = o.run_rc == 0 && o.store_opened;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 6; i++) {
         ok = ok && o.own[i] == 1 && o.cross[i] == 0;
     }
     if (!ok) {
         fprintf(stderr,
-                "  [%s] rc=%d own ping/pong a=%d/%d b=%d/%d cross a->b=%d/%d b->a=%d/%d\n",
-                venue, o.run_rc, o.own[0], o.own[1], o.own[2], o.own[3], o.cross[0],
-                o.cross[1], o.cross[2], o.cross[3]);
+                "  [%s] rc=%d own ping/pong/go a=%d/%d/%d b=%d/%d/%d cross a->b=%d/%d/%d "
+                "b->a=%d/%d/%d\n",
+                venue, o.run_rc, o.own[0], o.own[1], o.own[2], o.own[3], o.own[4], o.own[5],
+                o.cross[0], o.cross[1], o.cross[2], o.cross[3], o.cross[4], o.cross[5]);
     }
     return ok;
 }

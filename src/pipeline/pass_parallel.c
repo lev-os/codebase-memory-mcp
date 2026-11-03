@@ -3674,8 +3674,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         /* The caller's own build module first. MUST match pass_calls.c. */
         if (target_node) {
             const cbm_gbuf_node_t *own = cbm_pipeline_java_same_build_root(
-                rc->main_gbuf, rc->project_name, rc->repo_path, lang, source_node->file_path,
-                target_node);
+                rc->main_gbuf, rc->registry, rc->project_name, rc->repo_path, lang,
+                source_node->file_path, res.strategy, target_node);
             if (own != target_node) {
                 target_node = own;
                 res.qualified_name = own->qualified_name;
