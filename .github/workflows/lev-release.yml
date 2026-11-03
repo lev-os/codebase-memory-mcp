@@ -42,6 +42,10 @@ jobs:
     needs: [preflight]
     uses: ./.github/workflows/_test.yml
     with:
+      # Every test lane except lsan-macos: GitHub blocks that macOS arm64 leg on
+      # this repository ("repository invocation blocked", 2026-11-02, twice).
+      # LeakSanitizer still runs on the Linux legs.
+      lanes: '["diag","msan","pkg-wrappers","windows-guards","shard-completeness","tsan-arm","tsan-mac","tsan-x86","unix-arm64","unix-macos-intel","unix-macos14","unix-x86","windows"]'
       skip_perf: true
       broad_platforms: false
       shard_suites: true
