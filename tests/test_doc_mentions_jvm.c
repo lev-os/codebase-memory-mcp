@@ -1145,8 +1145,9 @@ TEST(doc_mentions_jvm_kotlin_families_and_reasons) {
     ASSERT_EQ(jt_edge(db, widget, "far.Helper.Helper"), 1);
     ASSERT_NOT_NULL(strstr(jt_props, "\"tier\":\"exact\""));
     ASSERT_EQ(jt_edge(db, widget, "far.Helper.Helper.run"), 1);
-    /* a member of the companion object, named through its class */
-    ASSERT_EQ(jt_edge(db, widget, "k.Gadget.Factory.create"), 1);
+    /* a member of the companion object, named through its class: its node
+     * is the class's method */
+    ASSERT_EQ(jt_edge(db, widget, "k.Gadget.Gadget.create"), 1);
     /* a type alias has a node of its own */
     ASSERT_EQ(jt_edge(db, widget, "k.Gadget.Alias"), 1);
     /* throws */
@@ -1331,7 +1332,7 @@ TEST(doc_mentions_jvm_kotlin_levels) {
               0);
     /* 3 */
     ASSERT_EQ(jt_edge(db, "kl.K3.K3.m", "kl.K3.K3.own"), 1);
-    ASSERT_EQ(jt_edge(db, "kl.K3.K3.m", "kl.K3.Tools.make"), 1);
+    ASSERT_EQ(jt_edge(db, "kl.K3.K3.m", "kl.K3.K3.make"), 1); /* companion member */
     ASSERT_EQ(jt_edge(db, "kl.K3.K3.m", "kl.K3.K3Base.inherited"), 1);
     ASSERT_EQ(jt_edge(db, "kl.K3.K3.m", "kl.K3.K3.shared"), 1);
     ASSERT_EQ(jt_edge(db, "kl.K3.K3.m", "kl.K3.K3Base.shared"), 0);
@@ -1357,7 +1358,7 @@ TEST(doc_mentions_jvm_kotlin_levels) {
     ASSERT_EQ(jt_edge(db, "kl.K9.K9", "far.Thing.Thing"), 1);
     ASSERT_NOT_NULL(strstr(jt_props, "\"tier\":\"exact\""));
     ASSERT_EQ(jt_edge(db, "kl.K9.K9", "far.Funs.topFun"), 1);
-    ASSERT_EQ(jt_edge(db, "kl.K9.K9", "kl.K3.Tools.make"), 1);
+    ASSERT_EQ(jt_edge(db, "kl.K9.K9", "kl.K3.K3.make"), 1);
     ASSERT_EQ(jt_edge(db, "kl.K9.K9", "kl.K3.K3Base.inherited"), 1);
     ASSERT_EQ(jt_edge(db, "kl.K9.K9", "kl.K3.K3.shared"), 1);
     ASSERT_EQ(jt_edge(db, "kl.K9.K9", "kl.K3.K3Base.shared"), 0);
@@ -1785,7 +1786,7 @@ TEST(doc_mentions_jvm_kotlin_open_supertypes) {
     /* the companion object's supertypes count: its members are in the
      * class's scope. What the companion declares itself binds */
     ASSERT_EQ(jt_rows(db, k4, "helper", "external"), 1);
-    ASSERT_EQ(jt_edge(db, "gk.K4.Locked.m", "gk.K4.Lock.close"), 1);
+    ASSERT_EQ(jt_edge(db, "gk.K4.Locked.m", "gk.K4.Locked.close"), 1);
     ASSERT_EQ(dm_mentions_from(db, "gk.K4.Locked.m"), 1);
     jt_end(&r);
     PASS();

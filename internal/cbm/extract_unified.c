@@ -1190,6 +1190,12 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
     if (ctx->language == CBM_LANG_NIX) {
         return cbm_nix_binding_scope_qn(ctx, node, state ? state->enclosing_class_qn : NULL);
     }
+    /* Kotlin: a `companion object` (named or not) adds no scope segment: its
+     * functions are minted as methods of the enclosing class (extract_defs.c
+     * extract_class_methods), so their calls source to `Outer.fn`. */
+    if (cbm_kotlin_is_companion(ctx->language, node)) {
+        return state ? state->enclosing_class_qn : NULL;
+    }
     TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
     /* Newer tree-sitter-kotlin: class/object name is a type_identifier child. */
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_KOTLIN) {

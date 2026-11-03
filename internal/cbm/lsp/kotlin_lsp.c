@@ -2002,11 +2002,17 @@ static void kt_process_object_decl(KotlinLSPContext *ctx, TSNode node, bool is_c
     if (!ts_node_is_null(body)) {
         const char *prev_class = ctx->enclosing_class_qn;
         const char *prev_companion = ctx->enclosing_companion_qn;
-        ctx->enclosing_class_qn = obj_qn;
+        /* A companion's functions are members of the enclosing class: the
+         * graph mints them as `Outer.fn` (extract_defs.c
+         * extract_class_methods), and `Outer.fn()` / a bare `fn()` inside the
+         * class resolve against Outer. */
+        const char *members_qn =
+            (is_companion && outer_class_qn && outer_class_qn[0]) ? outer_class_qn : obj_qn;
+        ctx->enclosing_class_qn = members_qn;
         if (is_companion) {
             ctx->enclosing_companion_qn = obj_qn;
         }
-        kt_register_class_members(ctx, obj_qn, body, true);
+        kt_register_class_members(ctx, members_qn, body, true);
         ctx->enclosing_class_qn = prev_class;
         ctx->enclosing_companion_qn = prev_companion;
     }
@@ -2109,7 +2115,11 @@ static void kt_register_class_members(KotlinLSPContext *ctx, const char *class_q
         } else if (strcmp(kind, "object_declaration") == 0) {
             /* Could be `companion object` or nested `object` */
             char *otext = kt_node_text(ctx, c);
-            bool is_comp = otext && strstr(otext, "companion");
+            /* `companion` must be a modifier of THIS declaration (before its
+             * `object` keyword), not a word in its body. */
+            const char *comp_at = otext ? strstr(otext, "companion") : NULL;
+            const char *obj_at = otext ? strstr(otext, "object") : NULL;
+            bool is_comp = comp_at && obj_at && comp_at < obj_at;
             const char *prev_class = ctx->enclosing_class_qn;
             ctx->enclosing_class_qn = class_qn;
             kt_process_object_decl(ctx, c, is_comp, class_qn);
@@ -3041,10 +3051,17 @@ static const CBMType *kt_eval_constructor_or_func_call(KotlinLSPContext *ctx, TS
         /* A known non-invokable value yields to the member function: step 1. */
     }
 
+    /* A call naming a registered class is a constructor call (step 2): a
+     * secondary constructor is registered as a same-named member of its class
+     * and must not be taken for a method by steps 1 / 1b. */
+    const char *ctor_cls = kotlin_resolve_class_name(ctx, callee_text);
+    bool is_ctor_call =
+        ctor_cls && ctx->registry && cbm_registry_lookup_type(ctx->registry, ctor_cls) != NULL;
+
     /* 1. `this`-method dispatch: if we're inside a class method or DSL
      * lambda, bare calls resolve against this_type's members first. This
      * matches Kotlin's resolution order: implicit-receiver before global. */
-    if (ctx->this_type && !cbm_type_is_unknown(ctx->this_type)) {
+    if (ctx->this_type && !cbm_type_is_unknown(ctx->this_type) && !is_ctor_call) {
         const char *this_qn = kt_type_qn_of(ctx->this_type);
         if (this_qn) {
             const CBMRegisteredFunc *rf = kotlin_lookup_method(ctx, this_qn, callee_text);
@@ -3069,9 +3086,6 @@ static const CBMType *kt_eval_constructor_or_func_call(KotlinLSPContext *ctx, TS
      * against Repo only and fell to a name guess. A call naming a class is a
      * constructor call, left to step 2 (a secondary constructor is registered
      * as a same-named member and would otherwise be taken for a method). */
-    const char *ctor_cls = kotlin_resolve_class_name(ctx, callee_text);
-    bool is_ctor_call =
-        ctor_cls && ctx->registry && cbm_registry_lookup_type(ctx->registry, ctor_cls) != NULL;
     if (ctx->enclosing_class_qn && !is_ctor_call) {
         const char *this_qn = (ctx->this_type && !cbm_type_is_unknown(ctx->this_type))
                                   ? kt_type_qn_of(ctx->this_type)
@@ -4555,8 +4569,11 @@ static void kt_walk_top_level_for_resolution(KotlinLSPContext *ctx, TSNode root,
             kt_walk_top_level_for_resolution(ctx, body, cls_qn);
             ctx->enclosing_class_qn = prev_class;
         } else if (strcmp(kind, "companion_object") == 0) {
-            const char *companion_qn = kt_join_dot(
-                ctx->arena, enclosing_class_qn ? enclosing_class_qn : ctx->package_qn, "Companion");
+            /* Companion functions are the enclosing class's members in the
+             * graph (`Outer.fn`), so their calls are walked under that QN. */
+            const char *companion_qn = enclosing_class_qn
+                                           ? enclosing_class_qn
+                                           : kt_join_dot(ctx->arena, ctx->package_qn, "Companion");
             TSNode body = kt_child_kind(c, "class_body");
             kt_walk_top_level_for_resolution(ctx, body, companion_qn);
         } else if (strcmp(kind, "property_declaration") == 0) {

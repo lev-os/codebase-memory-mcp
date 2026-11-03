@@ -334,7 +334,9 @@ static int ktc_check_venue(const char *dir, const char *venue, bool single_threa
     /* The enclosing class's member inside a lambda with a typed receiver. */
     ok &= ktc_expect_lsp(db, venue, "Svc.viaLet", "ping", "Svc.ping");
     ok &= ktc_expect_lsp(db, venue, "Svc.viaRun", "ping", "Svc.ping");
-    ok &= ktc_expect_lsp(db, venue, "Ledger.kt.__file__", "Ledger", "Ledger.Ledger.Ledger");
+    /* The companion function is a node of its own now (Ledger.of), so the
+     * call sources from it, not from the file. */
+    ok &= ktc_expect_lsp(db, venue, "Ledger.of", "Ledger", "Ledger.Ledger.Ledger");
     sqlite3_close(db);
     return ok;
 }
@@ -354,6 +356,86 @@ TEST(kotlin_property_receiver_binds_declared_type_both_venues) {
     PASS();
 }
 
+/* Companion-object functions are members of the enclosing class: each gets a
+ * Method node `Outer.fn`, and `Outer.fn()` from another file, a bare `fn()`
+ * inside the class and a call inside the companion all bind to it. Before,
+ * the companion minted no def, so its functions had no node and lost every
+ * caller. Two classes each declare a companion `parse`, so a binding by
+ * name or by a `Companion.parse` tail would pick the wrong one or none. */
+static const char *const KTCO_FILES[][2] = {
+    {"src/main/kotlin/com/acme/m/Recipe.kt",
+     "package com.acme.m\n\nclass Recipe(val text: String) {\n"
+     "    fun render(): String = parse(text).text\n\n"
+     "    companion object {\n"
+     "        fun parse(s: String): Recipe = Recipe(clean(s))\n\n"
+     "        private fun clean(s: String): String = s.trim()\n    }\n}\n"},
+    {"src/main/kotlin/com/acme/o/Other.kt",
+     "package com.acme.o\n\nclass Other(val n: Int) {\n"
+     "    companion object {\n        fun parse(s: String): Other = Other(s.length)\n    }\n}\n"},
+    {"src/main/kotlin/com/acme/f/Factory.kt",
+     "package com.acme.f\n\nclass Factory {\n"
+     "    companion object Maker {\n        fun build(): Factory = Factory()\n    }\n}\n"},
+    {"src/main/kotlin/com/acme/d/Doc.kt",
+     "package com.acme.d\n\nimport com.acme.f.Factory\nimport com.acme.m.Recipe\n\n"
+     "class Doc {\n    fun show(): Recipe = Recipe.parse(\"x\")\n\n"
+     "    fun make(): Factory = Factory.build()\n}\n"},
+};
+
+static int ktco_check_venue(const char *dir, const char *venue, bool single_thread) {
+    char db_path[512];
+    char name[64];
+    snprintf(name, sizeof(name), "ktco-%s.db", venue);
+    if (ktc_index(dir, name, single_thread, db_path, sizeof(db_path)) != 0) {
+        printf("\n  [%s] index failed\n", venue);
+        return 0;
+    }
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        if (db) {
+            sqlite3_close(db);
+        }
+        return 0;
+    }
+    int ok = 1;
+    /* Cross-file `Outer.fn()`, anonymous and named companion. */
+    ok &= ktc_expect_lsp(db, venue, "Doc.show", "parse", "Recipe.Recipe.parse");
+    ok &= ktc_expect_lsp(db, venue, "Doc.make", "build", "Factory.Factory.build");
+    /* Bare call from an instance method of the class. */
+    ok &= ktc_expect_lsp(db, venue, "Recipe.render", "parse", "Recipe.Recipe.parse");
+    /* A call inside the companion sources from the companion function. */
+    ok &= ktc_expect_lsp(db, venue, "Recipe.parse", "clean", "Recipe.Recipe.clean");
+    sqlite3_close(db);
+    return ok;
+}
+
+TEST(kotlin_companion_functions_are_class_members_both_venues) {
+    char *dir = th_mktempdir("cbm_kt_companion");
+    ASSERT_NOT_NULL(dir);
+    int wrote = 0;
+    for (size_t i = 0; i < sizeof(KTCO_FILES) / sizeof(KTCO_FILES[0]); i++) {
+        wrote |= th_write_file(TH_PATH(dir, KTCO_FILES[i][0]), KTCO_FILES[i][1]);
+    }
+    for (int i = 0; i < 55 && wrote == 0; i++) {
+        char rel[96];
+        char body[128];
+        snprintf(rel, sizeof(rel), "src/main/kotlin/com/acme/pad/Pad%d.kt", i);
+        snprintf(body, sizeof(body), "package com.acme.pad\n\nclass Pad%d {\n    fun v%d(): Int = %d\n}\n",
+                 i, i, i);
+        wrote |= th_write_file(TH_PATH(dir, rel), body);
+    }
+    if (wrote != 0) {
+        th_cleanup(dir);
+        FAIL("fixture");
+    }
+    int seq = ktco_check_venue(dir, "seq", true);
+    int par = ktco_check_venue(dir, "par", false);
+    th_cleanup(dir);
+    ASSERT_TRUE(seq);
+    ASSERT_TRUE(par);
+    PASS();
+}
+
 SUITE(kotlin_typed_calls) {
     RUN_TEST(kotlin_property_receiver_binds_declared_type_both_venues);
+    RUN_TEST(kotlin_companion_functions_are_class_members_both_venues);
 }

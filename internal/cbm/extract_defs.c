@@ -9522,6 +9522,16 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
             continue;
         }
 
+        /* Kotlin: a `companion object`'s functions are called as members of
+         * the class (`Outer.parse(x)`, a bare `parse(x)` inside it), so they
+         * are the class's methods: `Outer.parse`. The Kotlin LSP registers
+         * them under the class too. Before, the companion got no def and its
+         * functions got no node at all. */
+        if (cbm_kotlin_is_companion(ctx->language, child)) {
+            extract_class_methods(ctx, child, class_qn, spec);
+            continue;
+        }
+
         // Squirrel wraps each class member in a member_declaration node; the
         // method is the inner function_declaration. Peek through the wrapper.
         if (ctx->language == CBM_LANG_SQUIRREL &&
@@ -12972,6 +12982,11 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const char 
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_OBJECTSCRIPT_UDL) {
         name_node = cbm_find_child_by_kind(node, "class_name");
     }
+    /* Kotlin: a `companion object` (named or not) adds no QN segment; its
+     * members are the enclosing class's (see cbm_kotlin_is_companion). */
+    if (cbm_kotlin_is_companion(ctx->language, node)) {
+        return saved_enclosing;
+    }
     if (!ts_node_is_null(name_node)) {
         char *cname = cbm_node_text(ctx->arena, name_node, ctx->source);
         if (cname && cname[0]) {
@@ -13720,6 +13735,15 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
 
         if (is_dart_unnamed_extension(ctx, node)) {
             push_dart_unnamed_extension_members(node, &s, frame.enclosing_class_qn);
+            continue;
+        }
+
+        /* Kotlin: a companion object's functions were emitted as methods of
+         * the enclosing class (extract_class_methods). It mints no def of its
+         * own; only classes nested in its body are walked, under the
+         * enclosing class. */
+        if (cbm_kotlin_is_companion(ctx->language, node)) {
+            push_class_body_children(node, spec, &s, frame.enclosing_class_qn, ctx);
             continue;
         }
 

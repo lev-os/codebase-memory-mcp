@@ -247,6 +247,11 @@ bool cbm_kind_in_set(TSNode node, const char **types);
  * walks so TS/TSX scope attribution cannot drift. */
 bool cbm_is_namespace_scope_kind(CBMLanguage lang, const char *kind);
 
+/* True for a Kotlin `companion object` node. Its functions are members of
+ * the enclosing class (`Outer.fn`, the name callers use); definition and
+ * unified walks and the Kotlin LSP scope them under that class. */
+bool cbm_kotlin_is_companion(CBMLanguage lang, TSNode node);
+
 // Free the calling thread's cbm_kind_in_set bitset cache (call at thread/process
 // teardown so the thread-local cache is not reported as a leak).
 void cbm_kind_in_set_free_cache(void);
