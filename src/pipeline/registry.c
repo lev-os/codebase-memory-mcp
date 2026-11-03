@@ -107,6 +107,11 @@ struct cbm_registry {
 
     /* byName: simpleName → qn_array_t* (heap-owned) */
     CBMHashTable *by_name;
+
+    /* supertypes: type simple name → supertype_list_t* (heap-owned), the
+     * declared supertypes of every same-named type, for the languages
+     * cbm_registry_lang_climbs_supertypes admits. NULL until the first. */
+    CBMHashTable *supertypes;
 };
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
@@ -1509,6 +1514,8 @@ static void free_qn_array(const char *key, void *value, void *ud) {
     free((void *)key);
 }
 
+static void free_supertype_list(const char *key, void *value, void *ud);
+
 void cbm_registry_free(cbm_registry_t *r) {
     if (!r) {
         return;
@@ -1518,6 +1525,10 @@ void cbm_registry_free(cbm_registry_t *r) {
     cbm_ht_free(r->by_name);
     cbm_ht_foreach(r->exact, free_label, NULL);
     cbm_ht_free(r->exact);
+    if (r->supertypes) {
+        cbm_ht_foreach(r->supertypes, free_supertype_list, NULL);
+        cbm_ht_free(r->supertypes);
+    }
     for (int i = 0; i < r->label_pool_n; i++) {
         free(r->label_pool[i]);
     }
@@ -2756,6 +2767,283 @@ cbm_resolution_t cbm_registry_resolve_lexical(const cbm_registry_t *r, const cha
     return empty_result();
 }
 
+/* ── Inherited members ───────────────────────────────────────────── */
+
+/* A member call the extractor has already rewritten to its receiver's type,
+ * `T.m` (Swift: super.m -> Base.m, (x as? T)?.m -> T.m), names a method that
+ * may be declared on a supertype of T rather than on T itself. The chain above
+ * cannot see that: it knows names, not inheritance, and the receiver-chain
+ * guard rightly refuses Root.m for a callee written Mid.m. So the registry
+ * also keeps each type's declared supertypes (by simple name, the spelling a
+ * callee carries) and the call resolver climbs them once the chain found
+ * nothing.
+ *
+ * Only languages admitted by cbm_registry_lang_climbs_supertypes record
+ * supertypes, and only they climb: Swift today. Kotlin, Java and TS have their
+ * own semantic resolvers for these calls. */
+#define SUPERTYPE_MAX_DEPTH 8
+#define SUPERTYPE_MAX_SEEN 64
+#define CONF_INHERITED_MEMBER 0.80
+
+typedef struct {
+    /* "\nA\nB\n": each supertype simple name framed by newlines, in
+     * declaration order, without duplicates. */
+    char *names;
+    size_t len;
+} supertype_list_t;
+
+static void free_supertype_list(const char *key, void *value, void *ud) {
+    (void)ud;
+    supertype_list_t *list = value;
+    if (list) {
+        free(list->names);
+        free(list);
+    }
+    free((void *)key);
+}
+
+bool cbm_registry_lang_climbs_supertypes(CBMLanguage lang) {
+    return lang == CBM_LANG_SWIFT;
+}
+
+/* The simple type name a supertype spelling names: `Mod.Base<T>` -> Base,
+ * `Base?` -> Base. Writes "" when the spelling names no identifier. */
+static void supertype_simple_name(const char *spelling, char *out, size_t cap) {
+    out[0] = '\0';
+    if (!spelling || cap == 0) {
+        return;
+    }
+    const char *end = spelling;
+    while (*end && *end != '<' && *end != '(' && *end != '?' && *end != '!' && *end != ' ' &&
+           *end != '\t' && *end != '\n' && *end != '&' && *end != ',') {
+        end++;
+    }
+    const char *start = spelling;
+    for (const char *c = spelling; c < end; c++) {
+        if (*c == '.') {
+            start = c + SKIP_ONE;
+        }
+    }
+    size_t n = (size_t)(end - start);
+    if (n == 0 || n >= cap || !(isalpha((unsigned char)start[0]) || start[0] == '_')) {
+        return;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (!(isalnum((unsigned char)start[i]) || start[i] == '_')) {
+            return;
+        }
+    }
+    memcpy(out, start, n);
+    out[n] = '\0';
+}
+
+void cbm_registry_add_supertypes(cbm_registry_t *r, const char *type_name,
+                                 const char *const *bases, CBMLanguage lang) {
+    if (!r || !type_name || !type_name[0] || !bases ||
+        !cbm_registry_lang_climbs_supertypes(lang)) {
+        return;
+    }
+    char self[CBM_SZ_256];
+    supertype_simple_name(type_name, self, sizeof(self));
+    if (!self[0]) {
+        return;
+    }
+    if (!r->supertypes) {
+        r->supertypes = cbm_ht_create(CBM_SZ_256);
+        if (!r->supertypes) {
+            return;
+        }
+    }
+    supertype_list_t *list = cbm_ht_get(r->supertypes, self);
+    for (int i = 0; bases[i]; i++) {
+        char base[CBM_SZ_256];
+        char framed[CBM_SZ_256 + 2];
+        supertype_simple_name(bases[i], base, sizeof(base));
+        if (!base[0] || strcmp(base, self) == 0) {
+            continue;
+        }
+        snprintf(framed, sizeof(framed), "\n%s\n", base);
+        if (list && list->names && strstr(list->names, framed)) {
+            continue;
+        }
+        if (!list) {
+            char *key = strdup(self);
+            list = calloc(CBM_ALLOC_ONE, sizeof(*list));
+            if (!key || !list) {
+                free(key);
+                free(list);
+                return;
+            }
+            cbm_ht_set(r->supertypes, key, list);
+        }
+        size_t add = strlen(base) + SKIP_ONE; /* name + closing newline */
+        size_t need = (list->len ? list->len : SKIP_ONE) + add + SKIP_ONE;
+        char *grown = realloc(list->names, need);
+        if (!grown) {
+            return;
+        }
+        if (!list->len) {
+            grown[0] = '\n';
+            list->len = SKIP_ONE;
+        }
+        memcpy(grown + list->len, base, add - SKIP_ONE);
+        grown[list->len + add - SKIP_ONE] = '\n';
+        list->len += add;
+        grown[list->len] = '\0';
+        list->names = grown;
+    }
+}
+
+/* Callable candidates in `arr` (the `member` bucket) whose owner segment -- the
+ * segment before the member name -- is `owner`, and whose language `caller`
+ * may call. Returns how many; *hit gets the first. */
+static int owned_member_candidates(const cbm_registry_t *r, const qn_array_t *arr,
+                                   const char *member, const char *owner, CBMLanguage caller,
+                                   const char **hit) {
+    const uint8_t *langs = qn_lang_flags(arr);
+    size_t mlen = strlen(member);
+    size_t olen = strlen(owner);
+    int n = 0;
+    for (int i = 0; i < arr->count; i++) {
+        const char *qn = arr->items[i];
+        if (!registry_label_is_callable(cbm_registry_label_of(r, qn))) {
+            continue;
+        }
+        if (langs && !cbm_lang_resolution_compatible(caller, (CBMLanguage)langs[i])) {
+            continue;
+        }
+        size_t base = cbm_qn_callable_base_len_named(qn, member);
+        if (base < mlen + olen + 2 || memcmp(qn + base - mlen, member, mlen) != 0 ||
+            qn[base - mlen - 1] != '.') {
+            continue;
+        }
+        const char *own = qn + base - mlen - 1 - olen;
+        if (memcmp(own, owner, olen) != 0 || (own != qn && own[-1] != '.')) {
+            continue;
+        }
+        if (n++ == 0) {
+            *hit = qn;
+        }
+    }
+    return n;
+}
+
+typedef struct {
+    char seen[SUPERTYPE_MAX_SEEN][CBM_SZ_128];
+    int n;
+} supertype_walk_t;
+
+/* Records `name` as visited; false when it was already (or the set is full). */
+static bool supertype_walk_visit(supertype_walk_t *walk, const char *name) {
+    for (int i = 0; i < walk->n; i++) {
+        if (strcmp(walk->seen[i], name) == 0) {
+            return false;
+        }
+    }
+    if (walk->n >= SUPERTYPE_MAX_SEEN || strlen(name) >= sizeof(walk->seen[0])) {
+        return false;
+    }
+    snprintf(walk->seen[walk->n++], sizeof(walk->seen[0]), "%s", name);
+    return true;
+}
+
+/* Depth-first over the declared supertypes of `type`, in declaration order:
+ * each supertype is tried, then its own supertypes, before the next one. A
+ * Swift class lists its superclass first, so the superclass chain is searched
+ * before a protocol's extension. 1: *hit is the one owner of `member` found
+ * first; -1: the first type that owns it owns it more than once (same-named
+ * types), so nothing binds; 0: none. */
+static int climb_supertypes(const cbm_registry_t *r, const qn_array_t *arr, const char *member,
+                            const char *type, CBMLanguage caller, int depth,
+                            supertype_walk_t *walk, const char **hit) {
+    const supertype_list_t *list = cbm_ht_get(r->supertypes, type);
+    if (!list || !list->names || depth >= SUPERTYPE_MAX_DEPTH) {
+        return 0;
+    }
+    for (const char *s = list->names + SKIP_ONE; *s;) {
+        const char *nl = strchr(s, '\n');
+        size_t len = nl ? (size_t)(nl - s) : strlen(s);
+        char base[CBM_SZ_128];
+        if (len > 0 && len < sizeof(base)) {
+            memcpy(base, s, len);
+            base[len] = '\0';
+            if (supertype_walk_visit(walk, base)) {
+                int owned = owned_member_candidates(r, arr, member, base, caller, hit);
+                if (owned == SKIP_ONE) {
+                    return 1;
+                }
+                if (owned > SKIP_ONE) {
+                    return -1;
+                }
+                int rc =
+                    climb_supertypes(r, arr, member, base, caller, depth + SKIP_ONE, walk, hit);
+                if (rc != 0) {
+                    return rc;
+                }
+            }
+        }
+        if (!nl) {
+            break;
+        }
+        s = nl + SKIP_ONE;
+    }
+    return 0;
+}
+
+cbm_resolution_t cbm_registry_resolve_inherited_member(const cbm_registry_t *r,
+                                                       const char *callee_name,
+                                                       CBMLanguage caller_lang) {
+    if (!r || !r->supertypes || !callee_name ||
+        !cbm_registry_lang_climbs_supertypes(caller_lang)) {
+        return empty_result();
+    }
+    /* `[...].T.m`: T is the segment before the last; it names a type. */
+    const char *last = strrchr(callee_name, '.');
+    if (!last || last == callee_name || !last[SKIP_ONE]) {
+        return empty_result();
+    }
+    const char *member = last + SKIP_ONE;
+    const char *type_start = last;
+    while (type_start > callee_name && type_start[-1] != '.') {
+        type_start--;
+    }
+    size_t tlen = (size_t)(last - type_start);
+    char type[CBM_SZ_128];
+    if (tlen == 0 || tlen >= sizeof(type) || type_start[0] < 'A' || type_start[0] > 'Z') {
+        return empty_result();
+    }
+    memcpy(type, type_start, tlen);
+    type[tlen] = '\0';
+    for (const char *c = member; *c; c++) {
+        if (!(isalnum((unsigned char)*c) || *c == '_')) {
+            return empty_result();
+        }
+    }
+    for (size_t i = 0; i < tlen; i++) {
+        if (!(isalnum((unsigned char)type[i]) || type[i] == '_')) {
+            return empty_result();
+        }
+    }
+    const qn_array_t *arr = cbm_ht_get(r->by_name, member);
+    if (!arr || arr->count == 0) {
+        return empty_result();
+    }
+    /* A member T declares itself is the chain's to bind or to refuse; the
+     * climb never steps past it. */
+    const char *hit = NULL;
+    if (owned_member_candidates(r, arr, member, type, caller_lang, &hit) > 0) {
+        return empty_result();
+    }
+    supertype_walk_t walk;
+    walk.n = 0;
+    (void)supertype_walk_visit(&walk, type);
+    hit = NULL;
+    if (climb_supertypes(r, arr, member, type, caller_lang, 0, &walk, &hit) == 1 && hit) {
+        return (cbm_resolution_t){hit, "inherited_member", CONF_INHERITED_MEMBER, REG_RESOLVED};
+    }
+    return empty_result();
+}
+
 /* The registry step both call resolvers (pass_calls.c, pass_parallel.c) run
  * once the LSP has not answered: a Python bare name bound in an enclosing def
  * first (the LSP binds those locals itself; this covers the sites it did not
@@ -2774,8 +3062,16 @@ cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const
             return lexical;
         }
     }
-    return cbm_registry_resolve_call_lang(r, callee_name, module_qn, import_map_keys,
-                                          import_map_vals, import_map_count, lang);
+    cbm_resolution_t res = cbm_registry_resolve_call_lang(
+        r, callee_name, module_qn, import_map_keys, import_map_vals, import_map_count, lang);
+    if (!(res.qualified_name && res.qualified_name[0])) {
+        /* `T.m` where m is declared on a supertype of T (Swift only). */
+        cbm_resolution_t inherited = cbm_registry_resolve_inherited_member(r, callee_name, lang);
+        if (inherited.qualified_name) {
+            return inherited;
+        }
+    }
+    return res;
 }
 
 /* ── Fuzzy Resolve ──────────────────────────────────────────────── */
