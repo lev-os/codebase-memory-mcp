@@ -1985,10 +1985,17 @@ static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char 
     return empty_result();
 }
 
-/* Strategy 4: multiple candidates with import filtering. */
+static bool receiver_chain_admits(const char *callee_name, const char *candidate_qn);
+
+/* Strategy 4: multiple candidates with import filtering. The receiver-chain
+ * guard (receiver_chain_admits) holds here as on the unique-name and
+ * no-import paths: `Uri.parse(s)` names a type none of whose segments is in
+ * a candidate's ancestry, so the import-distance pick must not hand it a
+ * project `Markdown.parse`. Before, a file with imports skipped the guard
+ * that the same call in a file without imports got. */
 static cbm_resolution_t resolve_multi_with_imports(const cbm_registry_t *r, const qn_array_t *arr,
-                                                   const char *module_qn, const char **import_vals,
-                                                   int import_count) {
+                                                   const char *callee_name, const char *module_qn,
+                                                   const char **import_vals, int import_count) {
     const char *filtered[CBM_SZ_256];
     uint8_t filtered_test[CBM_SZ_256];
     uint8_t filtered_lang[CBM_SZ_256];
@@ -1996,7 +2003,8 @@ static cbm_resolution_t resolve_multi_with_imports(const cbm_registry_t *r, cons
     const uint8_t *langs = qn_lang_flags(arr);
     int fcount = 0;
     for (int i = 0; i < arr->count && fcount < CBM_SZ_256; i++) {
-        if (is_import_reachable(arr->items[i], import_vals, import_count)) {
+        if (is_import_reachable(arr->items[i], import_vals, import_count) &&
+            receiver_chain_admits(callee_name, arr->items[i])) {
             if (flags) {
                 filtered_test[fcount] = flags[i];
             }
@@ -2022,7 +2030,7 @@ static cbm_resolution_t resolve_multi_with_imports(const cbm_registry_t *r, cons
     /* No import-reachable — use all candidates with penalty */
     const char *best = best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
                                                qn_lang_flags(arr), arr->count, module_qn);
-    if (best) {
+    if (best && receiver_chain_admits(callee_name, best)) {
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH * REG_HALF_PENALTY, arr->count);
         return (cbm_resolution_t){best, "suffix_match", conf, arr->count};
     }
@@ -2237,7 +2245,8 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
 
     /* Strategy 4: multiple candidates */
     if (import_vals && import_count > 0) {
-        return resolve_multi_with_imports(r, arr, module_qn, import_vals, import_count);
+        return resolve_multi_with_imports(r, arr, callee_name, module_qn, import_vals,
+                                          import_count);
     }
     const char *best = best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
                                                qn_lang_flags(arr), arr->count, module_qn);

@@ -590,6 +590,11 @@ bool cbm_kind_in_set(TSNode node, const char **types) {
     return kind_in_set_strcmp(node, (const char *const *)types);
 }
 
+bool cbm_kotlin_is_companion(CBMLanguage lang, TSNode node) {
+    return lang == CBM_LANG_KOTLIN && !ts_node_is_null(node) &&
+           strcmp(ts_node_type(node), "companion_object") == 0;
+}
+
 bool cbm_is_namespace_scope_kind(CBMLanguage lang, const char *kind) {
     if (!kind) {
         return false;
