@@ -624,6 +624,71 @@ static char *delta_with_prop(const char *props, const char *key, const char *val
     return out;
 }
 
+/* `props` (a JSON object) with the member `key` = `array` added verbatim, or
+ * NULL when `array` is not a non-empty JSON array (CBM_MEM_CLASS_OTHER; the
+ * caller frees). `array` is SQLite json_extract output, so it is already
+ * valid, minified JSON; `key` is a fixed identifier. */
+static char *delta_with_json_array(const char *props, const char *key, const char *array) {
+    size_t al = array ? strlen(array) : 0;
+    if (al <= PAIR_LEN || array[0] != '[' || array[al - SKIP_ONE] != ']') {
+        return NULL;
+    }
+    size_t pl = props ? strlen(props) : 0;
+    bool has_members = pl > PAIR_LEN && props[0] == '{' && props[pl - SKIP_ONE] == '}';
+    size_t cap = pl + strlen(key) + al + CBM_SZ_32;
+    char *out = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, cap);
+    if (!out) {
+        return NULL;
+    }
+    size_t k = 0;
+    if (has_members) {
+        memcpy(out, props, pl - SKIP_ONE);
+        k = pl - SKIP_ONE;
+        out[k++] = ',';
+    } else {
+        out[k++] = '{';
+    }
+    snprintf(out + k, cap - k, "\"%s\":%s}", key, array);
+    return out;
+}
+
+/* Load the stored JS/TS re-export IMPORTS edges (`export { a as b } from`,
+ * `export * from`) between proxies into the delta gbuf. A re-resolved caller
+ * that imports through a barrel follows the BARREL's edges to the defining
+ * file (pass_lsp_cross.c pxc_barrel_symbol_qn), and an unchanged barrel is a
+ * proxy with no edges of its own; without these rows the walk stopped at the
+ * barrel and the call fell back to a name guess. Only the re-export rows,
+ * with their stored properties (local_name/imported/reexport): a small set.
+ * Both endpoints are pre-existing rows, so cbm_delta_patch never writes them
+ * back. Returns the edge count, or -1 on a database error. */
+static int64_t delta_preseed_reexports(sqlite3 *db, const char *project, cbm_gbuf_t *gbuf) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+                           "SELECT source_id, target_id, properties FROM edges"
+                           " WHERE project = ?1 AND type = 'IMPORTS'"
+                           " AND instr(properties, '\"reexport\":\"') > 0",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    int64_t loaded = 0;
+    int step_rc;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        int64_t src = sqlite3_column_int64(stmt, 0);
+        int64_t tgt = sqlite3_column_int64(stmt, 1);
+        const char *props = (const char *)sqlite3_column_text(stmt, 2);
+        /* An endpoint the preseed did not proxy is no walk step. */
+        if (!cbm_gbuf_find_by_id(gbuf, src) || !cbm_gbuf_find_by_id(gbuf, tgt)) {
+            continue;
+        }
+        if (cbm_gbuf_insert_edge(gbuf, src, tgt, "IMPORTS", props ? props : "{}") > 0) {
+            loaded++;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return step_rc == SQLITE_DONE ? loaded : -1;
+}
+
 int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf) {
     sqlite3 *db = cbm_store_get_db(store);
     if (!db) {
@@ -681,7 +746,15 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
      * its arguments fit by reading it off every member, and the registry seed
      * keeps members 2..n out of the short-name index by it
      * (cbm_node_is_split_overload). Without it an incremental run bound
-     * every call to the group's first member. */
+     * every call to the group's first member.
+     *
+     * And a type's declared supertypes (the stored "base_classes" array, on
+     * type-like rows): the registry seed reads them back into the supertype
+     * table (registry_seed_supertypes, the same reader the full-graph
+     * incremental route uses), which the inherited-member fallback climbs.
+     * Without them a re-resolved call to a member a type inherits from an
+     * unchanged type found no edge. Spliced as the stored JSON array, so the
+     * seed parses exactly what a full-graph load would hand it. */
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(
             db,
@@ -699,7 +772,10 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
             " THEN json_extract(properties, '$." CBM_PROP_GENERATED "') END,"
             " CASE WHEN label IN ('Function','Method')"
             " AND instr(properties, '\"" CBM_OVERLOAD_PARAMS_PROP "\"') > 0"
-            " THEN json_extract(properties, '$." CBM_OVERLOAD_PARAMS_PROP "') END"
+            " THEN json_extract(properties, '$." CBM_OVERLOAD_PARAMS_PROP "') END,"
+            " CASE WHEN label IN (" CBM_SQL_TYPE_LIKE_LABELS ")"
+            " AND instr(properties, '\"base_classes\"') > 0"
+            " THEN json_extract(properties, '$.base_classes') END"
             " FROM nodes"
             " WHERE project = ?1 AND label NOT IN"
             " ('Macro','Comment','Section','Branch','Commit','Tag')"
@@ -725,6 +801,7 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
         const char *parent = (const char *)sqlite3_column_text(stmt, 8);
         const char *generated = (const char *)sqlite3_column_text(stmt, 9);
         const char *overload = (const char *)sqlite3_column_text(stmt, 10);
+        const char *bases = (const char *)sqlite3_column_text(stmt, 11);
         char *owner_props =
             parent ? delta_owner_props(project, name, qn, parent, client_props) : NULL;
         const char *props = owner_props ? owner_props : (client_props ? client_props : "{}");
@@ -736,10 +813,15 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
         if (overload_props) {
             props = overload_props;
         }
+        char *bases_props = delta_with_json_array(props, "base_classes", bases);
+        if (bases_props) {
+            props = bases_props;
+        }
         /* Pin the gbuf id to the database id: proxies ARE their rows. */
         cbm_gbuf_set_next_id(gbuf, id);
         int64_t got =
             cbm_gbuf_upsert_node(gbuf, label, name, qn, fp ? fp : "", start_line, end_line, props);
+        cbm_free(CBM_MEM_CLASS_OTHER, bases_props);
         cbm_free(CBM_MEM_CLASS_OTHER, overload_props);
         cbm_free(CBM_MEM_CLASS_OTHER, generated_props);
         cbm_free(CBM_MEM_CLASS_OTHER, owner_props);
@@ -756,10 +838,16 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
     if (step_rc != SQLITE_DONE) {
         return -1;
     }
+    int64_t reexports = delta_preseed_reexports(db, project, gbuf);
+    if (reexports < 0) {
+        return -1;
+    }
     cbm_gbuf_set_next_id(gbuf, max_id + 1);
     char seeded_buf[32];
+    char reexport_buf[32];
     snprintf(seeded_buf, sizeof(seeded_buf), "%lld", (long long)seeded);
-    cbm_log_info("delta.preseed", "proxies", seeded_buf);
+    snprintf(reexport_buf, sizeof(reexport_buf), "%lld", (long long)reexports);
+    cbm_log_info("delta.preseed", "proxies", seeded_buf, "reexport_edges", reexport_buf);
     return max_id;
 }
 

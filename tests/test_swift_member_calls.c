@@ -19,6 +19,7 @@
 #include "test_helpers.h"
 #include "cbm.h"
 #include "pipeline/pipeline.h"
+#include "pipeline/pipeline_internal.h"
 #include "sqlite3.h"
 
 #include <stdio.h>
@@ -256,6 +257,123 @@ TEST(swift_member_calls_bind_inherited_member) {
     PASS();
 }
 
+/* Every edge except OVERRIDE as "TYPE source -> target" lines without the
+ * project prefix, sorted; NULL when the database cannot be read (the caller
+ * frees). OVERRIDE is left out: the override pass (pass_semantic.c) climbs
+ * the INHERITS and DEFINES_METHOD edges of unchanged ancestors, which the
+ * closure-repair graph does not hold, so an incremental run drops
+ * Square.redraw -> Shape.redraw. That gap is separate from the supertype
+ * table this test pins. */
+static char *swb_edge_set(const char *db_path) {
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+                           "SELECT e.type || ' ' || replace(s.qualified_name, e.project || '.', '') "
+                           "|| ' -> ' || replace(t.qualified_name, e.project || '.', '') "
+                           "FROM edges e JOIN nodes s ON s.id = e.source_id "
+                           "JOIN nodes t ON t.id = e.target_id WHERE e.type <> 'OVERRIDE' "
+                           "ORDER BY 1",
+                           -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return NULL;
+    }
+    size_t cap = 4096;
+    size_t len = 0;
+    char *buf = malloc(cap);
+    if (buf) {
+        buf[0] = '\0';
+    }
+    while (buf && sqlite3_step(st) == SQLITE_ROW) {
+        const char *line = (const char *)sqlite3_column_text(st, 0);
+        size_t l = line ? strlen(line) : 0;
+        if (len + l + 2 > cap) {
+            cap = (len + l + 2) * 2;
+            char *grown = realloc(buf, cap);
+            if (!grown) {
+                free(buf);
+                buf = NULL;
+                break;
+            }
+            buf = grown;
+        }
+        memcpy(buf + len, line, l);
+        len += l;
+        buf[len++] = '\n';
+        buf[len] = '\0';
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return buf;
+}
+
+static int swb_index(const char *dir, const char *db_path) {
+    cbm_pipeline_t *p = cbm_pipeline_new(dir, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    return rc;
+}
+
+/* A body-only edit of a caller re-resolves it on the closure-repair route,
+ * against proxies of the unchanged types. Their declared supertypes must
+ * reach the registry there too, or every inherited-member edge to an
+ * unchanged type disappears: the edge set must equal a fresh full index
+ * (OVERRIDE aside, see swb_edge_set). */
+TEST(swift_inherited_member_incremental_matches_full) {
+    char *dir = th_mktempdir("cbm_swift_base_incr");
+    ASSERT_NOT_NULL(dir);
+    char repo[512];
+    snprintf(repo, sizeof(repo), "%s/repo", dir);
+    int wrote = 0;
+    for (size_t i = 0; i < sizeof(SWB_FILES) / sizeof(SWB_FILES[0]); i++) {
+        wrote |= th_write_file(TH_PATH(repo, SWB_FILES[i][0]), SWB_FILES[i][1]);
+    }
+    char inc_db[600];
+    char full_db[600];
+    snprintf(inc_db, sizeof(inc_db), "%s/inc.db", dir);
+    snprintf(full_db, sizeof(full_db), "%s/full.db", dir);
+    int route = -1;
+    char *inc = NULL;
+    char *full = NULL;
+    if (wrote == 0 && swb_index(repo, inc_db) == 0 &&
+        th_write_file(TH_PATH(repo, "App/Geo/Square.swift"),
+                      "class Square: Polygon {\n"
+                      "    override func redraw(scale: Int) {\n"
+                      "        super.redraw(scale: scale)\n"
+                      "        super.redraw(scale: scale + 1)\n"
+                      "    }\n"
+                      "    func paint(item: Any) {\n"
+                      "        (item as? Polygon)?.redraw(scale: 2)\n"
+                      "        (item as? Polygon)?.redraw(scale: 4)\n"
+                      "    }\n"
+                      "}\n") == 0) {
+        cbm_pipeline_incremental_test_reset_faults();
+        if (swb_index(repo, inc_db) == 0) {
+            route = (int)cbm_pipeline_incremental_test_last_route();
+            if (swb_index(repo, full_db) == 0) {
+                inc = swb_edge_set(inc_db);
+                full = swb_edge_set(full_db);
+            }
+        }
+    }
+    static const char want[] =
+        "CALLS App.Geo.Square.Square.paint -> App.Geo.Shape.Shape.redraw\n";
+    int ok = inc && full && strcmp(inc, full) == 0 && strstr(full, want) &&
+             route == (int)CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR;
+    if (!ok) {
+        printf("\n  route %d (want %d), want edge [%s]\n--- incremental\n%s--- full\n%s", route,
+               (int)CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR, want, inc ? inc : "(null)",
+               full ? full : "(null)");
+    }
+    free(inc);
+    free(full);
+    th_cleanup(dir);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 static void swb_type(cbm_registry_t *r, const char *qn, const char *name, const char *base) {
     const char *bases[] = {base, NULL};
     cbm_registry_add_lang_in_module(r, name, qn, "Class", CBM_LANG_SWIFT, 0);
@@ -488,6 +606,7 @@ SUITE(swift_member_calls) {
     RUN_TEST(swift_member_callee_names_receiver_type);
     RUN_TEST(swift_member_calls_bind_named_receiver_type);
     RUN_TEST(swift_member_calls_bind_inherited_member);
+    RUN_TEST(swift_inherited_member_incremental_matches_full);
     RUN_TEST(swift_inherited_member_registry_rules);
     RUN_TEST(swift_leading_dot_chain_needs_view_root);
     RUN_TEST(swift_leading_dot_non_view_chain_binds);

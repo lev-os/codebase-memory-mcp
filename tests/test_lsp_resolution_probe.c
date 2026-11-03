@@ -85,9 +85,11 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "cbm.h"
+#include "sqlite3.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <pipeline/pipeline.h>
+#include <pipeline/pipeline_internal.h>
 #include <foundation/log.h>
 
 #include <string.h>
@@ -1473,6 +1475,136 @@ TEST(lrp_js_namespace_import_member_calls) {
     PASS();
 }
 
+/* Every edge as "TYPE source -> target" lines without the project prefix,
+ * sorted; NULL when the database cannot be read (the caller frees). */
+static char *lrp_edge_set(const char *db_path) {
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+                           "SELECT e.type || ' ' || replace(s.qualified_name, e.project || '.', '') "
+                           "|| ' -> ' || replace(t.qualified_name, e.project || '.', '') "
+                           "FROM edges e JOIN nodes s ON s.id = e.source_id "
+                           "JOIN nodes t ON t.id = e.target_id ORDER BY 1",
+                           -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return NULL;
+    }
+    size_t cap = 4096;
+    size_t len = 0;
+    char *buf = malloc(cap);
+    if (buf) {
+        buf[0] = '\0';
+    }
+    while (buf && sqlite3_step(st) == SQLITE_ROW) {
+        const char *line = (const char *)sqlite3_column_text(st, 0);
+        size_t l = line ? strlen(line) : 0;
+        if (len + l + 2 > cap) {
+            cap = (len + l + 2) * 2;
+            char *grown = realloc(buf, cap);
+            if (!grown) {
+                free(buf);
+                buf = NULL;
+                break;
+            }
+            buf = grown;
+        }
+        memcpy(buf + len, line, l);
+        len += l;
+        buf[len++] = '\n';
+        buf[len] = '\0';
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return buf;
+}
+
+static int lrp_pipeline_index(const char *dir, const char *db_path) {
+    cbm_pipeline_t *p = cbm_pipeline_new(dir, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    return rc;
+}
+
+/* Barrel calls on an incremental run. A body-only edit of the caller
+ * re-resolves it on the closure-repair route, where the unchanged barrels
+ * are proxies: the walk through `export { a as b } from`, `export * from`
+ * and a namespace import of the barrel must bind as a full index does. A
+ * decoy declares every public name, so a name guess cannot pass. */
+TEST(lrp_ts_barrel_incremental_matches_full) {
+    static const char app_v1[] = "import { statePath } from './lib';\n"
+                                 "import { thing } from './star';\n"
+                                 "import * as ns from './lib';\n"
+                                 "export function run(): number {\n"
+                                 "  statePath();\n"
+                                 "  ns.statePath();\n"
+                                 "  return thing();\n"
+                                 "}\n";
+    static const char app_v2[] = "import { statePath } from './lib';\n"
+                                 "import { thing } from './star';\n"
+                                 "import * as ns from './lib';\n"
+                                 "export function run(): number {\n"
+                                 "  statePath();\n"
+                                 "  // a body-only edit\n"
+                                 "  ns.statePath();\n"
+                                 "  return thing();\n"
+                                 "}\n";
+    static const LRP_File f[] = {
+        {"src/lib/xdg-paths.ts", "export function getStatePath(): string { return '/s'; }\n"},
+        {"src/lib/index.ts", "export { getStatePath as statePath } from './xdg-paths';\n"},
+        {"src/star/thing.impl.ts", "export function thing(): number { return 1; }\n"},
+        {"src/star/index.ts", "export * from './thing.impl';\n"},
+        {"src/decoy/decoy.ts", "export function statePath(): string { return ''; }\n"
+                               "export function getStatePath(): string { return ''; }\n"
+                               "export function thing(): number { return 0; }\n"},
+        {"src/app.ts", app_v1},
+    };
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_lrp_barrel_incr_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char repo[300];
+    snprintf(repo, sizeof(repo), "%s/repo", tmp);
+    int wrote = 0;
+    for (size_t i = 0; i < sizeof(f) / sizeof(f[0]); i++) {
+        wrote |= th_write_file(TH_PATH(repo, f[i].name), f[i].content);
+    }
+    char inc_db[400];
+    char full_db[400];
+    snprintf(inc_db, sizeof(inc_db), "%s/inc.db", tmp);
+    snprintf(full_db, sizeof(full_db), "%s/full.db", tmp);
+    int route = -1;
+    char *inc = NULL;
+    char *full = NULL;
+    if (wrote == 0 && lrp_pipeline_index(repo, inc_db) == 0 &&
+        th_write_file(TH_PATH(repo, "src/app.ts"), app_v2) == 0) {
+        cbm_pipeline_incremental_test_reset_faults();
+        if (lrp_pipeline_index(repo, inc_db) == 0) {
+            route = (int)cbm_pipeline_incremental_test_last_route();
+            if (lrp_pipeline_index(repo, full_db) == 0) {
+                inc = lrp_edge_set(inc_db);
+                full = lrp_edge_set(full_db);
+            }
+        }
+    }
+    static const char want_renamed[] = "CALLS src.app.run -> src.lib.xdg-paths.getStatePath\n";
+    static const char want_star[] = "CALLS src.app.run -> src.star.thing.impl.thing\n";
+    int ok = inc && full && strcmp(inc, full) == 0 && strstr(full, want_renamed) &&
+             strstr(full, want_star) && !strstr(full, "CALLS src.app.run -> src.decoy.") &&
+             route == (int)CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR;
+    if (!ok) {
+        printf("\n  route %d (want %d)\n--- incremental\n%s--- full\n%s", route,
+               (int)CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR, inc ? inc : "(null)",
+               full ? full : "(null)");
+    }
+    free(inc);
+    free(full);
+    th_rmtree(tmp);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  * ─── GROUP 7: JAVA (lsp_cross NOT WIRED) ─────────────────────────────
  * ══════════════════════════════════════════════════════════════════════
@@ -2123,6 +2255,7 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_ts_barrel_reexport_member_calls);
     RUN_TEST(lrp_ts_barrel_star_and_renamed_same_module);
     RUN_TEST(lrp_js_namespace_import_member_calls);
+    RUN_TEST(lrp_ts_barrel_incremental_matches_full);
 
     /* ── Java (lsp_cross NOT WIRED) — S1 GREEN, S2–S8 RED reproductions ── */
     RUN_TEST(lrp_java_s1_crossfile_call);
