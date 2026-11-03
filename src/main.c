@@ -1814,6 +1814,21 @@ static void main_report_client_bootstrap_failure(cbm_daemon_process_role_t role,
     main_report_client_failure(role, detail);
 }
 
+/* A daemon conflict in MCP mode must still answer MCP. A process that only
+ * wrote the reason to stderr and exited left the client waiting on
+ * `initialize` until it timed out, so the agent saw a timeout and never the
+ * reason. The refused session now answers initialize, tools/list and every
+ * tools/call (as a tool error carrying the reason) until stdin closes. The
+ * caller has already released every lease and the endpoint; this touches no
+ * cache, store or lock. Exit status stays a failure: the session was refused. */
+static int main_serve_mcp_refusal(const char *detail) {
+    (void)fprintf(stderr, "codebase-memory-mcp: %s\n", detail);
+    (void)fprintf(stderr, "codebase-memory-mcp: this session answers MCP with that reason and "
+                          "starts no work; it exits when the client closes stdin\n");
+    (void)cbm_mcp_refusal_run(stdin, stdout, detail);
+    return EXIT_FAILURE;
+}
+
 /* #2277: a conflict is a legitimate refusal (another build owns the account
  * daemon), but it must name that daemon and the way out. known_active is a
  * STATUS answer the caller already holds; without one this probes STATUS
@@ -3332,6 +3347,16 @@ int main(int argc, char **argv) {
                 main_conflict_remedy_probe(endpoint, &identity, NULL, remedy, sizeof(remedy));
             }
         }
+        if (role == CBM_DAEMON_PROCESS_MCP_CLIENT &&
+            client_cohort_status == CBM_VERSION_COHORT_CONFLICT) {
+            char detail[MAIN_CLIENT_FAILURE_DETAIL_CAP];
+            (void)snprintf(detail, sizeof(detail), "%s%s%s",
+                           formatted ? message : "client exact-build admission failed",
+                           remedy[0] ? " " : "", remedy);
+            (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
+            cbm_daemon_ipc_endpoint_free(endpoint);
+            return main_serve_mcp_refusal(detail);
+        }
         (void)fprintf(stderr, "codebase-memory-mcp: %s%s%s\n",
                       formatted ? message : "client exact-build admission failed",
                       remedy[0] ? " " : "", remedy);
@@ -3390,6 +3415,17 @@ int main(int argc, char **argv) {
     cbm_daemon_bootstrap_status_t bootstrap_status =
         main_client_bootstrap_with_upgrade(&bootstrap_config, &bootstrap_result, true);
     cbm_daemon_ipc_endpoint_free(endpoint);
+    if (bootstrap_status == CBM_DAEMON_BOOTSTRAP_CONFLICT &&
+        role == CBM_DAEMON_PROCESS_MCP_CLIENT) {
+        char detail[MAIN_CLIENT_FAILURE_DETAIL_CAP];
+        (void)snprintf(detail, sizeof(detail), "%s%s%s",
+                       bootstrap_result.message[0] ? bootstrap_result.message
+                                                   : "CBM could not start because a conflicting "
+                                                     "CBM process is active",
+                       bootstrap_result.remedy[0] ? " " : "", bootstrap_result.remedy);
+        (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
+        return main_serve_mcp_refusal(detail);
+    }
     if (bootstrap_status != CBM_DAEMON_BOOTSTRAP_CONNECTED || !bootstrap_result.client) {
         main_report_client_bootstrap_failure(role, &bootstrap_result);
         (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);

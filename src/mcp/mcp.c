@@ -1496,8 +1496,12 @@ static const char MCP_SCOUT_SERVER_INSTRUCTIONS[] =
     "check_index_coverage tells whether a cited file was fully indexed. Findings are "
     "provisional.";
 
+/* instructions_override, when set, replaces the profile's instructions: the
+ * refusal responder uses it to put the startup refusal in front of the agent
+ * at connect time. */
 static char *cbm_mcp_initialize_response_for_profile(const char *params_json,
-                                                     cbm_mcp_tool_profile_t profile) {
+                                                     cbm_mcp_tool_profile_t profile,
+                                                     const char *instructions_override) {
     /* Determine protocol version: if client requests a version we support,
      * echo it back; otherwise respond with our latest. */
     const char *version = SUPPORTED_PROTOCOL_VERSIONS[0]; /* default: latest */
@@ -1543,6 +1547,9 @@ static char *cbm_mcp_initialize_response_for_profile(const char *params_json,
     } else if (profile == CBM_MCP_TOOL_PROFILE_SCOUT) {
         instructions = MCP_SCOUT_SERVER_INSTRUCTIONS;
     }
+    if (instructions_override) {
+        instructions = instructions_override;
+    }
     yyjson_mut_obj_add_str(doc, root, "instructions", instructions);
 
     char *out = yy_doc_to_str(doc);
@@ -1551,7 +1558,7 @@ static char *cbm_mcp_initialize_response_for_profile(const char *params_json,
 }
 
 char *cbm_mcp_initialize_response(const char *params_json) {
-    return cbm_mcp_initialize_response_for_profile(params_json, CBM_MCP_TOOL_PROFILE_ALL);
+    return cbm_mcp_initialize_response_for_profile(params_json, CBM_MCP_TOOL_PROFILE_ALL, NULL);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -21823,7 +21830,8 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     bool request_timed_out = false;
 
     if (strcmp(req.method, "initialize") == 0) {
-        result_json = cbm_mcp_initialize_response_for_profile(req.params_raw, srv->tool_profile);
+        result_json =
+            cbm_mcp_initialize_response_for_profile(req.params_raw, srv->tool_profile, NULL);
         detect_session(srv);
         if (srv->background_tasks && srv->tool_profile == CBM_MCP_TOOL_PROFILE_ALL) {
             maybe_auto_index(srv);
@@ -22269,6 +22277,108 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
         }
     }
 
+    return 0;
+}
+
+/* ── Refusal responder ────────────────────────────────────────── */
+
+#define MCP_REFUSAL_TOOL_NAME "cbm_unavailable"
+#define MCP_REFUSAL_PREFIX "codebase-memory-mcp is unavailable in this session. "
+
+static const char MCP_REFUSAL_METHOD_NOT_FOUND[] =
+    "{\"code\":-32601,\"message\":\"Method not found\"}";
+
+/* One tool, not an empty list: an empty list reads as "no tools" and the agent
+ * never learns why. The tool's description already carries the reason, and a
+ * call returns it as a tool error. */
+static char *mcp_refusal_tools_list(const char *notice) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_val *tools = yyjson_mut_arr(doc);
+    yyjson_mut_val *tool = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, tool, "name", MCP_REFUSAL_TOOL_NAME);
+    yyjson_mut_obj_add_str(doc, tool, "description", notice);
+    yyjson_mut_val *schema = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, schema, "type", "object");
+    yyjson_mut_obj_add_val(doc, schema, "properties", yyjson_mut_obj(doc));
+    yyjson_mut_obj_add_val(doc, tool, "inputSchema", schema);
+    yyjson_mut_arr_add_val(tools, tool);
+    yyjson_mut_obj_add_val(doc, root, "tools", tools);
+    char *out = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    return out;
+}
+
+/* The answer to one request, or NULL for a notification. */
+static char *mcp_refusal_handle(const char *message, const char *reason, const char *notice) {
+    cbm_jsonrpc_request_t req;
+    if (cbm_jsonrpc_parse(message, &req) != 0) {
+        return NULL;
+    }
+    if (!req.has_id) {
+        cbm_jsonrpc_request_free(&req);
+        return NULL;
+    }
+    char *result_json = NULL;
+    const char *static_result = NULL;
+    if (strcmp(req.method, "initialize") == 0) {
+        result_json = cbm_mcp_initialize_response_for_profile(req.params_raw,
+                                                              CBM_MCP_TOOL_PROFILE_ALL, notice);
+    } else if (strcmp(req.method, "tools/list") == 0) {
+        result_json = mcp_refusal_tools_list(notice);
+    } else if (strcmp(req.method, "tools/call") == 0) {
+        result_json = cbm_mcp_text_result(reason, true);
+    } else if (strcmp(req.method, "ping") == 0) {
+        static_result = "{}";
+    } else if (strcmp(req.method, "prompts/list") == 0) {
+        static_result = "{\"prompts\":[]}";
+    }
+    const char *result = result_json ? result_json : static_result;
+    cbm_jsonrpc_response_t resp = {
+        .id = req.id,
+        .id_str = req.id_str,
+        .result_json = result,
+        .error_json = result ? NULL : MCP_REFUSAL_METHOD_NOT_FOUND,
+    };
+    char *out = cbm_jsonrpc_format_response(&resp);
+    safe_free(result_json);
+    cbm_jsonrpc_request_free(&req);
+    return out;
+}
+
+int cbm_mcp_refusal_run(FILE *in, FILE *out, const char *reason) {
+    if (!in || !out || !reason) {
+        return CBM_NOT_FOUND;
+    }
+#ifdef _WIN32
+    _setmode(cbm_fileno(in), _O_BINARY);
+    _setmode(cbm_fileno(out), _O_BINARY);
+#endif
+    size_t notice_size = sizeof(MCP_REFUSAL_PREFIX) + strlen(reason);
+    char *notice = cbm_alloc(CBM_MEM_CLASS_OTHER, notice_size);
+    if (!notice) {
+        return CBM_NOT_FOUND;
+    }
+    (void)snprintf(notice, notice_size, "%s%s", MCP_REFUSAL_PREFIX, reason);
+
+    char *message = NULL;
+    bool content_length_framed = false;
+    while (cbm_mcp_read_message(in, &message, &content_length_framed) > 0) {
+        char *resp = mcp_refusal_handle(message, reason, notice);
+        safe_free(message);
+        if (resp) {
+            if (content_length_framed) {
+                (void)fprintf(out, "Content-Length: %zu\r\n\r\n%s", strlen(resp), resp);
+            } else {
+                (void)fprintf(out, "%s\n", resp);
+            }
+            (void)fflush(out);
+            safe_free(resp);
+        }
+    }
+    safe_free(message);
+    cbm_free(CBM_MEM_CLASS_OTHER, notice);
     return 0;
 }
 

@@ -249,6 +249,15 @@ int cbm_mcp_read_message(FILE *in, char **message, bool *content_length_framed);
  * Blocks until EOF on input. Returns 0 on success, -1 on error. */
 int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out);
 
+/* Serve a session that was refused at startup (another CBM build owns the
+ * runtime). Answers initialize (the reason becomes the server instructions),
+ * tools/list (one tool, cbm_unavailable, whose description is the reason),
+ * every tools/call (isError with the reason), ping and prompts/list; other
+ * requests get "Method not found" and notifications are ignored. Touches no
+ * store, cache or lock. Blocks until EOF on input. Returns 0, or -1 on bad
+ * arguments or allocation failure. */
+int cbm_mcp_refusal_run(FILE *in, FILE *out, const char *reason);
+
 /* Process a single JSON-RPC request line and return the response.
  * Returns heap-allocated JSON response string, or NULL for notifications. */
 char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line);
