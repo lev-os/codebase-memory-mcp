@@ -364,6 +364,22 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
 bool cbm_registry_name_guess_vetoed(const cbm_registry_t *r, CBMLanguage caller_lang,
                                     const cbm_resolution_t *res);
 
+/* Inherited members. A language admitted by cbm_registry_lang_climbs_supertypes
+ * (Swift only) records each type's declared supertypes by simple name
+ * (`Mod.Base<T>` -> Base), from the same definitions that seed the registry.
+ * cbm_registry_resolve_inherited_member then binds a callee `[...].T.m` that T
+ * does not declare to the m of T's nearest supertype that does: depth-first in
+ * declaration order (superclass first), at most 8 levels. Empty when T declares
+ * m itself, when no supertype does, or when the first owner found is ambiguous
+ * (same-named types). cbm_registry_resolve_call_scoped runs it once the
+ * strategy chain found nothing. */
+bool cbm_registry_lang_climbs_supertypes(CBMLanguage lang);
+void cbm_registry_add_supertypes(cbm_registry_t *r, const char *type_name,
+                                 const char *const *bases, CBMLanguage lang);
+cbm_resolution_t cbm_registry_resolve_inherited_member(const cbm_registry_t *r,
+                                                       const char *callee_name,
+                                                       CBMLanguage caller_lang);
+
 /* Relation-permitting resolve for SQL FROM/JOIN lineage usages ONLY — the one
  * consumer allowed to bind Table/View targets. Uncached (the per-file resolve
  * cache stores the default variant's relation-vetoed answers). */

@@ -1348,6 +1348,41 @@ typedef struct {
     const char *project;        /* bounds Python function-local detection per file */
 } registry_seed_t;
 
+/* A type's declared supertypes, as the full index records them from its
+ * definition (cbm_registry_add_supertypes), read back from the node's stored
+ * "base_classes" property. */
+#define REG_SEED_MAX_BASES 32
+static void registry_seed_supertypes(cbm_registry_t *registry, const cbm_gbuf_node_t *node,
+                                     CBMLanguage lang) {
+    if (!cbm_registry_lang_climbs_supertypes(lang) || !node->label ||
+        !cbm_label_is_type_like(node->label) || !node->properties_json ||
+        !strstr(node->properties_json, "\"base_classes\"")) {
+        return;
+    }
+    yyjson_doc *doc = yyjson_read(node->properties_json, strlen(node->properties_json), 0);
+    if (!doc) {
+        return;
+    }
+    yyjson_val *arr = yyjson_obj_get(yyjson_doc_get_root(doc), "base_classes");
+    const char *bases[REG_SEED_MAX_BASES + 1];
+    int n = 0;
+    size_t idx;
+    size_t max;
+    yyjson_val *v;
+    if (yyjson_is_arr(arr)) {
+        yyjson_arr_foreach(arr, idx, max, v) {
+            if (n < REG_SEED_MAX_BASES && yyjson_is_str(v)) {
+                bases[n++] = yyjson_get_str(v);
+            }
+        }
+    }
+    bases[n] = NULL;
+    if (n > 0) {
+        cbm_registry_add_supertypes(registry, node->name, bases, lang);
+    }
+    yyjson_doc_free(doc);
+}
+
 static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
     registry_seed_t *seed = (registry_seed_t *)userdata;
     if (!incr_label_is_registry_symbol(node->label)) {
@@ -1373,6 +1408,7 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
                             : 0;
     cbm_registry_add_lang_in_module(seed->registry, node->name, node->qualified_name, node->label,
                                     lang, prefix_len);
+    registry_seed_supertypes(seed->registry, node, lang);
 }
 
 /* Seed the registry from every registry symbol in the graph buffer, with

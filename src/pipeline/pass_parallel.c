@@ -1821,6 +1821,9 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
             cbm_registry_add_lang_in_module(ctx->registry, def->name, def->qualified_name,
                                             def->label, lang, module_prefix_len);
         }
+        if (def->base_classes && cbm_label_is_type_like(def->label)) {
+            cbm_registry_add_supertypes(ctx->registry, def->name, def->base_classes, lang);
+        }
         (*reg_entries)++;
     }
     char marked[CBM_SZ_4K];

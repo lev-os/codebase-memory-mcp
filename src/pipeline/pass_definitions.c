@@ -521,6 +521,9 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
             cbm_registry_add_lang_in_module(ctx->registry, def->name, def->qualified_name,
                                             def->label, lang, module_prefix_len);
         }
+        if (def->base_classes && cbm_label_is_type_like(def->label)) {
+            cbm_registry_add_supertypes(ctx->registry, def->name, def->base_classes, lang);
+        }
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
