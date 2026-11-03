@@ -3442,6 +3442,179 @@ TEST(pipeline_cross_file_method_defines_method_venue_parity) {
     PASS();
 }
 
+/* Java multi-module build (two Gradle modules in one repository). Both modules
+ * declare com.acme.Util with the same methods, and each declares a Helper of
+ * its own package (com.acme.alpha / com.acme.beta). Each module's caller must
+ * bind to its own module's copy, through a static call (import-bound) and
+ * through fields whose names hint their types (field_type_hint). */
+static const char JMB_UTIL_JAVA[] = "package com.acme;\n"
+                                    "\n"
+                                    "public class Util {\n"
+                                    "    public static int ping() { return 1; }\n"
+                                    "    public int pong() { return 2; }\n"
+                                    "}\n";
+
+static int jmb_write(const char *dir, const char *rel, const char *content) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", dir, rel);
+    return th_write_file(path, content);
+}
+
+static int write_java_modules_fixture(const char *dir, int pad) {
+    static const char *const mods[] = {"alpha", "beta"};
+    for (int m = 0; m < 2; m++) {
+        char rel[256];
+        char src[768];
+        snprintf(rel, sizeof(rel), "%s/settings.gradle", mods[m]);
+        snprintf(src, sizeof(src), "rootProject.name = '%s'\n", mods[m]);
+        if (jmb_write(dir, rel, src) != 0) {
+            return -1;
+        }
+        snprintf(rel, sizeof(rel), "%s/build.gradle", mods[m]);
+        if (jmb_write(dir, rel, "plugins { id 'java' }\n") != 0) {
+            return -1;
+        }
+        snprintf(rel, sizeof(rel), "%s/src/main/java/com/acme/Util.java", mods[m]);
+        if (jmb_write(dir, rel, JMB_UTIL_JAVA) != 0) {
+            return -1;
+        }
+        snprintf(rel, sizeof(rel), "%s/src/main/java/com/acme/%s/Helper.java", mods[m],
+                 mods[m]);
+        snprintf(src, sizeof(src),
+                 "package com.acme.%s;\n\npublic class Helper {\n    public int go() { return 3; "
+                 "}\n}\n",
+                 mods[m]);
+        if (jmb_write(dir, rel, src) != 0) {
+            return -1;
+        }
+        snprintf(rel, sizeof(rel), "%s/src/main/java/com/acme/app/%sMain.java", mods[m],
+                 m == 0 ? "Alpha" : "Beta");
+        snprintf(src, sizeof(src),
+                 "package com.acme.app;\n"
+                 "\n"
+                 "import com.acme.Util;\n"
+                 "import com.acme.%s.Helper;\n"
+                 "\n"
+                 "public class %sMain {\n"
+                 "    private Util util;\n"
+                 "    private Helper helper;\n"
+                 "    public int run%s() { return Util.ping() + util.pong() + helper.go(); }\n"
+                 "}\n",
+                 mods[m], m == 0 ? "Alpha" : "Beta", m == 0 ? "Alpha" : "Beta");
+        if (jmb_write(dir, rel, src) != 0) {
+            return -1;
+        }
+    }
+    for (int i = 0; i < pad; i++) {
+        char rel[256];
+        char src[256];
+        snprintf(rel, sizeof(rel), "alpha/src/main/java/com/acme/pad/Pad%02d.java", i);
+        snprintf(src, sizeof(src),
+                 "package com.acme.pad;\n\npublic class Pad%02d {\n    int v() { return %d; }\n}\n",
+                 i, i);
+        if (jmb_write(dir, rel, src) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* CALLS edges from `caller` (a method) to `callee` whose target lies under
+ * the folder `target_prefix` ("alpha/" or "beta/"). */
+static int jmb_calls_into(cbm_store_t *s, const char *project, const char *caller,
+                          const char *callee, const char *target_prefix) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(cbm_store_get_db(s),
+                           "SELECT COUNT(*) FROM edges e JOIN nodes src ON src.id=e.source_id "
+                           "JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND "
+                           "e.type='CALLS' AND src.name=?2 AND t.name=?3 AND "
+                           "substr(t.file_path,1,length(?4))=?4",
+                           -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, caller, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, callee, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, target_prefix, -1, SQLITE_TRANSIENT);
+    int n = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : -1;
+    sqlite3_finalize(st);
+    return n;
+}
+
+typedef struct {
+    int run_rc;
+    bool store_opened;
+    int own[6];   /* alpha->alpha ping, pong, go; beta->beta ping, pong, go */
+    int cross[6]; /* alpha->beta ping, pong, go; beta->alpha ping, pong, go */
+} JavaModulesObservation;
+
+static JavaModulesObservation run_java_modules_case(bool parallel, int pad) {
+    JavaModulesObservation o = {.run_rc = -1};
+    for (int i = 0; i < 6; i++) {
+        o.own[i] = o.cross[i] = -1;
+    }
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_jmb_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return o;
+    }
+    if (write_java_modules_fixture(tmp, pad) == 0) {
+        XlangEnvSave save = xlang_env_select(parallel);
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/jmb.db", tmp);
+        cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        if (pipeline) {
+            o.run_rc = cbm_pipeline_run(pipeline);
+            const char *project = cbm_pipeline_project_name(pipeline);
+            cbm_store_t *store = cbm_store_open_path(db_path);
+            o.store_opened = store != NULL;
+            if (store && project) {
+                static const char *const callee[] = {"ping", "pong", "go"};
+                for (int c = 0; c < 3; c++) {
+                    o.own[c] = jmb_calls_into(store, project, "runAlpha", callee[c], "alpha/");
+                    o.own[3 + c] = jmb_calls_into(store, project, "runBeta", callee[c], "beta/");
+                    o.cross[c] = jmb_calls_into(store, project, "runAlpha", callee[c], "beta/");
+                    o.cross[3 + c] =
+                        jmb_calls_into(store, project, "runBeta", callee[c], "alpha/");
+                }
+            }
+            if (store) {
+                cbm_store_close(store);
+            }
+            cbm_pipeline_free(pipeline);
+        }
+        xlang_env_restore(&save);
+    }
+    th_rmtree(tmp);
+    return o;
+}
+
+static int java_modules_expect(const char *venue, JavaModulesObservation o) {
+    bool ok = o.run_rc == 0 && o.store_opened;
+    for (int i = 0; i < 6; i++) {
+        ok = ok && o.own[i] == 1 && o.cross[i] == 0;
+    }
+    if (!ok) {
+        fprintf(stderr,
+                "  [%s] rc=%d own ping/pong/go a=%d/%d/%d b=%d/%d/%d cross a->b=%d/%d/%d "
+                "b->a=%d/%d/%d\n",
+                venue, o.run_rc, o.own[0], o.own[1], o.own[2], o.own[3], o.own[4], o.own[5],
+                o.cross[0], o.cross[1], o.cross[2], o.cross[3], o.cross[4], o.cross[5]);
+    }
+    return ok;
+}
+
+TEST(pipeline_java_build_modules_bind_own_copy_sequential) {
+    ASSERT_TRUE(java_modules_expect("sequential", run_java_modules_case(false, 0)));
+    PASS();
+}
+
+/* 55 fillers send the second run through pass_parallel.c. */
+TEST(pipeline_java_build_modules_bind_own_copy_parallel) {
+    ASSERT_TRUE(java_modules_expect("parallel", run_java_modules_case(true, 55)));
+    PASS();
+}
+
 static bool test_buffer_appendf(char *buffer, size_t capacity, size_t *used, const char *format,
                                 ...) {
     if (!buffer || !used || *used >= capacity) {
@@ -31075,6 +31248,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_route_not_bound_to_python_builtin_incremental);
     RUN_TEST(pipeline_cross_file_method_defines_method_sequential);
     RUN_TEST(pipeline_cross_file_method_defines_method_venue_parity);
+    RUN_TEST(pipeline_java_build_modules_bind_own_copy_sequential);
+    RUN_TEST(pipeline_java_build_modules_bind_own_copy_parallel);
     RUN_TEST(pipeline_objectscript_export_aggregate_exceeds_arena_block_table);
 #if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
     RUN_TEST(pipeline_objectscript_export_range_join_keeps_one_trailing_marker);

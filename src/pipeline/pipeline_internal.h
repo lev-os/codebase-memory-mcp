@@ -661,6 +661,31 @@ void cbm_pipeline_spill_close(cbm_pipeline_ctx_t *ctx);
 const cbm_gbuf_node_t *cbm_pipeline_file_node(const cbm_gbuf_t *gbuf, const char *project,
                                               const char *rel);
 
+/* Java multi-module builds (Gradle/Maven): the same package and class can be
+ * declared in several build modules of one repository, and every resolver
+ * strategy (LSP tail match, field_type_hint, suffix_match, ...) then picks one
+ * copy for callers in every module. A build root is the nearest ancestor
+ * folder of a file that holds settings.gradle(.kts), build.gradle(.kts) or
+ * pom.xml. When a Java caller in `caller_rel` resolved to `target` in another
+ * build root, and the caller's own build root holds the same file path and the
+ * same qualified-name tail (same name and label), return that node. Failing
+ * that, when `strategy` is a name guess (not lsp_*, import_map or
+ * same_module) and the caller's build root holds exactly one registered
+ * symbol of the target's name and label whose owner (the QN segment before
+ * the name) is the target's owner, return that one: each module declared its
+ * own class of that name in its own package. Otherwise return `target`
+ * unchanged. Both call resolvers apply it at the same point, so the
+ * sequential and parallel paths stay in parity. */
+const cbm_gbuf_node_t *cbm_pipeline_java_same_build_root(
+    const cbm_gbuf_t *gbuf, const cbm_registry_t *registry, const char *project,
+    const char *repo_path, CBMLanguage lang, const char *caller_rel, const char *strategy,
+    const cbm_gbuf_node_t *target);
+
+/* Drop this thread's build-root cache (directory -> build root). Each call
+ * resolver clears it at its start and end, so a build file added between runs
+ * is seen by the next run. */
+void cbm_pipeline_build_root_cache_clear(void);
+
 /* Transcode an ObjectScript Studio Export XML file and compose every generated
  * UDL class into one cacheable result. The returned result owns all child
  * extraction arenas and is released with the ordinary cbm_free_result(). */
