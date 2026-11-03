@@ -15,7 +15,9 @@
  * Entities. A type entity is its binary-style name: package + '.' + the
  * dotted logical path (com.acme.Outer.Inner). Several declarations of one
  * name (source sets, expect/actual) are one entity. A member belongs to the
- * declaration that holds it; overloads of one type share a node.
+ * declaration that holds it; overloads of one type have a node each (the
+ * first keeps the plain name, the others get their signature as a suffix),
+ * and a signature selects one (one signature written twice keeps one node).
  *
  * Lookup (the first level with a visible candidate decides; more than one
  * entity there is ambiguous, never a pick):
@@ -4394,6 +4396,7 @@ enum {
     JR_F_M_FLAGS = 3,
     JR_F_M_NAME = 5,
     JR_F_M_RECV = 8,
+    JR_F_M_SLOT = 9,
     JR_DELTA_IMPORTS = 16, /* changed imports compared by name; more: any name */
 };
 
@@ -4437,6 +4440,31 @@ static bool jr_delta_next(const char **cursor, jr_span_t *line, bool imports) {
 
 static bool jr_span_eq(jr_span_t a, jr_span_t b) {
     return a.n == b.n && memcmp(a.p, b.p, a.n) == 0;
+}
+
+/* True when two member records declare the same member and differ only in
+ * slot: its own node was renamed, e.g. a removed overload hands the plain
+ * qualified name to the next overload (cbm_split_overloads gives overloads
+ * 2..n a signature-suffixed node). A changed own is no such move: a member
+ * that gains or loses its node can change where a lookup ends. */
+static bool jr_delta_slot_moved(jr_span_t a, jr_span_t b) {
+    if (a.n == 0 || b.n == 0 || a.p[0] != 'M' || b.p[0] != 'M') {
+        return false;
+    }
+    bool moved = false;
+    for (int k = 0;; k++) {
+        jr_span_t x = jr_delta_field(a, k);
+        jr_span_t y = jr_delta_field(b, k);
+        if (!x.p || !y.p) {
+            return moved && !x.p && !y.p;
+        }
+        if (!jr_span_eq(x, y)) {
+            if (k != JR_F_M_SLOT) {
+                return false;
+            }
+            moved = true;
+        }
+    }
 }
 
 /* The import records of a scope, in order. Returns the count, -1 when memory
@@ -4547,6 +4575,9 @@ static int jr_delta_import_change(const char *stored, const char *fresh) {
  *     field, a property, an enum constant): a reference that depended on it
  *     either bound it (an edge into this file) or names it in its unresolved
  *     row, so the name is reported;
+ *   - a member whose node was renamed (only its slot changed: an overload
+ *     group lost a member, and the next overload took the plain qualified
+ *     name): the same holds, so its name is reported too;
  *   - the file's own imports, unless one can re-bind a supertype or an
  *     extension receiver the file declares (jr_delta_import_change).
  * Everything else is GLOBAL: a new or changed record (a type, a member, a
@@ -4561,6 +4592,7 @@ static int jr_scope_delta(const char *stored, const char *fresh, cbm_doclink_nam
     const char *fp = fresh;
     jr_span_t sl = {0};
     jr_span_t fl = {0};
+    jr_span_t last = {0}; /* the name reported last */
     bool hs = jr_delta_next(&sp, &sl, false);
     bool hf = jr_delta_next(&fp, &fl, false);
     while (hs || hf) {
@@ -4580,8 +4612,13 @@ static int jr_scope_delta(const char *stored, const char *fresh, cbm_doclink_nam
         if (memchr(flags.p, 'p', flags.n)) {
             return CBM_DOCLINK_DELTA_GLOBAL;
         }
-        if (!removed || !removed(ud, name.p, name.n)) {
+        /* overloads are adjacent: a name is reported once in a row */
+        if (!jr_span_eq(name, last) && (!removed || !removed(ud, name.p, name.n))) {
             return CBM_NOT_FOUND;
+        }
+        last = name;
+        if (hf && jr_delta_slot_moved(sl, fl)) {
+            hf = jr_delta_next(&fp, &fl, false); /* reported, and kept */
         }
         hs = jr_delta_next(&sp, &sl, false);
     }

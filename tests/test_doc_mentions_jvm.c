@@ -352,9 +352,11 @@ TEST(doc_mentions_jvm_java_scope_blob) {
     ASSERT(jt_has_line(s, "M\t7\tv\t\t0\tMAX\t\t-\t\t=\t1\t"));
     ASSERT(jt_has_line(s, "M\t8\tv\t\t0\tsize\t\t-\t\tWidget.size#field\t1\t"));
     ASSERT(jt_has_line(s, "M\t8\tv\t\t0\tother\t\t-\t\t-\t0\t"));
-    /* constructors, overloads of one name: one node, owned by the last */
-    ASSERT(jt_has_line(s, "M\t9\tc\tK\t0\tWidget\t\t\t\t=\t0\t"));
-    ASSERT(jt_has_line(s, "M\t10\tc\tK\t0\tWidget\t\tint\t\t=\t1\t"));
+    /* constructors, overloads of one name: a node each. The first keeps the
+     * plain qualified name, a later one gets its signature as a suffix
+     * (cbm_split_overloads); the slot follows the extractor */
+    ASSERT(jt_has_line(s, "M\t9\tc\tK\t0\tWidget\t\t\t\t=\t1\t"));
+    ASSERT(jt_has_line(s, "M\t10\tc\tK\t0\tWidget\t\tint\t\tWidget.Widget(int)\t1\t"));
     /* a signature: simple names, no type arguments, an ellipsis is an array */
     ASSERT(jt_has_line(s, "M\t11\tc\t\t0\tsize\tV:Number\tV|List|int[]\t\t=\t1\t"));
     ASSERT(jt_has_line(s, "T\t13\t15\tc\tWidget.Inner\t\t\t=\t1\t"));
@@ -375,7 +377,7 @@ TEST(doc_mentions_jvm_java_scope_blob) {
     char *portable = cbm_doclink_portable_scope(s);
     ASSERT_NOT_NULL(portable);
     ASSERT(jt_has_line(portable, "T\t0\t0\tc\tWidget\tT,U:Comparable\tBase|Runnable\t=\t1\t"));
-    ASSERT(jt_has_line(portable, "M\t0\tc\tK\t0\tWidget\t\tint\t\t=\t1\t"));
+    ASSERT(jt_has_line(portable, "M\t0\tc\tK\t0\tWidget\t\tint\t\tWidget.Widget(int)\t1\t"));
     ASSERT(jt_has_line(portable, "I\ts\tHelper\tcom.acme.util.Helper"));
     cbm_free(CBM_MEM_CLASS_OTHER, portable);
     cbm_free_result(r);
@@ -428,8 +430,9 @@ TEST(doc_mentions_jvm_kotlin_scope_blob) {
     ASSERT(jt_has_line(s, "M\t5\tv\tp\t0\tdelegate\t\t-\t\t-\t0\t"));
     /* a class-body property: its node is named below the FILE's module */
     ASSERT(jt_has_line(s, "M\t6\tv\t\t0\tbodyProp\t\t-\t\tbodyProp\t1\t"));
-    ASSERT(jt_has_line(s, "M\t7\tc\t\t0\tmember\t\tInt\t\t=\t0\tparam"));
-    ASSERT(jt_has_line(s, "M\t10\tc\t\t0\tmember\t\tString\t\t=\t1\tparam"));
+    /* overloads: a node each, the later one's named with its signature */
+    ASSERT(jt_has_line(s, "M\t7\tc\t\t0\tmember\t\tInt\t\t=\t1\tparam"));
+    ASSERT(jt_has_line(s, "M\t10\tc\t\t0\tmember\t\tString\t\tAlias.member(String)\t1\tparam"));
     /* a nested type's node is flat: named below the file's module */
     ASSERT(jt_has_line(s, "T\t13\t13\tc\tAlias.Nested\t\t\tNested\t1\t"));
     /* an unnamed companion and its members: declared, no definitions */
@@ -449,7 +452,7 @@ TEST(doc_mentions_jvm_kotlin_scope_blob) {
     char *portable = cbm_doclink_portable_scope(s);
     ASSERT_NOT_NULL(portable);
     ASSERT(jt_has_line(portable, "T\t0\t0\tc\tAlias\tT\tBase|Marker\t=\t1\t"));
-    ASSERT(jt_has_line(portable, "M\t0\tc\t\t0\tmember\t\tString\t\t=\t1\t"));
+    ASSERT(jt_has_line(portable, "M\t0\tc\t\t0\tmember\t\tString\t\tAlias.member(String)\t1\t"));
     cbm_free(CBM_MEM_CLASS_OTHER, portable);
     cbm_free_result(r);
     PASS();
@@ -594,9 +597,10 @@ TEST(doc_mentions_jvm_java_families_and_reasons) {
     ASSERT_NOT_NULL(strstr(jt_props, "\"syntax\":\"link\""));
     ASSERT_NOT_NULL(strstr(jt_props, "\"tier\":\"unique\""));
     ASSERT_NOT_NULL(strstr(jt_props, "\"line\":8"));
-    /* linkplain, with a signature that selects one overload (overloads of a
-     * type share a node) */
-    ASSERT_EQ(jt_edge(db, "a.Widget", "a.Gadget.spin"), 1);
+    /* linkplain, with a signature that selects one overload: the second
+     * overload has its own node, named with its signature (the first keeps
+     * a.Gadget.spin) */
+    ASSERT_EQ(jt_edge(db, "a.Widget", "a.Gadget.spin(int)"), 1);
     ASSERT_NOT_NULL(strstr(jt_props, "\"syntax\":\"linkplain\""));
     /* ... and nothing is relaxed: another parameter count, another parameter
      * type, a nested type named as a member and a method named as a value
@@ -2645,7 +2649,8 @@ TEST(doc_mentions_jvm_scope_delta_rules) {
          JT_DJ_HEAD "import static acme.S.*;\n" JT_DJ_TYPES, global, NULL},
         {"java static import of the supertype's name", java, JT_DJ_BASE,
          JT_DJ_HEAD "import static acme.S.Base;\n" JT_DJ_TYPES, global, NULL},
-        /* a removed member is reported by name */
+        /* a removed member is reported by name; so is the overload whose node
+         * moved (run(String) takes the plain name run(int) left), once */
         {"java overload removed", java, JT_DJ_BASE,
          JT_DJ_HEAD JT_DJ_OPEN JT_DJ_RUN_STR JT_DJ_SIZE JT_DJ_CLOSE, local, "run"},
         {"java field removed", java, JT_DJ_BASE,
@@ -2657,10 +2662,10 @@ TEST(doc_mentions_jvm_scope_delta_rules) {
          "package n;\npublic class C {\n    public void m() {}\n}\n", local, "C"},
         {"java enum constant removed", java, "package n;\npublic enum Color { RED, GREEN }\n",
          "package n;\npublic enum Color { RED }\n", local, "GREEN"},
-        /* ... unless the overloads' one node was its own: the node moves to
-         * the declaration that stays */
-        {"java node owner removed", java, JT_DJ_BASE,
-         JT_DJ_HEAD JT_DJ_OPEN JT_DJ_RUN_INT JT_DJ_SIZE JT_DJ_CLOSE, global, NULL},
+        /* the later overload had a node of its own (overloads no longer share
+         * one, cbm_split_overloads): removing it moves no other node */
+        {"java later overload removed", java, JT_DJ_BASE,
+         JT_DJ_HEAD JT_DJ_OPEN JT_DJ_RUN_INT JT_DJ_SIZE JT_DJ_CLOSE, local, "run"},
         /* everything else can re-route references of files with no edge here */
         {"java member added", java, JT_DJ_BASE,
          JT_DJ_HEAD JT_DJ_OPEN JT_DJ_BODY "    public int more;\n" JT_DJ_CLOSE, global, NULL},
@@ -2725,6 +2730,7 @@ TEST(doc_mentions_jvm_scope_delta_rules) {
         {"kotlin receiver's import changed", kotlin,
          "package n\n\nimport acme.local.Recv\n\nfun Recv.ext() {}\n",
          "package n\n\nimport acme.other.Recv\n\nfun Recv.ext() {}\n", global, NULL},
+        /* the removed overload, and the one whose node moved: one name */
         {"kotlin overload removed", kotlin, JT_DK_BASE,
          JT_DK_HEAD JT_DK_OPEN JT_DK_RUN_STR JT_DK_SIZE JT_DK_CLOSE, local, "run"},
         {"kotlin property removed", kotlin, JT_DK_BASE,
@@ -2803,7 +2809,7 @@ static const char JT_I_TARGET_RENAMED[] = "package lib;\n"
                                           "    public static final int LIMIT = 20;\n"
                                           "    public void go(int n) {}\n"
                                           "}\n";
-/* one node for both overloads; it belongs to the later declaration */
+/* a node per overload: lib.Ov.run, then lib.Ov.run(String) */
 static const char JT_I_OV[] = "package lib;\n"
                               "public class Ov {\n"
                               "    public void run(int n) {}\n"
@@ -2956,7 +2962,7 @@ TEST(doc_mentions_jvm_incremental_equals_full) {
     /* a doc-comment edit re-extracts the file alone */
     jt_write(&r, main_java, JT_I_MAIN_EDITED);
     ASSERT_EQ(dm_step(r.repo, db, full_db, "doc edit", repair), 0);
-    ASSERT_EQ(jt_edge(db, "app.Main", "lib.Ov.run"), 1);
+    ASSERT_EQ(jt_edge(db, "app.Main", "lib.Ov.run(String)"), 1); /* the second overload */
 
     /* a body edit in a TARGET file: its scope is unchanged, and the edges
      * into it stand */
