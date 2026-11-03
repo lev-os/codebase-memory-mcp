@@ -1352,6 +1352,17 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
         cbm_suppress_external_import_shadow(call->callee_name, res.strategy, imports, imp_keys,
                                             imp_count, cbm_pipeline_get_pkgmap(),
                                             cbm_pipeline_get_nsmap()) ||
+        /* Kotlin: a member call on an untyped receiver whose leaf the file
+         * imports from a library, or whose receiver the Kotlin LSP typed as a
+         * library type, is never a project method. MUST match pass_parallel.c. */
+        /* (Kotlin calls carry no is_method flag; the helper reads the dotted
+         * callee as the member form.) */
+        cbm_suppress_kotlin_external_import_member(
+            lang == CBM_LANG_KOTLIN, true, call->callee_name, res.strategy, imports,
+            imp_keys, imp_count, cbm_pipeline_get_pkgmap(), cbm_pipeline_get_nsmap()) ||
+        (lang == CBM_LANG_KOTLIN && cbm_suppress_weak_member_match(true, true, res.strategy) &&
+         cbm_pipeline_kotlin_receiver_external(lsp_calls, call) &&
+         cbm_pipeline_qn_is_type_member(ctx->gbuf, res.qualified_name)) ||
         /* MUST match pass_parallel.c exactly. */
         (lang == CBM_LANG_PHP && cbm_suppress_weak_member_match(true, true, res.strategy) &&
          cbm_pipeline_php_receiver_type_unindexed(lsp_calls, call, ctx->registry));

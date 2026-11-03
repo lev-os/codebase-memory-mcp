@@ -467,6 +467,17 @@ bool cbm_suppress_external_import_shadow(const char *callee_name, const char *st
                                          const CBMHashTable *indexed_packages,
                                          const CBMHashTable *declared_packages);
 
+/* Kotlin member call `x.leaf()` whose leaf name the file imports from a
+ * package the tree does not declare (`import kotlinx.coroutines.launch`): a
+ * weak project-wide guess must not bind it. this/super receivers keep it.
+ * Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_kotlin_external_import_member(bool is_kotlin, bool is_method,
+                                                const char *callee_name, const char *strategy,
+                                                const CBMImportArray *file_imports,
+                                                const char **import_map_keys, int import_map_count,
+                                                const CBMHashTable *indexed_packages,
+                                                const CBMHashTable *declared_packages);
+
 /* Go analog of the TS/JS guard, same failure class: a selector call whose
  * receiver the Go LSP could not type must not be bound by a receiver-blind
  * short-name strategy. Drops suffix_match / fuzzy always, and unique_name only

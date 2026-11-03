@@ -74,6 +74,8 @@ typedef struct {
 #define KT_CONF_TOP_LEVEL 0.95f
 #define KT_CONF_LAMBDA_IT 0.78f
 #define KT_CONF_IMPORT 0.92f
+/* Below CBM_LSP_CONFIDENCE_FLOOR: an evidence row, never an edge. */
+#define KT_CONF_EXTERNAL_RECEIVER 0.55f
 
 /* ── forward declarations ─────────────────────────────────────────── */
 
@@ -446,7 +448,11 @@ static void kt_emit_resolved_kind(KotlinLSPContext *ctx, const char *callee_qn,
     if (!ctx->resolved_calls || !ctx->enclosing_func_qn || !callee_qn) {
         return;
     }
-    if (confidence < 0.60f) {
+    /* Sub-floor rows are dropped, except the external-receiver evidence row:
+     * it is meant to stay below CBM_LSP_CONFIDENCE_FLOOR (never an edge) and
+     * is read only by cbm_pipeline_kotlin_receiver_external. */
+    if (confidence < 0.60f &&
+        !(strategy && strcmp(strategy, "lsp_kt_external_receiver") == 0)) {
         return;
     }
 
@@ -3219,6 +3225,21 @@ static TSNode kt_nav_member_node(TSNode nav) {
     return sel;
 }
 
+/* True when recv_qn is a qualified type whose simple name no project type
+ * carries. Only the cross-file pass knows every project type
+ * (cross_type_short); the per-file pass answers false. A project type that
+ * shares the simple name keeps the receiver "maybe project" (fail open). */
+static bool kt_receiver_is_library_type(const KotlinLSPContext *ctx, const char *recv_qn) {
+    if (!ctx || !ctx->cross_type_short || !recv_qn || !strchr(recv_qn, '.')) {
+        return false;
+    }
+    const char *short_name = kt_short(recv_qn);
+    if (!short_name || !short_name[0]) {
+        return false;
+    }
+    return cbm_ht_get((const CBMHashTable *)ctx->cross_type_short, short_name) == NULL;
+}
+
 static const CBMType *kt_eval_navigation_expression_type(KotlinLSPContext *ctx, TSNode node) {
     return kt_eval_navigation_expression_type_at(ctx, node, node);
 }
@@ -3278,6 +3299,16 @@ static const CBMType *kt_eval_navigation_expression_type_at(KotlinLSPContext *ct
     const CBMType *recv_type = kotlin_eval_expr_type(ctx, receiver_node);
     recv_type = kt_unwrap_nullable(recv_type);
     const char *recv_qn = kt_type_qn_of(recv_type);
+
+    /* A call on a receiver typed as a library type (no project type has its
+     * simple name) cannot reach a project method. Leave a sub-floor
+     * `lsp_kt_external_receiver` row at the call so the pipeline refuses a
+     * weak same-name guess (`progressDialog.dismiss()` -> a project
+     * `dismiss`). Cross pass only: it alone holds every project type. */
+    if (kt_receiver_is_library_type(ctx, recv_qn) && !ts_node_eq(site, node)) {
+        kt_emit_resolved_at(ctx, kt_join_dot(ctx->arena, recv_qn, member_text),
+                            "lsp_kt_external_receiver", KT_CONF_EXTERNAL_RECEIVER, site);
+    }
 
     /* Receiver might be a class reference itself — `Foo.bar()` where Foo is
      * a singleton object or an enum class with a companion. */

@@ -451,6 +451,67 @@ static inline bool cbm_pipeline_php_receiver_type_unindexed(const CBMResolvedCal
     return false;
 }
 
+/* True when `qn` names a member of a project TYPE: the node one segment up is
+ * type-like (Class, Interface, Enum, ...). A Kotlin top-level extension
+ * function (`fun String.tokenize()`, a Method node directly under its file's
+ * module) is not, and stays callable on a library receiver. */
+static inline bool cbm_pipeline_qn_is_type_member(const cbm_gbuf_t *gbuf, const char *qn) {
+    if (!gbuf || !qn) {
+        return false;
+    }
+    const char *dot = strrchr(qn, '.');
+    if (!dot || dot == qn) {
+        return false;
+    }
+    size_t len = (size_t)(dot - qn);
+    char *owner = (char *)malloc(len + 1);
+    if (!owner) {
+        return false;
+    }
+    memcpy(owner, qn, len);
+    owner[len] = '\0';
+    const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(gbuf, owner);
+    free(owner);
+    return n && n->label && cbm_label_is_type_like(n->label);
+}
+
+/* A sub-floor `lsp_kt_external_receiver` row: the cross-file Kotlin LSP typed
+ * this call's receiver as a type the project does not declare (a library or
+ * stdlib class such as android.app.ProgressDialog or a CoroutineScope), so a
+ * weak short-name fallback must not bind the call to a same-named project
+ * method (callers also check cbm_pipeline_qn_is_type_member: a project
+ * extension function on that type still binds). The row names no graph node
+ * and never becomes an edge itself. */
+static inline bool cbm_pipeline_kotlin_receiver_external(const CBMResolvedCallArray *arr,
+                                                         const CBMCall *call) {
+    if (!arr || !call || !call->enclosing_func_qn || !call->callee_name) {
+        return false;
+    }
+    /* The Kotlin LSP spells callers by package (com.acme.Screen.close), the
+     * graph by path: an exact occurrence span, the exact caller, or the same
+     * Class.method tail joins them (as cbm_pipeline_find_lsp_resolution_in_graph
+     * does for JVM rows). */
+    const char *call_tail = cbm_pipeline_qn_class_method_tail(call->enclosing_func_qn);
+    for (int i = 0; i < arr->count; i++) {
+        const CBMResolvedCall *rc = &arr->items[i];
+        if (rc->kind != CBM_RESOLVED_INVOCATION || !rc->caller_qn || !rc->callee_qn ||
+            !rc->strategy || strcmp(rc->strategy, "lsp_kt_external_receiver") != 0) {
+            continue;
+        }
+        int site_rank = cbm_pipeline_invocation_site_rank(rc, call);
+        if (site_rank == 0 || !cbm_pipeline_invocation_leaf_matches(rc, call, site_rank)) {
+            continue;
+        }
+        bool caller_matches =
+            site_rank == 2 || strcmp(rc->caller_qn, call->enclosing_func_qn) == 0 ||
+            (call_tail && cbm_pipeline_qn_class_method_tail_eq(rc->caller_qn, call_tail));
+        if (caller_matches) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Look up the highest-confidence LSP-resolved call entry whose caller QN
  * matches the textual call's enclosing function and whose callee QN
  * short-name matches the textual callee. Returns a pointer into `arr`
