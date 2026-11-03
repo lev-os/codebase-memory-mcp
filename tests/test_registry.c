@@ -1841,6 +1841,56 @@ TEST(external_import_shadow_drops_package_bound_bare_call) {
     PASS();
 }
 
+TEST(kotlin_external_import_member_drops_library_leaf) {
+    /* `import kotlinx.coroutines.launch` binds the leaf of `scope.launch {}`
+     * to the library builder; a weak project-wide guess must not bind it. */
+    CBMImport imports[] = {
+        {.local_name = "launch", .module_path = "kotlinx.coroutines.launch"},
+        {.local_name = "ScreenModel", .module_path = "com.acme.vm.ScreenModel"},
+    };
+    CBMImportArray arr = {.items = imports, .count = 2, .cap = 2};
+    const char *keys[] = {"ScreenModel"};
+    ASSERT_TRUE(cbm_suppress_kotlin_external_import_member(true, true, "scope.launch",
+                                                           "unique_name", &arr, keys, 1, NULL,
+                                                           NULL));
+    ASSERT_TRUE(cbm_suppress_kotlin_external_import_member(true, true, "a.b?.launch",
+                                                           "suffix_match", &arr, keys, 1, NULL,
+                                                           NULL));
+    /* Negative space: other languages, bare calls, this/super receivers,
+     * receiver-aware strategies, leaves not imported, in-tree imports. */
+    ASSERT_FALSE(cbm_suppress_kotlin_external_import_member(false, true, "scope.launch",
+                                                            "unique_name", &arr, keys, 1, NULL,
+                                                            NULL));
+    ASSERT_FALSE(cbm_suppress_kotlin_external_import_member(true, false, "launch", "unique_name",
+                                                            &arr, keys, 1, NULL, NULL));
+    ASSERT_FALSE(cbm_suppress_kotlin_external_import_member(true, true, "this.launch",
+                                                            "unique_name", &arr, keys, 1, NULL,
+                                                            NULL));
+    ASSERT_FALSE(cbm_suppress_kotlin_external_import_member(true, true, "super.launch",
+                                                            "unique_name", &arr, keys, 1, NULL,
+                                                            NULL));
+    ASSERT_FALSE(cbm_suppress_kotlin_external_import_member(true, true, "scope.launch",
+                                                            "lsp_kt_method", &arr, keys, 1, NULL,
+                                                            NULL));
+    ASSERT_FALSE(cbm_suppress_kotlin_external_import_member(true, true, "vm.refresh",
+                                                            "unique_name", &arr, keys, 1, NULL,
+                                                            NULL));
+    /* The Kotlin import map keys every import, resolved or not: a key alone
+     * keeps nothing. */
+    const char *all_keys[] = {"launch", "ScreenModel"};
+    ASSERT_TRUE(cbm_suppress_kotlin_external_import_member(true, true, "scope.launch",
+                                                           "unique_name", &arr, all_keys, 2, NULL,
+                                                           NULL));
+    CBMHashTable *declared = cbm_ht_create(4);
+    ASSERT_NOT_NULL(declared);
+    cbm_ht_set(declared, "kotlinx.coroutines", (void *)"1");
+    ASSERT_FALSE(cbm_suppress_kotlin_external_import_member(true, true, "scope.launch",
+                                                            "unique_name", &arr, keys, 1, NULL,
+                                                            declared));
+    cbm_ht_free(declared);
+    PASS();
+}
+
 TEST(external_import_shadow_keeps_everything_else) {
     /* Negative space: every input that is NOT "bare call bound to a package
      * import the graph could not resolve" must keep its edge. */
@@ -2718,6 +2768,7 @@ SUITE(registry) {
     RUN_TEST(weak_call_guards_share_one_drop_list);
     RUN_TEST(external_import_shadow_drops_package_bound_bare_call);
     RUN_TEST(external_import_shadow_keeps_everything_else);
+    RUN_TEST(kotlin_external_import_member_drops_library_leaf);
     RUN_TEST(external_import_shadow_relative_binding_wins_the_tie);
     RUN_TEST(external_import_shadow_windows_relative_specifier_kept);
     RUN_TEST(external_import_shadow_workspace_sibling_kept);

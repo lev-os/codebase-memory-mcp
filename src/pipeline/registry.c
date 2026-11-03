@@ -986,6 +986,50 @@ bool cbm_suppress_external_import_shadow(const char *callee_name, const char *st
     return external_binding;
 }
 
+/* Kotlin member-call counterpart of the import-shadow guard above. Kotlin
+ * reaches a library extension function through an explicit import of its
+ * NAME: `import kotlinx.coroutines.launch` makes `scope.launch {}` the
+ * coroutine builder. When such a call reaches the registry, the Kotlin LSP
+ * could not type the receiver, and a project-wide same-name guess binds it to
+ * whatever project method shares the name (`lifecycleScope.launch {}` ->
+ * a project ScreenModel.launch). The import of the leaf name from a package
+ * the tree does not declare is the same positive evidence the bare-call guard
+ * uses, so the weak guess is refused. A `this.` / `super.` receiver names the
+ * enclosing class, never the import, and keeps the guess; so does every
+ * receiver- or import-aware
+ * strategy (cbm_suppress_external_import_shadow's own drop-list). A leaf
+ * imported from a package the tree declares (`import com.acme.util.launch`)
+ * is in-tree and keeps the guess. Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_kotlin_external_import_member(bool is_kotlin, bool is_method,
+                                                const char *callee_name, const char *strategy,
+                                                const CBMImportArray *file_imports,
+                                                const char **import_map_keys, int import_map_count,
+                                                const CBMHashTable *indexed_packages,
+                                                const CBMHashTable *declared_packages) {
+    if (!is_kotlin || !is_method || !callee_name) {
+        return false;
+    }
+    const char *dot = strrchr(callee_name, '.');
+    if (!dot || dot == callee_name || !dot[1]) {
+        return false;
+    }
+    if (strncmp(callee_name, "this", 4) == 0 &&
+        (callee_name[4] == '.' || callee_name[4] == '@' || callee_name[4] == '?')) {
+        return false;
+    }
+    if (strncmp(callee_name, "super", 5) == 0 &&
+        (callee_name[5] == '.' || callee_name[5] == '@' || callee_name[5] == '<')) {
+        return false;
+    }
+    /* The Kotlin import map lists every import's local name, resolved or
+     * not (pass_lsp_cross.c metadata entries), so a key is no proof that the
+     * import names project code; the declared-package test decides instead. */
+    (void)import_map_keys;
+    (void)import_map_count;
+    return cbm_suppress_external_import_shadow(dot + 1, strategy, file_imports, NULL, 0,
+                                               indexed_packages, declared_packages);
+}
+
 bool cbm_go_suppress_weak_method_match(bool is_go, bool is_method, const char *strategy,
                                        double confidence) {
     /* Go analog of the TS/JS guard above, same failure class: a selector call
