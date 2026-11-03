@@ -58,7 +58,7 @@
  * start line, name and kind), so this file models neither the qualified-name
  * scheme nor its collisions: Kotlin flattens nested types and puts class
  * properties at module level, Java names a field after its whole declarator
- * (`MAX = 10`), overloads share one name, and whatever the scheme does next is
+ * (`MAX = 10`), a later overload's name has its signature, and whatever the scheme does next is
  * followed without a change here.
  * pnames (the parameter names of a callable, the primary-constructor
  * parameters of a Kotlin class) and all line numbers serve the file's own
