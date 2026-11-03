@@ -106,7 +106,8 @@ const char **cbm_string_dispatch_suffixes(CBMLanguage lang) {
 }
 
 // Forward declarations
-static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, CBMLanguage lang);
+static char *extract_callee_name(CBMExtractCtx *ctx, CBMArena *a, TSNode node, const char *source,
+                                 CBMLanguage lang);
 static char *gotemplate_callee(CBMArena *a, TSNode node, const char *source);
 static const char *strip_and_validate_string_arg(CBMArena *a, char *text);
 
@@ -485,78 +486,160 @@ static char *swift_cast_type_name(CBMArena *a, TSNode expr, const char *source) 
     return swift_plain_type_name(a, ts_node_child_by_field_name(expr, TS_FIELD("name")), source);
 }
 
-/* Swift local `let x = y as? T` (also `if let` / `guard let`) declared before
- * `site` in the same function: the cast type of x, else NULL. Only casts and
- * explicit `let x: T` annotations count; nothing is inferred. */
-static char *swift_local_cast_type(CBMArena *a, TSNode site, const char *name,
-                                   const char *source) {
-    TSNode body = site;
-    while (!ts_node_is_null(body) && strcmp(ts_node_type(body), "function_body") != 0 &&
-           strcmp(ts_node_type(body), "lambda_literal") != 0 &&
-           strcmp(ts_node_type(body), "computed_property") != 0) {
-        body = ts_node_parent(body);
+/* Swift local bindings a cast receiver can name: every `let x = y as? T` /
+ * `let x: T` (a property_declaration) and every `if let x = y as? T` /
+ * `guard let x = y as? T` in one function body, in source order. The lookup
+ * answers "the type of x at the latest binding of x before the call site",
+ * which a walk of the body per call answered in time quadratic in the size of
+ * the function (2k lines: 5 s, 8k lines: 46 s). Each body is read once into a
+ * table; each call is then a hash probe and a binary search. */
+typedef struct {
+    const char *name;
+    const char *type; /* NULL: the binding names no type, so it hides earlier ones */
+    uint32_t start;   /* start byte of the statement that binds the name */
+    uint32_t order;   /* pre-order position, to keep same-start bindings in order */
+} SwiftBinding;
+
+typedef struct {
+    const char *name; /* NULL: empty slot */
+    uint32_t first;   /* this name's bindings: entries[first .. first + count) */
+    uint32_t count;
+} SwiftBindingName;
+
+typedef struct {
+    const void *id; /* the body node (TSNode.id), with its byte span */
+    uint32_t start;
+    uint32_t end;
+    SwiftBinding *entries; /* grouped by name, source order within a name */
+    SwiftBindingName *names;
+    uint32_t name_cap; /* power of two; 0 when the body binds nothing */
+} SwiftBindingBody;
+
+/* Per-file table of bodies, held in CBMExtractCtx.swift_bindings. */
+typedef struct {
+    SwiftBindingBody **slots;
+    uint32_t cap; /* power of two */
+    uint32_t count;
+} SwiftBindingCache;
+
+static uint32_t swift_name_hash(const char *s) {
+    uint32_t h = 2166136261U;
+    for (; *s; s++) {
+        h = (h ^ (unsigned char)*s) * 16777619U;
     }
-    if (ts_node_is_null(body)) {
+    return h;
+}
+
+static uint32_t swift_body_hash(const void *id, uint32_t start) {
+    uintptr_t v = (uintptr_t)id ^ ((uintptr_t)start * 2654435761U);
+    v ^= v >> 17;
+    v *= 0x9E3779B1U;
+    return (uint32_t)(v ^ (v >> 15));
+}
+
+static int swift_binding_cmp(const void *pa, const void *pb) {
+    const SwiftBinding *x = pa;
+    const SwiftBinding *y = pb;
+    int c = strcmp(x->name, y->name);
+    if (c != 0) {
+        return c;
+    }
+    return (x->order > y->order) - (x->order < y->order);
+}
+
+/* The type a property_declaration's binding names: its cast, else its
+ * `: T` / `: T?` annotation. NULL when it names neither. */
+static char *swift_declared_type(CBMArena *a, TSNode decl, const char *source) {
+    char *t = swift_cast_type_name(a, ts_node_child_by_field_name(decl, TS_FIELD("value")), source);
+    if (t) {
+        return t;
+    }
+    TSNode ann = cbm_find_child_by_kind(decl, "type_annotation");
+    if (ts_node_is_null(ann)) {
         return NULL;
     }
-    uint32_t site_start = ts_node_start_byte(site);
-    char *found = NULL;
-    /* Iterative pre-order walk over the body, bounded to bindings that start
-     * before the call. */
+    TSNode tn = ts_node_child_by_field_name(ann, TS_FIELD("name"));
+    if (!ts_node_is_null(tn) && strcmp(ts_node_type(tn), "optional_type") == 0) {
+        tn = ts_node_child_by_field_name(tn, TS_FIELD("wrapped"));
+    }
+    return swift_plain_type_name(a, tn, source);
+}
+
+typedef struct {
+    CBMArena *a;
+    SwiftBinding *items;
+    uint32_t count;
+    uint32_t cap;
+} SwiftBindingList;
+
+static void swift_binding_push(SwiftBindingList *l, const char *name, const char *type,
+                               uint32_t start) {
+    if (!name || !name[0]) {
+        return;
+    }
+    if (l->count == l->cap) {
+        uint32_t cap = l->cap ? l->cap * 2 : 16;
+        SwiftBinding *grown = cbm_arena_alloc(l->a, (size_t)cap * sizeof(SwiftBinding));
+        if (!grown) {
+            return;
+        }
+        if (l->count) {
+            memcpy(grown, l->items, (size_t)l->count * sizeof(SwiftBinding));
+        }
+        l->items = grown;
+        l->cap = cap;
+    }
+    l->items[l->count] = (SwiftBinding){name, type, start, l->count};
+    l->count++;
+}
+
+/* Read every binding of `body` in one pre-order walk (the walk the per-call
+ * lookup used to repeat). */
+static SwiftBindingBody *swift_bindings_build(CBMArena *a, TSNode body, const char *source) {
+    SwiftBindingBody *b = cbm_arena_calloc(a, sizeof(SwiftBindingBody));
+    if (!b) {
+        return NULL;
+    }
+    b->id = body.id;
+    b->start = ts_node_start_byte(body);
+    b->end = ts_node_end_byte(body);
+    SwiftBindingList list = {.a = a};
     TSTreeCursor cur = ts_tree_cursor_new(body);
     bool more = true;
     while (more) {
         TSNode n = ts_tree_cursor_current_node(&cur);
-        if (ts_node_start_byte(n) >= site_start) {
-            break;
-        }
         const char *k = ts_node_type(n);
+        uint32_t at = ts_node_start_byte(n);
         if (strcmp(k, "if_statement") == 0 || strcmp(k, "guard_statement") == 0) {
             /* `if let x = y as? T` / `guard let x = y as? T`: the bound name
-             * and its cast are consecutive children of the statement. */
-            bool bound_here = false;
+             * and its cast are consecutive children of the statement. A bound
+             * name without a cast hides nothing. */
+            char *bound = NULL;
             uint32_t nc = ts_node_named_child_count(n);
             for (uint32_t i = 0; i < nc; i++) {
                 TSNode c = ts_node_named_child(n, i);
                 const char *ck = ts_node_type(c);
                 if (strcmp(ck, "simple_identifier") == 0) {
-                    char *bn = cbm_node_text(a, c, source);
-                    bound_here = bn && strcmp(bn, name) == 0;
-                } else if (bound_here && strcmp(ck, "as_expression") == 0) {
+                    bound = cbm_node_text(a, c, source);
+                } else if (bound && strcmp(ck, "as_expression") == 0) {
                     char *t = swift_cast_type_name(a, c, source);
                     if (t) {
-                        found = t;
+                        swift_binding_push(&list, bound, t, at);
                     }
-                    bound_here = false;
+                    bound = NULL;
                 } else if (strcmp(ck, "value_binding_pattern") != 0) {
-                    bound_here = false;
+                    bound = NULL;
                 }
             }
-        }
-        if (strcmp(k, "property_declaration") == 0) {
+        } else if (strcmp(k, "property_declaration") == 0) {
             /* name: pattern(bound_identifier) [type_annotation] value: expr */
             TSNode pat = ts_node_child_by_field_name(n, TS_FIELD("name"));
             TSNode bound = ts_node_is_null(pat)
                                ? pat
                                : ts_node_child_by_field_name(pat, TS_FIELD("bound_identifier"));
             if (!ts_node_is_null(bound)) {
-                char *bn = cbm_node_text(a, bound, source);
-                if (bn && strcmp(bn, name) == 0) {
-                    char *t = swift_cast_type_name(
-                        a, ts_node_child_by_field_name(n, TS_FIELD("value")), source);
-                    if (!t) {
-                        TSNode ann = cbm_find_child_by_kind(n, "type_annotation");
-                        if (!ts_node_is_null(ann)) {
-                            TSNode tn = ts_node_child_by_field_name(ann, TS_FIELD("name"));
-                            if (!ts_node_is_null(tn) &&
-                                strcmp(ts_node_type(tn), "optional_type") == 0) {
-                                tn = ts_node_child_by_field_name(tn, TS_FIELD("wrapped"));
-                            }
-                            t = swift_plain_type_name(a, tn, source);
-                        }
-                    }
-                    found = t; /* the latest binding before the call wins */
-                }
+                swift_binding_push(&list, cbm_node_text(a, bound, source),
+                                   swift_declared_type(a, n, source), at);
             }
         }
         if (ts_tree_cursor_goto_first_child(&cur)) {
@@ -570,7 +653,130 @@ static char *swift_local_cast_type(CBMArena *a, TSNode site, const char *name,
         }
     }
     ts_tree_cursor_delete(&cur);
-    return found;
+    if (list.count == 0) {
+        return b;
+    }
+    qsort(list.items, list.count, sizeof(SwiftBinding), swift_binding_cmp);
+    uint32_t cap = 16;
+    while (cap < list.count * 2) {
+        cap *= 2;
+    }
+    b->names = cbm_arena_calloc(a, (size_t)cap * sizeof(SwiftBindingName));
+    if (!b->names) {
+        return b;
+    }
+    b->entries = list.items;
+    b->name_cap = cap;
+    for (uint32_t i = 0; i < list.count;) {
+        uint32_t j = i + 1;
+        while (j < list.count && strcmp(list.items[j].name, list.items[i].name) == 0) {
+            j++;
+        }
+        uint32_t s = swift_name_hash(list.items[i].name) & (cap - 1);
+        while (b->names[s].name) {
+            s = (s + 1) & (cap - 1);
+        }
+        b->names[s] = (SwiftBindingName){list.items[i].name, i, j - i};
+        i = j;
+    }
+    return b;
+}
+
+/* The binding table of `body`, built on first use and kept for the file. */
+static SwiftBindingBody *swift_bindings_for(CBMExtractCtx *ctx, TSNode body) {
+    CBMArena *a = ctx->scratch ? ctx->scratch : ctx->arena;
+    SwiftBindingCache *c = ctx->swift_bindings;
+    if (!c) {
+        c = cbm_arena_calloc(a, sizeof(SwiftBindingCache));
+        if (!c) {
+            return NULL;
+        }
+        c->cap = 64;
+        c->slots = cbm_arena_calloc(a, (size_t)c->cap * sizeof(SwiftBindingBody *));
+        if (!c->slots) {
+            return NULL;
+        }
+        ctx->swift_bindings = c;
+    }
+    uint32_t start = ts_node_start_byte(body);
+    uint32_t end = ts_node_end_byte(body);
+    uint32_t s = swift_body_hash(body.id, start) & (c->cap - 1);
+    for (SwiftBindingBody *e; (e = c->slots[s]) != NULL; s = (s + 1) & (c->cap - 1)) {
+        if (e->id == body.id && e->start == start && e->end == end) {
+            return e;
+        }
+    }
+    SwiftBindingBody *b = swift_bindings_build(a, body, ctx->source);
+    if (!b) {
+        return NULL;
+    }
+    if ((c->count + 1) * 2 > c->cap) {
+        uint32_t cap = c->cap * 2;
+        SwiftBindingBody **slots = cbm_arena_calloc(a, (size_t)cap * sizeof(SwiftBindingBody *));
+        if (!slots) {
+            return b; /* answer this call; the next one rebuilds */
+        }
+        for (uint32_t i = 0; i < c->cap; i++) {
+            SwiftBindingBody *e = c->slots[i];
+            if (e) {
+                uint32_t t = swift_body_hash(e->id, e->start) & (cap - 1);
+                while (slots[t]) {
+                    t = (t + 1) & (cap - 1);
+                }
+                slots[t] = e;
+            }
+        }
+        c->slots = slots;
+        c->cap = cap;
+        s = swift_body_hash(body.id, start) & (cap - 1);
+        while (c->slots[s]) {
+            s = (s + 1) & (cap - 1);
+        }
+    }
+    c->slots[s] = b;
+    c->count++;
+    return b;
+}
+
+/* Swift local `let x = y as? T` (also `if let` / `guard let`) declared before
+ * `site` in the same function: the cast type of x, else NULL. Only casts and
+ * explicit `let x: T` annotations count; nothing is inferred. */
+static char *swift_local_cast_type(CBMExtractCtx *ctx, TSNode site, const char *name) {
+    TSNode body = site;
+    while (!ts_node_is_null(body) && strcmp(ts_node_type(body), "function_body") != 0 &&
+           strcmp(ts_node_type(body), "lambda_literal") != 0 &&
+           strcmp(ts_node_type(body), "computed_property") != 0) {
+        body = ts_node_parent(body);
+    }
+    if (!ctx || ts_node_is_null(body)) {
+        return NULL;
+    }
+    SwiftBindingBody *b = swift_bindings_for(ctx, body);
+    if (!b || b->name_cap == 0) {
+        return NULL;
+    }
+    uint32_t s = swift_name_hash(name) & (b->name_cap - 1);
+    while (b->names[s].name && strcmp(b->names[s].name, name) != 0) {
+        s = (s + 1) & (b->name_cap - 1);
+    }
+    if (!b->names[s].name) {
+        return NULL;
+    }
+    /* The latest binding that starts before the call: starts rise with
+     * source order inside one name's run. */
+    const SwiftBinding *run = b->entries + b->names[s].first;
+    uint32_t lo = 0;
+    uint32_t hi = b->names[s].count;
+    uint32_t site_start = ts_node_start_byte(site);
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (run[mid].start < site_start) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo == 0 ? NULL : (char *)run[lo - 1].type;
 }
 
 /* True when a line break separates the receiver from the `.member` suffix:
@@ -586,6 +792,165 @@ static bool swift_suffix_starts_line(TSNode target, TSNode suffix, const char *s
     return false;
 }
 
+/* SwiftUI view modifiers: a chain that already applies one of these is a view
+ * chain whatever its root is (`content\n  .padding()\n  .tagged()`). */
+static const char *const swift_view_modifiers[] = {
+    "accessibilityElement",
+    "accessibilityHidden",
+    "accessibilityIdentifier",
+    "accessibilityLabel",
+    "alignmentGuide",
+    "animation",
+    "aspectRatio",
+    "background",
+    "blur",
+    "border",
+    "buttonStyle",
+    "clipShape",
+    "clipped",
+    "contentShape",
+    "contextMenu",
+    "cornerRadius",
+    "edgesIgnoringSafeArea",
+    "environment",
+    "environmentObject",
+    "fixedSize",
+    "focused",
+    "font",
+    "fontWeight",
+    "foregroundColor",
+    "foregroundStyle",
+    "frame",
+    "fullScreenCover",
+    "gesture",
+    "ignoresSafeArea",
+    "labelStyle",
+    "layoutPriority",
+    "lineLimit",
+    "lineSpacing",
+    "listRowBackground",
+    "listRowInsets",
+    "listRowSeparator",
+    "listStyle",
+    "mask",
+    "minimumScaleFactor",
+    "multilineTextAlignment",
+    "navigationBarBackButtonHidden",
+    "navigationBarHidden",
+    "navigationBarTitleDisplayMode",
+    "navigationDestination",
+    "navigationTitle",
+    "offset",
+    "onAppear",
+    "onChange",
+    "onDisappear",
+    "onLongPressGesture",
+    "onPreferenceChange",
+    "onSubmit",
+    "onTapGesture",
+    "opacity",
+    "overlay",
+    "padding",
+    "pickerStyle",
+    "position",
+    "presentationDetents",
+    "presentationDragIndicator",
+    "refreshable",
+    "resizable",
+    "rotationEffect",
+    "safeAreaInset",
+    "scaleEffect",
+    "scaledToFill",
+    "scaledToFit",
+    "scrollDisabled",
+    "scrollIndicators",
+    "searchable",
+    "shadow",
+    "sheet",
+    "simultaneousGesture",
+    "tabItem",
+    "textFieldStyle",
+    "tint",
+    "toggleStyle",
+    "toolbar",
+    "transition",
+    "truncationMode",
+    "underline",
+    "zIndex",
+    NULL,
+};
+
+static bool swift_is_view_modifier(const char *name) {
+    for (const char *const *m = swift_view_modifiers; *m; m++) {
+        if (strcmp(*m, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The member a navigation_expression names (`a.b` -> b), or NULL. */
+static char *swift_nav_member(CBMArena *a, TSNode nav, const char *source) {
+    TSNode suffix = ts_node_child_by_field_name(nav, TS_FIELD("suffix"));
+    TSNode member = ts_node_is_null(suffix)
+                        ? suffix
+                        : ts_node_child_by_field_name(suffix, TS_FIELD("suffix"));
+    if (ts_node_is_null(member) || strcmp(ts_node_type(member), "simple_identifier") != 0) {
+        return NULL;
+    }
+    return cbm_node_text(a, member, source);
+}
+
+/* True when the receiver chain under a leading-dot call is a SwiftUI view:
+ * its root constructs a view (`Text("a")`, `VStack { }`, `Kit.Card()`: a
+ * constructor expression, or a call of a capitalised name), or the chain,
+ * this call included, applies a known view modifier. A chain rooted anywhere else
+ * (`make()\n  .resume()`, `URLSession.shared.dataTask(...)\n  .resume()`,
+ * Combine / RxSwift operators) is not a view and keeps its source text. */
+static bool swift_chain_is_view(CBMArena *a, TSNode target, const char *mname,
+                                const char *source) {
+    if (swift_is_view_modifier(mname)) {
+        return true;
+    }
+    TSNode n = target;
+    while (!ts_node_is_null(n)) {
+        const char *k = ts_node_type(n);
+        if (strcmp(k, "constructor_expression") == 0) {
+            return true;
+        }
+        TSNode nav = {0};
+        bool called = false;
+        if (strcmp(k, "call_expression") == 0) {
+            if (ts_node_named_child_count(n) == 0) {
+                return false;
+            }
+            TSNode callee = ts_node_named_child(n, 0);
+            const char *ck = ts_node_type(callee);
+            if (strcmp(ck, "simple_identifier") == 0) {
+                char *root = cbm_node_text(a, callee, source);
+                return root && root[0] >= 'A' && root[0] <= 'Z';
+            }
+            if (strcmp(ck, "navigation_expression") != 0) {
+                return false;
+            }
+            nav = callee;
+            called = true;
+        } else if (strcmp(k, "navigation_expression") == 0) {
+            nav = n;
+        } else {
+            return false;
+        }
+        char *m = swift_nav_member(a, nav, source);
+        /* `Kit.Card(...)` constructs a qualified type; `.padding()` is a view
+         * modifier. */
+        if (m && ((called && m[0] >= 'A' && m[0] <= 'Z') || swift_is_view_modifier(m))) {
+            return true;
+        }
+        n = ts_node_child_by_field_name(nav, TS_FIELD("target"));
+    }
+    return false;
+}
+
 /* Swift member callee spelling. The callee text of a navigation call names
  * its receiver; where the text alone cannot name the receiver's type, spell
  * the type the source does state:
@@ -594,9 +959,11 @@ static bool swift_suffix_starts_line(TSNode target, TSNode suffix, const char *s
  *   - `x?.m()` after `let x = y as? T` (or `let x: T`) -> T.m
  *   - `<view expr>\n  .m()`       -> View.m (a SwiftUI modifier: every view
  *     modifier's receiver is a View, and project modifiers are declared in
- *     `extension View`)
+ *     `extension View`), only when the chain is a view (swift_chain_is_view);
+ *     `make()\n  .resume()` keeps its text and binds like `make().resume()`
  * Everything else keeps the source text. */
-static char *swift_navigation_callee(CBMArena *a, TSNode call, TSNode nav, const char *source) {
+static char *swift_navigation_callee(CBMExtractCtx *ctx, CBMArena *a, TSNode call, TSNode nav,
+                                     const char *source) {
     TSNode target = ts_node_child_by_field_name(nav, TS_FIELD("target"));
     TSNode suffix = ts_node_child_by_field_name(nav, TS_FIELD("suffix"));
     TSNode member = ts_node_is_null(suffix)
@@ -620,11 +987,12 @@ static char *swift_navigation_callee(CBMArena *a, TSNode call, TSNode nav, const
             while (len > 0 && (recv[len - 1] == '?' || recv[len - 1] == '!')) {
                 recv[--len] = '\0';
             }
-            type = swift_local_cast_type(a, call, recv, source);
+            type = swift_local_cast_type(ctx, call, recv);
         }
     } else if ((strcmp(tk, "call_expression") == 0 ||
                 strcmp(tk, "constructor_expression") == 0) &&
-               swift_suffix_starts_line(target, suffix, source)) {
+               swift_suffix_starts_line(target, suffix, source) &&
+               swift_chain_is_view(a, target, mname, source)) {
         type = cbm_arena_strdup(a, "View");
     }
     if (type) {
@@ -633,7 +1001,8 @@ static char *swift_navigation_callee(CBMArena *a, TSNode call, TSNode nav, const
     return cbm_node_text(a, nav, source);
 }
 
-static char *extract_swift_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+static char *extract_swift_callee(CBMExtractCtx *ctx, CBMArena *a, TSNode node,
+                                  const char *source, const char *nk) {
     if (strcmp(nk, "call_expression") != 0 && strcmp(nk, "constructor_expression") != 0) {
         return NULL;
     }
@@ -644,7 +1013,7 @@ static char *extract_swift_callee(CBMArena *a, TSNode node, const char *source, 
             return cbm_node_text(a, callee, source);
         }
         if (strcmp(ck, "navigation_expression") == 0) {
-            return swift_navigation_callee(a, node, callee, source);
+            return swift_navigation_callee(ctx, a, node, callee, source);
         }
     }
     return NULL;
@@ -1779,8 +2148,8 @@ static char *extract_puppet_callee(CBMArena *a, TSNode node, const char *source,
     return NULL;
 }
 
-static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *source,
-                                          CBMLanguage lang) {
+static char *extract_callee_lang_specific(CBMExtractCtx *ctx, CBMArena *a, TSNode node,
+                                          const char *source, CBMLanguage lang) {
     const char *nk = ts_node_type(node);
 
     if (lang == CBM_LANG_FORTRAN && strcmp(nk, "subroutine_call") == 0) {
@@ -1894,7 +2263,7 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
         return extract_wolfram_callee(a, node, source);
     }
     if (lang == CBM_LANG_SWIFT) {
-        return extract_swift_callee(a, node, source, nk);
+        return extract_swift_callee(ctx, a, node, source, nk);
     }
     if (lang == CBM_LANG_VERILOG || lang == CBM_LANG_SYSTEMVERILOG) {
         char *c = extract_hdl_callee(a, node, source, nk);
@@ -2490,7 +2859,8 @@ static bool is_nested_verilog_call_wrapper(CBMLanguage lang, TSNode node) {
            strcmp(ts_node_type(parent), "function_subroutine_call") == 0;
 }
 
-static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, CBMLanguage lang) {
+static char *extract_callee_name(CBMExtractCtx *ctx, CBMArena *a, TSNode node, const char *source,
+                                 CBMLanguage lang) {
     if (call_node_is_definition_container(lang, node, source)) {
         return NULL;
     }
@@ -2585,7 +2955,7 @@ static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, C
     }
 
     // Language-specific patterns
-    name = extract_callee_lang_specific(a, node, source, lang);
+    name = extract_callee_lang_specific(ctx, a, node, source, lang);
     if (name) {
         return name;
     }
@@ -4575,7 +4945,7 @@ static TSNode language_specific_callee_leaf(CBMLanguage language, TSNode expr,
 static CBMPrimaryCalleeSelection select_primary_callee(CBMExtractCtx *ctx, TSNode node,
                                                        WalkState *state) {
     CBMPrimaryCalleeSelection selection = {0};
-    selection.name = extract_callee_name(ctx->arena, node, ctx->source, ctx->language);
+    selection.name = extract_callee_name(ctx, ctx->arena, node, ctx->source, ctx->language);
     selection.name = resolve_objectscript_callee(ctx, node, state, selection.name);
     if (!selection.name || !selection.name[0]) {
         return selection;

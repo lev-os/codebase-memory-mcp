@@ -1122,6 +1122,10 @@ typedef struct {
      * The core never reads, interprets or frees it. It is the only place for
      * such state: a static or thread-local cache is not. */
     void *doclink_state;
+    /* Swift: the local bindings of each function body a member call has
+     * looked into (extract_calls.c), NULL until the first lookup; allocated
+     * in `scratch`. */
+    void *swift_bindings;
 } CBMExtractCtx;
 
 /* Internal configured-definition seams. No declarations pointer enters a result. */
