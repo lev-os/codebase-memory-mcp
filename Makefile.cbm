@@ -380,6 +380,7 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/cbm.c \
     $(CBM_DIR)/extract_defs.c \
     $(CBM_DIR)/callable_sig.c \
+    $(CBM_DIR)/callable_overload.c \
     $(CBM_DIR)/extract_calls.c \
     $(CBM_DIR)/extract_imports.c \
     $(CBM_DIR)/extract_usages.c \
@@ -525,6 +526,7 @@ PIPELINE_SRCS = \
     src/pipeline/pass_parallel.c \
     src/pipeline/pass_definitions.c \
     src/pipeline/pass_calls.c \
+    src/pipeline/call_overloads.c \
     src/pipeline/pass_spawns.c \
     src/pipeline/pass_lsp_cross.c \
     src/pipeline/pass_usages.c \
@@ -904,7 +906,7 @@ TEST_JAVA_LSP_SRCS = tests/test_java_lsp.c tests/test_java_lsp_coverage.c
 TEST_KOTLIN_LSP_SRCS = tests/test_kotlin_lsp.c tests/test_kotlin_typed_calls.c
 TEST_RUST_LSP_SRCS = tests/test_rust_lsp.c
 
-TEST_INTEGRATION_SRCS = tests/test_integration.c tests/test_incremental.c tests/test_lang_contract.c tests/test_edge_imports.c tests/test_edge_structural.c tests/test_lsp_resolution_probe.c tests/test_node_creation_probe.c tests/test_edge_types_probe.c tests/test_convergence_probe.c tests/test_matrix_known_classes.c tests/test_matrix_new_constructs.c tests/test_grammar_probe_a.c tests/test_grammar_probe_b.c tests/test_grammar_probe_c.c tests/test_grammar_probe_d.c tests/test_grammar_probe_e.c tests/test_grammar_probe_f.c tests/test_grammar_probe_g.c tests/test_conditional_variants.c tests/test_spawns.c
+TEST_INTEGRATION_SRCS = tests/test_integration.c tests/test_incremental.c tests/test_lang_contract.c tests/test_edge_imports.c tests/test_edge_structural.c tests/test_lsp_resolution_probe.c tests/test_node_creation_probe.c tests/test_edge_types_probe.c tests/test_convergence_probe.c tests/test_matrix_known_classes.c tests/test_matrix_new_constructs.c tests/test_grammar_probe_a.c tests/test_grammar_probe_b.c tests/test_grammar_probe_c.c tests/test_grammar_probe_d.c tests/test_grammar_probe_e.c tests/test_grammar_probe_f.c tests/test_grammar_probe_g.c tests/test_conditional_variants.c tests/test_overloads.c tests/test_spawns.c
 
 TEST_TRACES_SRCS = tests/test_traces.c
 

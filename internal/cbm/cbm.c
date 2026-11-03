@@ -9,6 +9,7 @@
 #include "arena.h"   // CBMArena, cbm_arena_init/alloc/strdup/destroy
 #include "doclink.h" // cbm_doclinks_extract: doc-comment references + doc-link scope
 #include "helpers.h"
+#include "callable_overload.h" // cbm_split_overloads
 #include "lang_specs.h"
 #include "extract_unified.h"
 #include "lsp/go_lsp.h"
@@ -4578,6 +4579,9 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     if (cbm_is_c_preprocessor_lang(language)) {
         cbm_mark_def_variants(result);
     }
+    /* Java/Kotlin/Swift: same-file overloads become separate nodes. Last, so
+     * the language resolvers above saw the base QNs they always saw. */
+    cbm_split_overloads(a, result, language);
 
     result->imports_count = result->imports.count;
 

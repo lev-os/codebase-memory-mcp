@@ -869,6 +869,20 @@ static bool emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     return false;
 }
 
+/* The plain CALLS edge of a resolved call. */
+static bool calls_emit_plain(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
+                             const cbm_gbuf_node_t *source, const cbm_gbuf_node_t *target,
+                             const cbm_resolution_t *res) {
+    char esc_c2[CBM_SZ_256];
+    cbm_json_escape(esc_c2, sizeof(esc_c2), call->callee_name);
+    char props[CBM_SZ_512];
+    snprintf(props, sizeof(props),
+             "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d}",
+             esc_c2, res->confidence, res->strategy ? res->strategy : "unknown",
+             res->candidate_count);
+    return calls_emit_edge(ctx->gbuf, source->id, target->id, "CALLS", props, sizeof(props), call);
+}
+
 /* Classify a resolved call and emit the appropriate edge. */
 /* When suppress_plain_calls is true (a TS/JS/TSX weak short-name member-call
  * match, #592/#606), the route/HTTP/ASYNC/CONFIG service classifications below
@@ -903,14 +917,39 @@ static bool emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     if (suppress_plain_calls) {
         return false; /* weak TS/JS member-call match with an unresolved receiver (#606) */
     }
-    char esc_c2[CBM_SZ_256];
-    cbm_json_escape(esc_c2, sizeof(esc_c2), call->callee_name);
-    char props[CBM_SZ_512];
-    snprintf(props, sizeof(props),
-             "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d}",
-             esc_c2, res->confidence, res->strategy ? res->strategy : "unknown",
-             res->candidate_count);
-    return calls_emit_edge(ctx->gbuf, source->id, target->id, "CALLS", props, sizeof(props), call);
+    return calls_emit_plain(ctx, call, source, target, res);
+}
+
+/* Same-file overloads (callable_overload.h): the member of `target`'s
+ * overload group the call binds to. When the argument shape cannot decide,
+ * the other candidates get their plain CALLS edge here and *res takes the
+ * ambiguous strategy for the edge the caller writes. NULL: the chosen member
+ * is the source itself. MUST match pass_parallel.c. */
+static const cbm_gbuf_node_t *calls_overload_target(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
+                                                    CBMLanguage lang,
+                                                    const cbm_gbuf_node_t *source,
+                                                    const cbm_gbuf_node_t *target,
+                                                    cbm_resolution_t *res, bool suppress_plain,
+                                                    CBMCallEvidence *evidence) {
+    const cbm_gbuf_node_t *ovl[CBM_OVERLOAD_TARGETS_MAX];
+    int novl = cbm_pipeline_overload_targets(ctx->gbuf, target, call, lang, ovl,
+                                             CBM_OVERLOAD_TARGETS_MAX);
+    if (novl > 1) {
+        res->strategy = CBM_OVERLOAD_AMBIGUOUS_STRATEGY;
+        if (res->confidence > CBM_OVERLOAD_AMBIGUOUS_CONFIDENCE) {
+            res->confidence = CBM_OVERLOAD_AMBIGUOUS_CONFIDENCE;
+        }
+        res->candidate_count = novl;
+        for (int oi = 1; oi < novl && !suppress_plain; oi++) {
+            if (ovl[oi]->id != source->id) {
+                evidence->calls_emitted |= calls_emit_plain(ctx, call, source, ovl[oi], res);
+            }
+        }
+    }
+    if (novl > 0) {
+        target = ovl[0];
+    }
+    return target->id == source->id ? NULL : target;
 }
 
 /* Find source node for a call: enclosing function or file node. */
@@ -1065,6 +1104,11 @@ static bool calls_emit_lsp_target(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     res.confidence = lsp->confidence;
     res.strategy = lsp->strategy;
     res.candidate_count = PC_SINGLE_CANDIDATE_COUNT;
+    target_node =
+        calls_overload_target(ctx, call, lang, source_node, target_node, &res, false, evidence);
+    if (!target_node) {
+        return true; /* the call is bound: to the overload it sits in */
+    }
     evidence->candidate_qn = target_node->qualified_name;
     /* Synthetic builtins can still denote a spawn; keep the parallel pass policy. */
     cbm_pipeline_spawn_t spawn;
@@ -1407,6 +1451,11 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
      * pass_parallel.c exactly. */
     if (cbm_go_suppress_bare_init_bind(lang == CBM_LANG_GO, call->is_method, call->callee_name,
                                        res.strategy, target_node->label)) {
+        return 0;
+    }
+    target_node = calls_overload_target(ctx, call, lang, source_node, target_node, &res,
+                                        drop_plain_call, evidence);
+    if (!target_node) {
         return 0;
     }
     evidence->candidate_qn = target_node->qualified_name;

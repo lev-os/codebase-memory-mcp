@@ -1,3 +1,4 @@
+#include "callable_overload.h"
 #include "cbm.h"
 #include "arena.h"   // CBMArena, cbm_arena_alloc/strdup/sprintf
 #include "doclink.h" // cbm_doclink_note_doc_line
@@ -7187,6 +7188,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         if (!tdx_observe(ctx, name_node, node, def.qualified_name, &configured_rule))
             return;
     }
+    cbm_overload_describe_def(a, &def, node, ctx->source, ctx->language);
     cbm_defs_push(&ctx->result->defs, a, def);
     if (ctx->language == CBM_LANG_MAKEFILE && strcmp(ts_node_type(node), "rule") == 0) {
         push_make_rule_targets(ctx, node, &def);
@@ -9334,6 +9336,7 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     // TestFoo.test_bar) is itself a test, same as free functions (#1294).
     def.is_test = def.is_test || ctx->result->is_test_file;
 
+    cbm_overload_describe_def(a, &def, child, ctx->source, ctx->language);
     cbm_defs_push(&ctx->result->defs, a, def);
 }
 

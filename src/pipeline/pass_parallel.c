@@ -1814,7 +1814,8 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
      * (helpers.c) — see pass_definitions.c for the per-label rationale, and
      * for the generated member registered by qualified name only. */
     if (cbm_label_is_registry_symbol(def->label)) {
-        if (cbm_def_props_generated(def->extra_props)) {
+        /* A split overload member 2..n as well — see pass_definitions.c. */
+        if (cbm_def_props_generated(def->extra_props) || def->qn_sig_off > 0) {
             cbm_registry_add_qn_only(ctx->registry, def->qualified_name, def->label);
         } else {
             cbm_registry_add_lang_in_module(ctx->registry, def->name, def->qualified_name,
@@ -3740,6 +3741,32 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 }
             }
             continue;
+        }
+        /* Same-file overloads (callable_overload.h): the argument shape picks
+         * the member; when it cannot, every candidate gets an edge with the
+         * ambiguous strategy, never one picked silently. MUST match
+         * pass_calls.c (calls_overload_target). */
+        const cbm_gbuf_node_t *ovl[CBM_OVERLOAD_TARGETS_MAX];
+        int novl = cbm_pipeline_overload_targets(rc->main_gbuf, target_node, call, lang, ovl,
+                                                 CBM_OVERLOAD_TARGETS_MAX);
+        if (novl > 1) {
+            res.strategy = CBM_OVERLOAD_AMBIGUOUS_STRATEGY;
+            if (res.confidence > CBM_OVERLOAD_AMBIGUOUS_CONFIDENCE) {
+                res.confidence = CBM_OVERLOAD_AMBIGUOUS_CONFIDENCE;
+            }
+            res.candidate_count = novl;
+            for (int oi = 1; oi < novl && !drop_plain_call; oi++) {
+                if (ovl[oi]->id != source_node->id) {
+                    site_evidence->calls_emitted |= emit_normal_calls_edge(
+                        ws->local_edge_buf, source_node, ovl[oi], call, &res);
+                }
+            }
+        }
+        if (novl > 0) {
+            target_node = ovl[0];
+            if (target_node->id == source_node->id) {
+                continue;
+            }
         }
         site_evidence->candidate_qn = target_node->qualified_name;
         _rc_t0 = extract_now_ns();

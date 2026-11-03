@@ -512,7 +512,10 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
      * through the same predicate, so the three registries cannot diverge.
      * A generated member is registered by qualified name only, at all three. */
     if (node_id > 0 && cbm_label_is_registry_symbol(def->label)) {
-        if (cbm_def_props_generated(def->extra_props)) {
+        /* A split overload member 2..n (callable_overload.h) too: resolution
+         * keeps landing on the group's base QN, and the overload choice
+         * happens once the target is known (cbm_pipeline_overload_targets). */
+        if (cbm_def_props_generated(def->extra_props) || def->qn_sig_off > 0) {
             cbm_registry_add_qn_only(ctx->registry, def->qualified_name, def->label);
         } else {
             cbm_registry_add_lang_in_module(ctx->registry, def->name, def->qualified_name,

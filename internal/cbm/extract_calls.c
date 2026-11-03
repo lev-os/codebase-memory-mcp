@@ -1,3 +1,4 @@
+#include "callable_overload.h"
 #include "cbm.h"
 #include "arena.h" // CBMArena, cbm_arena_sprintf
 #include "helpers.h"
@@ -4687,6 +4688,9 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                     call.is_method = false;
                 }
             }
+            /* Java/Kotlin/Swift: the argument shape picks among overloads
+             * (callable_overload.h). */
+            call.arg_shape = cbm_call_args_shape(ctx->arena, node, ctx->source, ctx->language);
             cbm_calls_push(&ctx->result->calls, ctx->arena, call);
             invocation = describe_emitted_primary_call(node, &callee);
 
