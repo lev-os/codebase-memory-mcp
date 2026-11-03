@@ -21912,6 +21912,66 @@ TEST(mcp_server_run_rapid_messages) {
 }
 #endif /* !_WIN32 */
 
+/* A session refused at startup (another CBM build owns the runtime) must
+ * still answer MCP, or the client only sees an initialize timeout. */
+TEST(mcp_refusal_run_answers_with_reason) {
+    const char *reason = "CBM could not start because a conflicting CBM process is active "
+                         "(build; active version 0.12.1, build abc; requested version 0.13.0, "
+                         "build def). Active daemon: pid 4242, version 0.12.1. "
+                         "`codebase-memory-mcp daemon stop` retires the daemon.";
+    const char *msgs =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+        "\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{}}}\n"
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n"
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n"
+        "{\"jsonrpc\":\"2.0\",\"id\":\"s3\",\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"index_repository\",\"arguments\":{\"repo_path\":\"/tmp\"}}}\n"
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"ping\"}\n"
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"resources/list\"}\n";
+    FILE *in_fp = tmpfile();
+    FILE *out_fp = tmpfile();
+    ASSERT_NOT_NULL(in_fp);
+    ASSERT_NOT_NULL(out_fp);
+    ASSERT_TRUE(fputs(msgs, in_fp) >= 0);
+    rewind(in_fp);
+
+    ASSERT_EQ(cbm_mcp_refusal_run(in_fp, out_fp, reason), 0);
+
+    rewind(out_fp);
+    char lines[5][4096];
+    for (int i = 0; i < 5; i++) {
+        ASSERT_NOT_NULL(fgets(lines[i], sizeof(lines[i]), out_fp));
+    }
+    char extra[16];
+    ASSERT_NULL(fgets(extra, sizeof(extra), out_fp)); /* the notification got no answer */
+
+    ASSERT_NOT_NULL(strstr(lines[0], "\"id\":1"));
+    ASSERT_NOT_NULL(strstr(lines[0], "\"serverInfo\""));
+    ASSERT_NOT_NULL(strstr(lines[0], "\"tools\""));
+    ASSERT_NOT_NULL(strstr(lines[0], "\"protocolVersion\":\"2025-06-18\""));
+    ASSERT_NOT_NULL(strstr(lines[0], "unavailable in this session"));
+    ASSERT_NOT_NULL(strstr(lines[0], "pid 4242"));
+
+    ASSERT_NOT_NULL(strstr(lines[1], "\"id\":2"));
+    ASSERT_NOT_NULL(strstr(lines[1], "\"name\":\"cbm_unavailable\""));
+    ASSERT_NULL(strstr(lines[1], "\"search_graph\""));
+
+    ASSERT_NOT_NULL(strstr(lines[2], "\"id\":\"s3\""));
+    ASSERT_NOT_NULL(strstr(lines[2], "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(lines[2], "active version 0.12.1"));
+    ASSERT_NOT_NULL(strstr(lines[2], "daemon stop"));
+
+    ASSERT_NOT_NULL(strstr(lines[3], "\"id\":4"));
+    ASSERT_NOT_NULL(strstr(lines[3], "\"result\":{}"));
+
+    ASSERT_NOT_NULL(strstr(lines[4], "\"id\":5"));
+    ASSERT_NOT_NULL(strstr(lines[4], "-32601"));
+
+    fclose(in_fp);
+    fclose(out_fp);
+    PASS();
+}
+
 /* Issue #235: passing an unrecognised project name to a tool crashed the
  * binary with a buffer overflow while building the "available_projects"
  * error list — collect_db_project_names overflowed projects[CBM_SZ_4K] via
@@ -27118,6 +27178,7 @@ SUITE(mcp) {
 #ifndef _WIN32
     RUN_TEST(mcp_server_run_rapid_messages);
 #endif
+    RUN_TEST(mcp_refusal_run_answers_with_reason);
 
     /* Snippet resolution (port of snippet_test.go) */
     RUN_TEST(snippet_exact_qn);
