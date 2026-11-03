@@ -2640,6 +2640,57 @@ TEST(registry_python_local_bound_at_own_file_issue1548) {
     PASS();
 }
 
+/* A static factory call `Foo.of(...)` among several same-named `of` methods.
+ * Two modules declare a Foo with an `of`, so the qualified tail is ambiguous
+ * and the call reaches the closest-candidate pick. The receiver chain names
+ * Foo, so only the two Foo.of fit. The closest candidate by namespace is the
+ * caller's neighbour Cart.of, which the chain refuses. The guard must narrow
+ * the candidates before the closest one is picked: picking first and then
+ * refusing left the call with no target, and the later field-type re-pick
+ * never ran because it only re-picks a call that already has a target. */
+TEST(registry_receiver_chain_filters_before_closest_pick) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "of", "shop.web.handlers.Cart.of", "Method");
+    cbm_registry_add(r, "of", "shop.domain.Foo.of", "Method");
+    cbm_registry_add(r, "of", "shop.legacy.Foo.of", "Method");
+
+    /* The file imports the neighbour, not Foo (Foo comes in some other way,
+     * for example a wildcard import the import map does not resolve). */
+    const char *keys[] = {"Cart"};
+    const char *vals[] = {"shop.web.handlers.Cart"};
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "Foo.of", "shop.web.handlers.CheckoutTest", keys, vals, 1);
+    ASSERT_STR_EQ(res.qualified_name, "shop.domain.Foo.of");
+    ASSERT_STR_EQ(res.strategy, "suffix_match");
+    /* The full candidate count stays, so a later re-pick still sees the call
+     * as ambiguous. */
+    ASSERT_EQ(res.candidate_count, 3);
+
+    /* The same call in a file without imports. */
+    cbm_registry_t *r2 = cbm_registry_new();
+    cbm_registry_add(r2, "of", "shop.web.handlers.Cart.of", "Method");
+    cbm_registry_add(r2, "of", "shop.domain.Foo.of", "Method");
+    cbm_registry_add(r2, "of", "shop.legacy.Foo.of", "Method");
+    res = cbm_registry_resolve(r2, "Foo.of", "shop.web.handlers.CheckoutTest", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "shop.domain.Foo.of");
+    ASSERT_STR_EQ(res.strategy, "suffix_match");
+
+    /* A chain that no candidate fits still gets no target: Uri is a library
+     * type, so neither project `parse` may take the call. */
+    cbm_registry_add(r, "parse", "shop.text.Markdown.parse", "Method");
+    cbm_registry_add(r, "parse", "shop.web.handlers.Query.parse", "Method");
+    cbm_registry_add(r2, "parse", "shop.text.Markdown.parse", "Method");
+    cbm_registry_add(r2, "parse", "shop.web.handlers.Query.parse", "Method");
+    res = cbm_registry_resolve(r, "Uri.parse", "shop.web.handlers.CheckoutTest", keys, vals, 1);
+    ASSERT_NULL(res.qualified_name);
+    res = cbm_registry_resolve(r2, "Uri.parse", "shop.web.handlers.CheckoutTest", NULL, NULL, 0);
+    ASSERT_NULL(res.qualified_name);
+
+    cbm_registry_free(r);
+    cbm_registry_free(r2);
+    PASS();
+}
+
 /* The prefix every def of a file carries, without allocating; the same as
  * cbm_pipeline_fqn_compute(project, path, name) minus ".name". */
 TEST(fqn_symbol_prefix_len_matches_fqn_compute) {
@@ -2780,4 +2831,5 @@ SUITE(registry) {
     RUN_TEST(registry_resolve_lexical_walks_enclosing_defs_issue1548);
     RUN_TEST(registry_python_local_bound_at_own_file_issue1548);
     RUN_TEST(fqn_symbol_prefix_len_matches_fqn_compute);
+    RUN_TEST(registry_receiver_chain_filters_before_closest_pick);
 }

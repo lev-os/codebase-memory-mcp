@@ -2057,12 +2057,71 @@ static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char 
 
 static bool receiver_chain_admits(const char *callee_name, const char *candidate_qn);
 
+/* The candidates of `arr` that the receiver chain of `callee_name` admits,
+ * copied into `out` with their test and language flags (the flag arrays are
+ * filled only when `arr` has them). Returns the count. */
+static int receiver_admitted_candidates(const qn_array_t *arr, const char *callee_name,
+                                        const char **out, uint8_t *out_test, uint8_t *out_lang,
+                                        int cap) {
+    const uint8_t *flags = qn_test_flags(arr);
+    const uint8_t *langs = qn_lang_flags(arr);
+    int n = 0;
+    for (int i = 0; i < arr->count && n < cap; i++) {
+        if (!receiver_chain_admits(callee_name, arr->items[i])) {
+            continue;
+        }
+        if (flags) {
+            out_test[n] = flags[i];
+        }
+        if (langs) {
+            out_lang[n] = langs[i];
+        }
+        out[n++] = arr->items[i];
+    }
+    return n;
+}
+
+/* The closest candidate among those the receiver chain admits, or NULL when
+ * the chain admits none. The guard narrows the set BEFORE the closest
+ * candidate is picked. Picking first and refusing after left a call with no
+ * target whenever the closest candidate was the wrong type, even when another
+ * candidate fitted the chain: `Foo.of(...)` with a nearer `Cart.of` lost its
+ * edge, and the field-type re-pick (pass_parallel.c try_field_type_hint),
+ * which only re-picks a call that has a target, never ran. That re-pick
+ * matches the owner segment against the chain root, so apart from its
+ * I-prefixed interface name it finds nothing the filtered set here does not
+ * hold; an empty set therefore stays empty. Measured on a private Java corpus with a
+ * javac answer key: the pick-then-refuse order removed 516 correct edges, 472
+ * of them field-type re-picks of static factory calls. */
+static const char *closest_receiver_admitted(const cbm_registry_t *r, const qn_array_t *arr,
+                                             const char *callee_name, const char *module_qn) {
+    /* receiver_chain_admits judges only a chained callee with an upper-case
+     * root; every other callee admits every candidate, so skip the copy. */
+    if (!callee_name || callee_name[0] < 'A' || callee_name[0] > 'Z' ||
+        (!strchr(callee_name, '.') && !strstr(callee_name, "::"))) {
+        return best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
+                                       qn_lang_flags(arr), arr->count, module_qn);
+    }
+    const char *admitted[CBM_SZ_256];
+    uint8_t admitted_test[CBM_SZ_256];
+    uint8_t admitted_lang[CBM_SZ_256];
+    int n = receiver_admitted_candidates(arr, callee_name, admitted, admitted_test, admitted_lang,
+                                         CBM_SZ_256);
+    if (n == 0) {
+        return NULL;
+    }
+    return best_by_import_distance(r, admitted, qn_test_flags(arr) ? admitted_test : NULL,
+                                   qn_lang_flags(arr) ? admitted_lang : NULL, n, module_qn);
+}
+
 /* Strategy 4: multiple candidates with import filtering. The receiver-chain
  * guard (receiver_chain_admits) holds here as on the unique-name and
  * no-import paths: `Uri.parse(s)` names a type none of whose segments is in
  * a candidate's ancestry, so the import-distance pick must not hand it a
  * project `Markdown.parse`. Before, a file with imports skipped the guard
- * that the same call in a file without imports got. */
+ * that the same call in a file without imports got. Both the import-reachable
+ * set and the fallback over all candidates are narrowed by the guard before
+ * the closest candidate is picked (closest_receiver_admitted). */
 static cbm_resolution_t resolve_multi_with_imports(const cbm_registry_t *r, const qn_array_t *arr,
                                                    const char *callee_name, const char *module_qn,
                                                    const char **import_vals, int import_count) {
@@ -2097,10 +2156,10 @@ static cbm_resolution_t resolve_multi_with_imports(const cbm_registry_t *r, cons
             return (cbm_resolution_t){best, "suffix_match", conf, fcount};
         }
     }
-    /* No import-reachable — use all candidates with penalty */
-    const char *best = best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
-                                               qn_lang_flags(arr), arr->count, module_qn);
-    if (best && receiver_chain_admits(callee_name, best)) {
+    /* No import-reachable — use all candidates the receiver chain admits,
+     * with penalty. The count stays the full bucket's, as before the guard. */
+    const char *best = closest_receiver_admitted(r, arr, callee_name, module_qn);
+    if (best) {
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH * REG_HALF_PENALTY, arr->count);
         return (cbm_resolution_t){best, "suffix_match", conf, arr->count};
     }
@@ -2318,12 +2377,8 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
         return resolve_multi_with_imports(r, arr, callee_name, module_qn, import_vals,
                                           import_count);
     }
-    const char *best = best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
-                                               qn_lang_flags(arr), arr->count, module_qn);
+    const char *best = closest_receiver_admitted(r, arr, callee_name, module_qn);
     if (best) {
-        if (!receiver_chain_admits(callee_name, best)) {
-            return empty_result();
-        }
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
         return (cbm_resolution_t){best, "suffix_match", conf, arr->count};
     }
