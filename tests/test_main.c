@@ -1721,6 +1721,7 @@ extern void suite_extraction(void);
 extern void suite_callable_sig(void);
 extern void suite_test_conventions(void);
 extern void suite_extraction_inheritance(void);
+extern void suite_swift_member_calls(void);
 extern void suite_extraction_imports(void);
 extern void suite_parse_coverage(void);
 extern void suite_grammar_regression(void);
@@ -2317,6 +2318,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(callable_sig);
     RUN_SELECTED_SUITE(test_conventions);
     RUN_SELECTED_SUITE(extraction_inheritance);
+    RUN_SELECTED_SUITE(swift_member_calls);
     RUN_SELECTED_SUITE(extraction_imports);
     RUN_SELECTED_SUITE(parse_coverage);
     RUN_SELECTED_SUITE(grammar_regression);

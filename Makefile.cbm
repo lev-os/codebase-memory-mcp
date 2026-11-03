@@ -790,6 +790,7 @@ TEST_EXTRACTION_SRCS = \
     tests/test_callable_sig.c \
     tests/test_test_conventions.c \
     tests/test_extraction_inheritance.c \
+    tests/test_swift_member_calls.c \
     tests/test_extraction_imports.c \
     tests/test_parse_coverage.c \
     tests/test_grammar_regression.c \

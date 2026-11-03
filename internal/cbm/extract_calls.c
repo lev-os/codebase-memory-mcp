@@ -428,6 +428,211 @@ static char *extract_wolfram_callee(CBMArena *a, TSNode node, const char *source
 
 // Language-specific callee extraction for FP and niche languages.
 // Swift callee extraction from call/constructor expressions.
+/* Swift: the type name a `user_type` spells, without generic arguments or
+ * module qualification (`Foo<T>` -> Foo, `Mod.Foo` -> Foo). NULL when the
+ * node names no plain type. */
+static char *swift_plain_type_name(CBMArena *a, TSNode type_node, const char *source) {
+    if (ts_node_is_null(type_node)) {
+        return NULL;
+    }
+    if (strcmp(ts_node_type(type_node), "user_type") != 0) {
+        return NULL;
+    }
+    TSNode last = {0};
+    uint32_t nc = ts_node_named_child_count(type_node);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_named_child(type_node, i);
+        if (strcmp(ts_node_type(c), "type_identifier") == 0) {
+            last = c;
+        }
+    }
+    if (ts_node_is_null(last)) {
+        return NULL;
+    }
+    char *name = cbm_node_text(a, last, source);
+    return (name && name[0]) ? name : NULL;
+}
+
+/* Swift `super.m()`: the class `super` names is the first type the
+ * enclosing class inherits from. Spelling the call `Base.m` lets the
+ * receiver-aware resolution bind the base's method; `super.m` bound by name
+ * alone to whichever same-named override was nearest. */
+static char *swift_super_type_name(CBMArena *a, TSNode node, const char *source) {
+    for (TSNode p = ts_node_parent(node); !ts_node_is_null(p); p = ts_node_parent(p)) {
+        if (strcmp(ts_node_type(p), "class_declaration") != 0) {
+            continue;
+        }
+        TSNode spec = cbm_find_child_by_kind(p, "inheritance_specifier");
+        if (ts_node_is_null(spec)) {
+            return NULL;
+        }
+        return swift_plain_type_name(
+            a, ts_node_child_by_field_name(spec, TS_FIELD("inherits_from")), source);
+    }
+    return NULL;
+}
+
+/* Swift receiver `x as? T` / `(x as? T)` / `x as! T`: the cast names the
+ * receiver's type. */
+static char *swift_cast_type_name(CBMArena *a, TSNode expr, const char *source) {
+    while (!ts_node_is_null(expr) && strcmp(ts_node_type(expr), "tuple_expression") == 0 &&
+           ts_node_named_child_count(expr) == 1) {
+        expr = ts_node_named_child(expr, 0);
+    }
+    if (ts_node_is_null(expr) || strcmp(ts_node_type(expr), "as_expression") != 0) {
+        return NULL;
+    }
+    return swift_plain_type_name(a, ts_node_child_by_field_name(expr, TS_FIELD("name")), source);
+}
+
+/* Swift local `let x = y as? T` (also `if let` / `guard let`) declared before
+ * `site` in the same function: the cast type of x, else NULL. Only casts and
+ * explicit `let x: T` annotations count; nothing is inferred. */
+static char *swift_local_cast_type(CBMArena *a, TSNode site, const char *name,
+                                   const char *source) {
+    TSNode body = site;
+    while (!ts_node_is_null(body) && strcmp(ts_node_type(body), "function_body") != 0 &&
+           strcmp(ts_node_type(body), "lambda_literal") != 0 &&
+           strcmp(ts_node_type(body), "computed_property") != 0) {
+        body = ts_node_parent(body);
+    }
+    if (ts_node_is_null(body)) {
+        return NULL;
+    }
+    uint32_t site_start = ts_node_start_byte(site);
+    char *found = NULL;
+    /* Iterative pre-order walk over the body, bounded to bindings that start
+     * before the call. */
+    TSTreeCursor cur = ts_tree_cursor_new(body);
+    bool more = true;
+    while (more) {
+        TSNode n = ts_tree_cursor_current_node(&cur);
+        if (ts_node_start_byte(n) >= site_start) {
+            break;
+        }
+        const char *k = ts_node_type(n);
+        if (strcmp(k, "if_statement") == 0 || strcmp(k, "guard_statement") == 0) {
+            /* `if let x = y as? T` / `guard let x = y as? T`: the bound name
+             * and its cast are consecutive children of the statement. */
+            bool bound_here = false;
+            uint32_t nc = ts_node_named_child_count(n);
+            for (uint32_t i = 0; i < nc; i++) {
+                TSNode c = ts_node_named_child(n, i);
+                const char *ck = ts_node_type(c);
+                if (strcmp(ck, "simple_identifier") == 0) {
+                    char *bn = cbm_node_text(a, c, source);
+                    bound_here = bn && strcmp(bn, name) == 0;
+                } else if (bound_here && strcmp(ck, "as_expression") == 0) {
+                    char *t = swift_cast_type_name(a, c, source);
+                    if (t) {
+                        found = t;
+                    }
+                    bound_here = false;
+                } else if (strcmp(ck, "value_binding_pattern") != 0) {
+                    bound_here = false;
+                }
+            }
+        }
+        if (strcmp(k, "property_declaration") == 0) {
+            /* name: pattern(bound_identifier) [type_annotation] value: expr */
+            TSNode pat = ts_node_child_by_field_name(n, TS_FIELD("name"));
+            TSNode bound = ts_node_is_null(pat)
+                               ? pat
+                               : ts_node_child_by_field_name(pat, TS_FIELD("bound_identifier"));
+            if (!ts_node_is_null(bound)) {
+                char *bn = cbm_node_text(a, bound, source);
+                if (bn && strcmp(bn, name) == 0) {
+                    char *t = swift_cast_type_name(
+                        a, ts_node_child_by_field_name(n, TS_FIELD("value")), source);
+                    if (!t) {
+                        TSNode ann = cbm_find_child_by_kind(n, "type_annotation");
+                        if (!ts_node_is_null(ann)) {
+                            TSNode tn = ts_node_child_by_field_name(ann, TS_FIELD("name"));
+                            if (!ts_node_is_null(tn) &&
+                                strcmp(ts_node_type(tn), "optional_type") == 0) {
+                                tn = ts_node_child_by_field_name(tn, TS_FIELD("wrapped"));
+                            }
+                            t = swift_plain_type_name(a, tn, source);
+                        }
+                    }
+                    found = t; /* the latest binding before the call wins */
+                }
+            }
+        }
+        if (ts_tree_cursor_goto_first_child(&cur)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cur)) {
+            if (!ts_tree_cursor_goto_parent(&cur)) {
+                more = false;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cur);
+    return found;
+}
+
+/* True when a line break separates the receiver from the `.member` suffix:
+ * the leading-dot modifier style of SwiftUI (`Text("a")\n    .padding()`). */
+static bool swift_suffix_starts_line(TSNode target, TSNode suffix, const char *source) {
+    uint32_t from = ts_node_end_byte(target);
+    uint32_t to = ts_node_start_byte(suffix);
+    for (uint32_t i = from; i < to; i++) {
+        if (source[i] == '\n') {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Swift member callee spelling. The callee text of a navigation call names
+ * its receiver; where the text alone cannot name the receiver's type, spell
+ * the type the source does state:
+ *   - `super.m()`                 -> Base.m (first inherited type)
+ *   - `(x as? T)?.m()`            -> T.m
+ *   - `x?.m()` after `let x = y as? T` (or `let x: T`) -> T.m
+ *   - `<view expr>\n  .m()`       -> View.m (a SwiftUI modifier: every view
+ *     modifier's receiver is a View, and project modifiers are declared in
+ *     `extension View`)
+ * Everything else keeps the source text. */
+static char *swift_navigation_callee(CBMArena *a, TSNode call, TSNode nav, const char *source) {
+    TSNode target = ts_node_child_by_field_name(nav, TS_FIELD("target"));
+    TSNode suffix = ts_node_child_by_field_name(nav, TS_FIELD("suffix"));
+    TSNode member = ts_node_is_null(suffix)
+                        ? suffix
+                        : ts_node_child_by_field_name(suffix, TS_FIELD("suffix"));
+    char *mname = ts_node_is_null(member) ? NULL : cbm_node_text(a, member, source);
+    if (ts_node_is_null(target) || !mname || !mname[0] ||
+        strcmp(ts_node_type(member), "simple_identifier") != 0) {
+        return cbm_node_text(a, nav, source);
+    }
+    const char *tk = ts_node_type(target);
+    char *type = NULL;
+    if (strcmp(tk, "super_expression") == 0) {
+        type = swift_super_type_name(a, nav, source);
+    } else if (strcmp(tk, "tuple_expression") == 0 || strcmp(tk, "as_expression") == 0) {
+        type = swift_cast_type_name(a, target, source);
+    } else if (strcmp(tk, "simple_identifier") == 0) {
+        char *recv = cbm_node_text(a, target, source);
+        if (recv && recv[0] >= 'a' && recv[0] <= 'z') {
+            size_t len = strlen(recv);
+            while (len > 0 && (recv[len - 1] == '?' || recv[len - 1] == '!')) {
+                recv[--len] = '\0';
+            }
+            type = swift_local_cast_type(a, call, recv, source);
+        }
+    } else if ((strcmp(tk, "call_expression") == 0 ||
+                strcmp(tk, "constructor_expression") == 0) &&
+               swift_suffix_starts_line(target, suffix, source)) {
+        type = cbm_arena_strdup(a, "View");
+    }
+    if (type) {
+        return cbm_arena_sprintf(a, "%s.%s", type, mname);
+    }
+    return cbm_node_text(a, nav, source);
+}
+
 static char *extract_swift_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
     if (strcmp(nk, "call_expression") != 0 && strcmp(nk, "constructor_expression") != 0) {
         return NULL;
@@ -435,8 +640,11 @@ static char *extract_swift_callee(CBMArena *a, TSNode node, const char *source, 
     if (ts_node_named_child_count(node) > 0) {
         TSNode callee = ts_node_named_child(node, 0);
         const char *ck = ts_node_type(callee);
-        if (strcmp(ck, "simple_identifier") == 0 || strcmp(ck, "navigation_expression") == 0) {
+        if (strcmp(ck, "simple_identifier") == 0) {
             return cbm_node_text(a, callee, source);
+        }
+        if (strcmp(ck, "navigation_expression") == 0) {
+            return swift_navigation_callee(a, node, callee, source);
         }
     }
     return NULL;
