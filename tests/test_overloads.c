@@ -138,8 +138,8 @@ TEST(overload_extract_swift_same_signature_stays_one_qn) {
                               "#endif\n"
                               "    func pick(named: String, to target: String = \"\") {}\n"
                               "}\n";
-    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_SWIFT, "p",
-                                        "Store.swift", 0, NULL, NULL);
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)strlen(src), CBM_LANG_SWIFT, "p", "Store.swift", 0, NULL, NULL);
     ASSERT_NOT_NULL(r);
     const CBMDefinition *p1 = ovl_def_at(r, "pick", 3);
     const CBMDefinition *p2 = ovl_def_at(r, "pick", 5);
@@ -167,7 +167,7 @@ typedef struct {
     int file_count;
     const char *pad_fmt; /* filler file content, %d = index */
     const char *pad_path_fmt;
-    int lines[3];          /* start lines of the three overloads */
+    int lines[3];           /* start lines of the three overloads */
     const char *callers[3]; /* caller i calls overload i */
     int solo_line;
 } ovl_case_t;
@@ -512,13 +512,13 @@ static char *ovl_edge_set(const char *db_path) {
     cbm_store_t *store = cbm_store_open_path(db_path);
     sqlite3 *db = store ? cbm_store_get_db(store) : NULL;
     sqlite3_stmt *st = NULL;
-    if (!db ||
-        sqlite3_prepare_v2(db,
-                           "SELECT e.type || ' ' || replace(s.qualified_name, e.project || '.', '') "
-                           "|| ' -> ' || replace(t.qualified_name, e.project || '.', '') "
-                           "FROM edges e JOIN nodes s ON s.id=e.source_id "
-                           "JOIN nodes t ON t.id=e.target_id ORDER BY 1",
-                           -1, &st, NULL) != SQLITE_OK) {
+    if (!db || sqlite3_prepare_v2(
+                   db,
+                   "SELECT e.type || ' ' || replace(s.qualified_name, e.project || '.', '') "
+                   "|| ' -> ' || replace(t.qualified_name, e.project || '.', '') "
+                   "FROM edges e JOIN nodes s ON s.id=e.source_id "
+                   "JOIN nodes t ON t.id=e.target_id ORDER BY 1",
+                   -1, &st, NULL) != SQLITE_OK) {
         if (store) {
             cbm_store_close(store);
         }

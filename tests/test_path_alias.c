@@ -462,8 +462,7 @@ TEST(path_alias_loader_jsconfig_fallback) {
     bool root_source_is_jsconfig = false;
     for (int i = 0; i < coll->count; i++) {
         if (coll->scopes[i].dir_prefix[0] == '\0') {
-            root_source_is_jsconfig =
-                strcmp(coll->scopes[i].source_rel_path, "jsconfig.json") == 0;
+            root_source_is_jsconfig = strcmp(coll->scopes[i].source_rel_path, "jsconfig.json") == 0;
         }
     }
     ASSERT_TRUE(root_source_is_jsconfig);

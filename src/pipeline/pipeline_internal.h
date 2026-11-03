@@ -676,10 +676,12 @@ const cbm_gbuf_node_t *cbm_pipeline_file_node(const cbm_gbuf_t *gbuf, const char
  * own class of that name in its own package. Otherwise return `target`
  * unchanged. Both call resolvers apply it at the same point, so the
  * sequential and parallel paths stay in parity. */
-const cbm_gbuf_node_t *cbm_pipeline_java_same_build_root(
-    const cbm_gbuf_t *gbuf, const cbm_registry_t *registry, const char *project,
-    const char *repo_path, CBMLanguage lang, const char *caller_rel, const char *strategy,
-    const cbm_gbuf_node_t *target);
+const cbm_gbuf_node_t *cbm_pipeline_java_same_build_root(const cbm_gbuf_t *gbuf,
+                                                         const cbm_registry_t *registry,
+                                                         const char *project, const char *repo_path,
+                                                         CBMLanguage lang, const char *caller_rel,
+                                                         const char *strategy,
+                                                         const cbm_gbuf_node_t *target);
 
 /* Drop this thread's build-root cache (directory -> build root). Each call
  * resolver clears it at its start and end, so a build file added between runs

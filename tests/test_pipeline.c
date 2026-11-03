@@ -3478,8 +3478,7 @@ static int write_java_modules_fixture(const char *dir, int pad) {
         if (jmb_write(dir, rel, JMB_UTIL_JAVA) != 0) {
             return -1;
         }
-        snprintf(rel, sizeof(rel), "%s/src/main/java/com/acme/%s/Helper.java", mods[m],
-                 mods[m]);
+        snprintf(rel, sizeof(rel), "%s/src/main/java/com/acme/%s/Helper.java", mods[m], mods[m]);
         snprintf(src, sizeof(src),
                  "package com.acme.%s;\n\npublic class Helper {\n    public int go() { return 3; "
                  "}\n}\n",
@@ -3574,8 +3573,7 @@ static JavaModulesObservation run_java_modules_case(bool parallel, int pad) {
                     o.own[c] = jmb_calls_into(store, project, "runAlpha", callee[c], "alpha/");
                     o.own[3 + c] = jmb_calls_into(store, project, "runBeta", callee[c], "beta/");
                     o.cross[c] = jmb_calls_into(store, project, "runAlpha", callee[c], "beta/");
-                    o.cross[3 + c] =
-                        jmb_calls_into(store, project, "runBeta", callee[c], "alpha/");
+                    o.cross[3 + c] = jmb_calls_into(store, project, "runBeta", callee[c], "alpha/");
                 }
             }
             if (store) {

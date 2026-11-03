@@ -1404,8 +1404,8 @@ TEST(lrp_ts_barrel_star_and_renamed_same_module) {
     cbm_store_t *store = lrp_index(&lp, f, (int)(sizeof(f) / sizeof(f[0])));
     ASSERT_NOT_NULL(store);
 
-    int renamed = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run",
-                                              "impl.innerFn");
+    int renamed =
+        lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "impl.innerFn");
     int star = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "impl.starFn");
     printf("  [ts/barrel-same-module] renamed=%d star=%d\n", renamed, star);
     lrp_cleanup(&lp, store);
@@ -1456,12 +1456,11 @@ TEST(lrp_js_namespace_import_member_calls) {
     int n3 = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "impl.innerFn");
     int n4 = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "pkgimpl.pkgFn");
     int d = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "decoy.starFn");
-    int t1 = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "two.runTwo",
-                                         "direct.directFn");
-    int t2 = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "two.runTwo",
-                                         "pkgimpl.pkgFn");
-    printf("  [js/namespace] N1=%d N2=%d N3=%d N4=%d decoy=%d T1=%d T2=%d\n", n1, n2, n3, n4, d,
-           t1, t2);
+    int t1 =
+        lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "two.runTwo", "direct.directFn");
+    int t2 = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "two.runTwo", "pkgimpl.pkgFn");
+    printf("  [js/namespace] N1=%d N2=%d N3=%d N4=%d decoy=%d T1=%d T2=%d\n", n1, n2, n3, n4, d, t1,
+           t2);
     lrp_cleanup(&lp, store);
 
     ASSERT_EQ(n1, 1);

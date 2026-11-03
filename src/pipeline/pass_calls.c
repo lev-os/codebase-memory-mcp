@@ -926,14 +926,13 @@ static bool emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
  * ambiguous strategy for the edge the caller writes. NULL: the chosen member
  * is the source itself. MUST match pass_parallel.c. */
 static const cbm_gbuf_node_t *calls_overload_target(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
-                                                    CBMLanguage lang,
-                                                    const cbm_gbuf_node_t *source,
+                                                    CBMLanguage lang, const cbm_gbuf_node_t *source,
                                                     const cbm_gbuf_node_t *target,
                                                     cbm_resolution_t *res, bool suppress_plain,
                                                     CBMCallEvidence *evidence) {
     const cbm_gbuf_node_t *ovl[CBM_OVERLOAD_TARGETS_MAX];
-    int novl = cbm_pipeline_overload_targets(ctx->gbuf, target, call, lang, ovl,
-                                             CBM_OVERLOAD_TARGETS_MAX);
+    int novl =
+        cbm_pipeline_overload_targets(ctx->gbuf, target, call, lang, ovl, CBM_OVERLOAD_TARGETS_MAX);
     if (novl > 1) {
         res->strategy = CBM_OVERLOAD_AMBIGUOUS_STRATEGY;
         if (res->confidence > CBM_OVERLOAD_AMBIGUOUS_CONFIDENCE) {
@@ -1103,8 +1102,8 @@ static bool br_dir_has_build_file(const char *repo_path, const char *dir) {
                                         "build.gradle.kts", "pom.xml"};
     char path[CBM_SZ_4K];
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
-        int n = snprintf(path, sizeof(path), "%s%s%s/%s", repo_path, dir[0] ? "/" : "", dir,
-                         files[i]);
+        int n =
+            snprintf(path, sizeof(path), "%s%s%s/%s", repo_path, dir[0] ? "/" : "", dir, files[i]);
         if (n <= 0 || (size_t)n >= sizeof(path)) {
             continue;
         }
@@ -1240,13 +1239,15 @@ static const cbm_gbuf_node_t *br_unique_owner_match(const cbm_gbuf_t *gbuf,
     return found;
 }
 
-const cbm_gbuf_node_t *cbm_pipeline_java_same_build_root(
-    const cbm_gbuf_t *gbuf, const cbm_registry_t *registry, const char *project,
-    const char *repo_path, CBMLanguage lang, const char *caller_rel, const char *strategy,
-    const cbm_gbuf_node_t *target) {
-    if (lang != CBM_LANG_JAVA || !gbuf || !project || !repo_path || !repo_path[0] ||
-        !caller_rel || !target || !target->file_path || !target->qualified_name ||
-        !target->name || !target->label) {
+const cbm_gbuf_node_t *cbm_pipeline_java_same_build_root(const cbm_gbuf_t *gbuf,
+                                                         const cbm_registry_t *registry,
+                                                         const char *project, const char *repo_path,
+                                                         CBMLanguage lang, const char *caller_rel,
+                                                         const char *strategy,
+                                                         const cbm_gbuf_node_t *target) {
+    if (lang != CBM_LANG_JAVA || !gbuf || !project || !repo_path || !repo_path[0] || !caller_rel ||
+        !target || !target->file_path || !target->qualified_name || !target->name ||
+        !target->label) {
         return target;
     }
     char croot[CBM_SZ_4K];
@@ -1292,7 +1293,8 @@ const cbm_gbuf_node_t *cbm_pipeline_java_same_build_root(
     free(tprefix);
     free(cprefix);
     if (better == target && br_strategy_is_name_guess(strategy)) {
-        const cbm_gbuf_node_t *own = br_unique_owner_match(gbuf, registry, repo_path, croot, target);
+        const cbm_gbuf_node_t *own =
+            br_unique_owner_match(gbuf, registry, repo_path, croot, target);
         if (own) {
             better = own;
         }
@@ -1632,8 +1634,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
         /* (Kotlin calls carry no is_method flag; the helper reads the dotted
          * callee as the member form.) */
         cbm_suppress_kotlin_external_import_member(
-            lang == CBM_LANG_KOTLIN, true, call->callee_name, res.strategy, imports,
-            imp_keys, imp_count, cbm_pipeline_get_pkgmap(), cbm_pipeline_get_nsmap()) ||
+            lang == CBM_LANG_KOTLIN, true, call->callee_name, res.strategy, imports, imp_keys,
+            imp_count, cbm_pipeline_get_pkgmap(), cbm_pipeline_get_nsmap()) ||
         (lang == CBM_LANG_KOTLIN && cbm_suppress_weak_member_match(true, true, res.strategy) &&
          cbm_pipeline_kotlin_receiver_external(lsp_calls, call) &&
          cbm_pipeline_qn_is_type_member(ctx->gbuf, res.qualified_name)) ||

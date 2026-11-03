@@ -222,8 +222,7 @@ static const char *params_shape(CBMArena *a, TSNode func, const char *source, CB
 void cbm_overload_describe_def(CBMArena *a, CBMDefinition *def, TSNode func_node,
                                const char *source, CBMLanguage lang) {
     if (!a || !def || !source || ts_node_is_null(func_node) || !cbm_overload_lang(lang) ||
-        !def->label ||
-        (strcmp(def->label, "Function") != 0 && strcmp(def->label, "Method") != 0)) {
+        !def->label || (strcmp(def->label, "Function") != 0 && strcmp(def->label, "Method") != 0)) {
         return;
     }
     CBMCallableIdentity mode =
@@ -246,8 +245,7 @@ static void java_args_shape(ovl_shape_t *s, TSNode call) {
 
 /* Kotlin and Swift: call_expression -> call_suffix -> value_arguments, and a
  * trailing lambda/closure beside the value_arguments in the call_suffix. */
-static void suffix_args_shape(ovl_shape_t *s, TSNode suffix, const char *source,
-                              CBMLanguage lang) {
+static void suffix_args_shape(ovl_shape_t *s, TSNode suffix, const char *source, CBMLanguage lang) {
     uint32_t count = ts_node_named_child_count(suffix);
     for (uint32_t i = 0; i < count; i++) {
         TSNode ch = ts_node_named_child(suffix, i);
@@ -260,7 +258,8 @@ static void suffix_args_shape(ovl_shape_t *s, TSNode suffix, const char *source,
                 }
                 TSNode label = {0};
                 if (lang == CBM_LANG_SWIFT) {
-                    TSNode name = ts_node_child_by_field_name(arg, "name", (uint32_t)strlen("name"));
+                    TSNode name =
+                        ts_node_child_by_field_name(arg, "name", (uint32_t)strlen("name"));
                     if (!ts_node_is_null(name) && kind_is(name, "value_argument_label")) {
                         label = name;
                     }
@@ -524,7 +523,7 @@ static void split_group(CBMArena *a, CBMFileResult *result, const ovl_ref_t *ref
     size_t base_len = strlen(base);
     for (int k = 0; k < n; k++) {
         CBMDefinition *d = &defs[idx[k]];
-        const char *params = !d->callable_params      ? OVL_UNKNOWN
+        const char *params = !d->callable_params     ? OVL_UNKNOWN
                              : d->callable_params[0] ? d->callable_params
                                                      : CBM_OVERLOAD_NO_PARAMS;
         add_extra_prop(a, d, CBM_OVERLOAD_PARAMS_PROP, params);

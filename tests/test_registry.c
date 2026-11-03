@@ -1850,43 +1850,34 @@ TEST(kotlin_external_import_member_drops_library_leaf) {
     };
     CBMImportArray arr = {.items = imports, .count = 2, .cap = 2};
     const char *keys[] = {"ScreenModel"};
-    ASSERT_TRUE(cbm_suppress_kotlin_external_import_member(true, true, "scope.launch",
-                                                           "unique_name", &arr, keys, 1, NULL,
-                                                           NULL));
-    ASSERT_TRUE(cbm_suppress_kotlin_external_import_member(true, true, "a.b?.launch",
-                                                           "suffix_match", &arr, keys, 1, NULL,
-                                                           NULL));
+    ASSERT_TRUE(cbm_suppress_kotlin_external_import_member(
+        true, true, "scope.launch", "unique_name", &arr, keys, 1, NULL, NULL));
+    ASSERT_TRUE(cbm_suppress_kotlin_external_import_member(
+        true, true, "a.b?.launch", "suffix_match", &arr, keys, 1, NULL, NULL));
     /* Negative space: other languages, bare calls, this/super receivers,
      * receiver-aware strategies, leaves not imported, in-tree imports. */
-    ASSERT_FALSE(cbm_suppress_kotlin_external_import_member(false, true, "scope.launch",
-                                                            "unique_name", &arr, keys, 1, NULL,
-                                                            NULL));
+    ASSERT_FALSE(cbm_suppress_kotlin_external_import_member(
+        false, true, "scope.launch", "unique_name", &arr, keys, 1, NULL, NULL));
     ASSERT_FALSE(cbm_suppress_kotlin_external_import_member(true, false, "launch", "unique_name",
                                                             &arr, keys, 1, NULL, NULL));
-    ASSERT_FALSE(cbm_suppress_kotlin_external_import_member(true, true, "this.launch",
-                                                            "unique_name", &arr, keys, 1, NULL,
-                                                            NULL));
-    ASSERT_FALSE(cbm_suppress_kotlin_external_import_member(true, true, "super.launch",
-                                                            "unique_name", &arr, keys, 1, NULL,
-                                                            NULL));
-    ASSERT_FALSE(cbm_suppress_kotlin_external_import_member(true, true, "scope.launch",
-                                                            "lsp_kt_method", &arr, keys, 1, NULL,
-                                                            NULL));
-    ASSERT_FALSE(cbm_suppress_kotlin_external_import_member(true, true, "vm.refresh",
-                                                            "unique_name", &arr, keys, 1, NULL,
-                                                            NULL));
+    ASSERT_FALSE(cbm_suppress_kotlin_external_import_member(
+        true, true, "this.launch", "unique_name", &arr, keys, 1, NULL, NULL));
+    ASSERT_FALSE(cbm_suppress_kotlin_external_import_member(
+        true, true, "super.launch", "unique_name", &arr, keys, 1, NULL, NULL));
+    ASSERT_FALSE(cbm_suppress_kotlin_external_import_member(
+        true, true, "scope.launch", "lsp_kt_method", &arr, keys, 1, NULL, NULL));
+    ASSERT_FALSE(cbm_suppress_kotlin_external_import_member(true, true, "vm.refresh", "unique_name",
+                                                            &arr, keys, 1, NULL, NULL));
     /* The Kotlin import map keys every import, resolved or not: a key alone
      * keeps nothing. */
     const char *all_keys[] = {"launch", "ScreenModel"};
-    ASSERT_TRUE(cbm_suppress_kotlin_external_import_member(true, true, "scope.launch",
-                                                           "unique_name", &arr, all_keys, 2, NULL,
-                                                           NULL));
+    ASSERT_TRUE(cbm_suppress_kotlin_external_import_member(
+        true, true, "scope.launch", "unique_name", &arr, all_keys, 2, NULL, NULL));
     CBMHashTable *declared = cbm_ht_create(4);
     ASSERT_NOT_NULL(declared);
     cbm_ht_set(declared, "kotlinx.coroutines", (void *)"1");
-    ASSERT_FALSE(cbm_suppress_kotlin_external_import_member(true, true, "scope.launch",
-                                                            "unique_name", &arr, keys, 1, NULL,
-                                                            declared));
+    ASSERT_FALSE(cbm_suppress_kotlin_external_import_member(
+        true, true, "scope.launch", "unique_name", &arr, keys, 1, NULL, declared));
     cbm_ht_free(declared);
     PASS();
 }

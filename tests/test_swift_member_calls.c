@@ -75,38 +75,34 @@ TEST(swift_member_callee_names_receiver_type) {
 }
 
 static const char *const SWC_FILES[][2] = {
-    {"App/Ext/View+Ext.swift",
-     "import SwiftUI\n\nextension View {\n"
-     "    public func tagged(_ id: String) -> some View {\n        return accessibilityIdentifier(id)\n    }\n}\n"},
+    {"App/Ext/View+Ext.swift", "import SwiftUI\n\nextension View {\n"
+                               "    public func tagged(_ id: String) -> some View {\n        "
+                               "return accessibilityIdentifier(id)\n    }\n}\n"},
     {"App/Model/Label.swift",
      "struct Label {\n    func tagged(_ id: String) -> Label { return self }\n}\n"},
     {"App/UI/Card.swift",
      "import SwiftUI\n\nstruct Card: View {\n    var body: some View {\n"
      "        VStack {\n            Text(\"a\")\n        }\n        .padding(1)\n"
      "        .tagged(\"card\")\n    }\n}\n"},
-    {"App/VM/BaseVM.swift",
-     "class BaseVM {\n    func refresh(host: Int) {}\n}\n"},
-    {"App/VM/OtherVM.swift",
-     "class OtherVM {\n    func refresh(host: Int) {}\n}\n"},
-    {"App/VM/ChildVM.swift",
-     "class ChildVM: BaseVM {\n"
-     "    var items: [Any] = []\n"
-     "    override func refresh(host: Int) {\n"
-     "        super.refresh(host: host)\n"
-     "    }\n"
-     "    func each(item: Any) {\n"
-     "        let vm = item as? BaseVM\n"
-     "        vm?.refresh(host: 1)\n"
-     "    }\n"
-     "}\n"},
+    {"App/VM/BaseVM.swift", "class BaseVM {\n    func refresh(host: Int) {}\n}\n"},
+    {"App/VM/OtherVM.swift", "class OtherVM {\n    func refresh(host: Int) {}\n}\n"},
+    {"App/VM/ChildVM.swift", "class ChildVM: BaseVM {\n"
+                             "    var items: [Any] = []\n"
+                             "    override func refresh(host: Int) {\n"
+                             "        super.refresh(host: host)\n"
+                             "    }\n"
+                             "    func each(item: Any) {\n"
+                             "        let vm = item as? BaseVM\n"
+                             "        vm?.refresh(host: 1)\n"
+                             "    }\n"
+                             "}\n"},
 };
 
 /* Distinct target QNs of CALLS edges onto a node named `leaf` from the nodes
  * of file `src` or from the node whose QN ends `.<src>`, one per line;
  * returns the count. (A computed property such as a view's `body` has no node
  * of its own, so there the file is the caller unit.) */
-static int swc_targets(sqlite3 *db, const char *src_file, const char *leaf, char *out,
-                       size_t cap) {
+static int swc_targets(sqlite3 *db, const char *src_file, const char *leaf, char *out, size_t cap) {
     out[0] = '\0';
     static const char sql[] =
         "SELECT DISTINCT t.qualified_name FROM edges e JOIN nodes s ON s.id = e.source_id "
@@ -139,8 +135,7 @@ static int swc_expect_one(sqlite3 *db, const char *src_file, const char *leaf,
         strncmp(got + gl - wl - 1, want_tail, wl) == 0) {
         return 1;
     }
-    printf("\n  %s -> %s: want one edge to ...%s, have %d:\n%s", src_file, leaf, want_tail, n,
-           got);
+    printf("\n  %s -> %s: want one edge to ...%s, have %d:\n%s", src_file, leaf, want_tail, n, got);
     return 0;
 }
 
@@ -191,24 +186,21 @@ static const char *const SWB_FILES[][2] = {
     {"App/Geo/Shape.swift", "class Shape {\n    func redraw(scale: Int) {}\n}\n"},
     {"App/Geo/Polygon.swift",
      "class Polygon: Shape {\n    func corners() -> Int { return 0 }\n}\n"},
-    {"App/Geo/Square.swift",
-     "class Square: Polygon {\n"
-     "    override func redraw(scale: Int) {\n"
-     "        super.redraw(scale: scale)\n"
-     "    }\n"
-     "    func paint(item: Any) {\n"
-     "        (item as? Polygon)?.redraw(scale: 2)\n"
-     "    }\n"
-     "}\n"},
-    {"App/Geo/Circle.swift",
-     "class Circle: Shape {\n    override func redraw(scale: Int) {}\n}\n"},
+    {"App/Geo/Square.swift", "class Square: Polygon {\n"
+                             "    override func redraw(scale: Int) {\n"
+                             "        super.redraw(scale: scale)\n"
+                             "    }\n"
+                             "    func paint(item: Any) {\n"
+                             "        (item as? Polygon)?.redraw(scale: 2)\n"
+                             "    }\n"
+                             "}\n"},
+    {"App/Geo/Circle.swift", "class Circle: Shape {\n    override func redraw(scale: Int) {}\n}\n"},
     {"App/Geo/Disc.swift", "class Disc: Circle {\n    func area() -> Int { return 0 }\n}\n"},
-    {"App/Geo/Ring.swift",
-     "class Ring: Disc {\n"
-     "    func spin() {\n"
-     "        super.redraw(scale: 3)\n"
-     "    }\n"
-     "}\n"},
+    {"App/Geo/Ring.swift", "class Ring: Disc {\n"
+                           "    func spin() {\n"
+                           "        super.redraw(scale: 3)\n"
+                           "    }\n"
+                           "}\n"},
     {"App/Sketch/Sketch.swift", "class Sketch {\n    func redraw(scale: Int) {}\n}\n"},
 };
 
@@ -339,35 +331,34 @@ TEST(swift_inherited_member_registry_rules) {
 /* A leading-dot call is View.m only on a view chain. A chain rooted in a
  * plain call (`make()\n    .resume()`: URLSession, Combine, RxSwift) keeps
  * its source text, so it binds like the one-line `make().resume()`. */
-static const char SWC_CHAIN_SRC[] =
-    "import SwiftUI\n\n"
-    "final class Job { func resume() {} }\n"
-    "final class Runner {\n"
-    "    func make() -> Job { return Job() }\n"
-    "    func run() {\n"
-    "        make()\n"
-    "            .resume()\n"
-    "    }\n"
-    "}\n"
-    "struct Row: View {\n"
-    "    var body: some View {\n"
-    "        Text(\"a\")\n"
-    "            .stamped(1)\n"
-    "    }\n"
-    "    func wrap(content: Content) -> some View {\n"
-    "        content.padding()\n"
-    "            .stamped(2)\n"
-    "    }\n"
-    "    func badge() -> some View {\n"
-    "        Kit.Badge()\n"
-    "            .stamped(3)\n"
-    "    }\n"
-    "    func listen() {\n"
-    "        feed()\n"
-    "            .receive(on: main)\n"
-    "            .sink { _ in }\n"
-    "    }\n"
-    "}\n";
+static const char SWC_CHAIN_SRC[] = "import SwiftUI\n\n"
+                                    "final class Job { func resume() {} }\n"
+                                    "final class Runner {\n"
+                                    "    func make() -> Job { return Job() }\n"
+                                    "    func run() {\n"
+                                    "        make()\n"
+                                    "            .resume()\n"
+                                    "    }\n"
+                                    "}\n"
+                                    "struct Row: View {\n"
+                                    "    var body: some View {\n"
+                                    "        Text(\"a\")\n"
+                                    "            .stamped(1)\n"
+                                    "    }\n"
+                                    "    func wrap(content: Content) -> some View {\n"
+                                    "        content.padding()\n"
+                                    "            .stamped(2)\n"
+                                    "    }\n"
+                                    "    func badge() -> some View {\n"
+                                    "        Kit.Badge()\n"
+                                    "            .stamped(3)\n"
+                                    "    }\n"
+                                    "    func listen() {\n"
+                                    "        feed()\n"
+                                    "            .receive(on: main)\n"
+                                    "            .sink { _ in }\n"
+                                    "    }\n"
+                                    "}\n";
 
 TEST(swift_leading_dot_chain_needs_view_root) {
     CBMFileResult *r = cbm_extract_file(SWC_CHAIN_SRC, (int)strlen(SWC_CHAIN_SRC), CBM_LANG_SWIFT,
@@ -394,9 +385,8 @@ TEST(swift_leading_dot_chain_needs_view_root) {
 
 static const char *const SWC_CHAIN_FILES[][2] = {
     {"Net/Job.swift", "final class Job {\n    func resume() {}\n}\n"},
-    {"Net/Runner.swift",
-     "final class Runner {\n    func make() -> Job { return Job() }\n"
-     "    func run() {\n        make()\n            .resume()\n    }\n}\n"},
+    {"Net/Runner.swift", "final class Runner {\n    func make() -> Job { return Job() }\n"
+                         "    func run() {\n        make()\n            .resume()\n    }\n}\n"},
 };
 
 TEST(swift_leading_dot_non_view_chain_binds) {
@@ -441,8 +431,8 @@ static char *swc_big_function(int n) {
     if (!buf) {
         return NULL;
     }
-    size_t used = (size_t)snprintf(buf, cap,
-                                   "final class Job { func resume() {} }\nfunc big(_ v: Any) {\n");
+    size_t used =
+        (size_t)snprintf(buf, cap, "final class Job { func resume() {} }\nfunc big(_ v: Any) {\n");
     for (int i = 0; i < n; i++) {
         used += (size_t)snprintf(buf + used, cap - used,
                                  "    if let a%d = v as? Job { a%d.resume() }\n"

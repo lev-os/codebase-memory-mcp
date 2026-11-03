@@ -451,8 +451,7 @@ static void kt_emit_resolved_kind(KotlinLSPContext *ctx, const char *callee_qn,
     /* Sub-floor rows are dropped, except the external-receiver evidence row:
      * it is meant to stay below CBM_LSP_CONFIDENCE_FLOOR (never an edge) and
      * is read only by cbm_pipeline_kotlin_receiver_external. */
-    if (confidence < 0.60f &&
-        !(strategy && strcmp(strategy, "lsp_kt_external_receiver") == 0)) {
+    if (confidence < 0.60f && !(strategy && strcmp(strategy, "lsp_kt_external_receiver") == 0)) {
         return;
     }
 

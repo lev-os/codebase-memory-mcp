@@ -3557,9 +3557,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                                 cbm_pipeline_get_nsmap()) ||
             /* Kotlin library receivers — MUST match pass_calls.c exactly. */
             cbm_suppress_kotlin_external_import_member(
-                lang == CBM_LANG_KOTLIN, true, call->callee_name, res.strategy,
-                &result->imports, imp_keys, imp_count, cbm_pipeline_get_pkgmap(),
-                cbm_pipeline_get_nsmap()) ||
+                lang == CBM_LANG_KOTLIN, true, call->callee_name, res.strategy, &result->imports,
+                imp_keys, imp_count, cbm_pipeline_get_pkgmap(), cbm_pipeline_get_nsmap()) ||
             (lang == CBM_LANG_KOTLIN && cbm_suppress_weak_member_match(true, true, res.strategy) &&
              cbm_pipeline_kotlin_receiver_external(&result->resolved_calls, call) &&
              cbm_pipeline_qn_is_type_member(rc->main_gbuf, res.qualified_name)) ||

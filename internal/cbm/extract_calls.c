@@ -892,9 +892,8 @@ static bool swift_is_view_modifier(const char *name) {
 /* The member a navigation_expression names (`a.b` -> b), or NULL. */
 static char *swift_nav_member(CBMArena *a, TSNode nav, const char *source) {
     TSNode suffix = ts_node_child_by_field_name(nav, TS_FIELD("suffix"));
-    TSNode member = ts_node_is_null(suffix)
-                        ? suffix
-                        : ts_node_child_by_field_name(suffix, TS_FIELD("suffix"));
+    TSNode member =
+        ts_node_is_null(suffix) ? suffix : ts_node_child_by_field_name(suffix, TS_FIELD("suffix"));
     if (ts_node_is_null(member) || strcmp(ts_node_type(member), "simple_identifier") != 0) {
         return NULL;
     }
@@ -907,8 +906,7 @@ static char *swift_nav_member(CBMArena *a, TSNode nav, const char *source) {
  * this call included, applies a known view modifier. A chain rooted anywhere else
  * (`make()\n  .resume()`, `URLSession.shared.dataTask(...)\n  .resume()`,
  * Combine / RxSwift operators) is not a view and keeps its source text. */
-static bool swift_chain_is_view(CBMArena *a, TSNode target, const char *mname,
-                                const char *source) {
+static bool swift_chain_is_view(CBMArena *a, TSNode target, const char *mname, const char *source) {
     if (swift_is_view_modifier(mname)) {
         return true;
     }
@@ -966,9 +964,8 @@ static char *swift_navigation_callee(CBMExtractCtx *ctx, CBMArena *a, TSNode cal
                                      const char *source) {
     TSNode target = ts_node_child_by_field_name(nav, TS_FIELD("target"));
     TSNode suffix = ts_node_child_by_field_name(nav, TS_FIELD("suffix"));
-    TSNode member = ts_node_is_null(suffix)
-                        ? suffix
-                        : ts_node_child_by_field_name(suffix, TS_FIELD("suffix"));
+    TSNode member =
+        ts_node_is_null(suffix) ? suffix : ts_node_child_by_field_name(suffix, TS_FIELD("suffix"));
     char *mname = ts_node_is_null(member) ? NULL : cbm_node_text(a, member, source);
     if (ts_node_is_null(target) || !mname || !mname[0] ||
         strcmp(ts_node_type(member), "simple_identifier") != 0) {
@@ -989,8 +986,7 @@ static char *swift_navigation_callee(CBMExtractCtx *ctx, CBMArena *a, TSNode cal
             }
             type = swift_local_cast_type(ctx, call, recv);
         }
-    } else if ((strcmp(tk, "call_expression") == 0 ||
-                strcmp(tk, "constructor_expression") == 0) &&
+    } else if ((strcmp(tk, "call_expression") == 0 || strcmp(tk, "constructor_expression") == 0) &&
                swift_suffix_starts_line(target, suffix, source) &&
                swift_chain_is_view(a, target, mname, source)) {
         type = cbm_arena_strdup(a, "View");
@@ -1001,8 +997,8 @@ static char *swift_navigation_callee(CBMExtractCtx *ctx, CBMArena *a, TSNode cal
     return cbm_node_text(a, nav, source);
 }
 
-static char *extract_swift_callee(CBMExtractCtx *ctx, CBMArena *a, TSNode node,
-                                  const char *source, const char *nk) {
+static char *extract_swift_callee(CBMExtractCtx *ctx, CBMArena *a, TSNode node, const char *source,
+                                  const char *nk) {
     if (strcmp(nk, "call_expression") != 0 && strcmp(nk, "constructor_expression") != 0) {
         return NULL;
     }

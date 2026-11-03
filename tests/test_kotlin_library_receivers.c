@@ -55,8 +55,7 @@ static const char *const KLR_FILES[][2] = {
 
 /* CALLS edges whose source QN ends in `.<src_tail>` onto a node named
  * `leaf`; the target QNs go to out, one per line. */
-static int klr_targets(sqlite3 *db, const char *src_tail, const char *leaf, char *out,
-                       size_t cap) {
+static int klr_targets(sqlite3 *db, const char *src_tail, const char *leaf, char *out, size_t cap) {
     out[0] = '\0';
     static const char sql[] =
         "SELECT t.qualified_name FROM edges e JOIN nodes s ON s.id = e.source_id "
@@ -79,8 +78,7 @@ static int klr_targets(sqlite3 *db, const char *src_tail, const char *leaf, char
     return n;
 }
 
-static int klr_expect_none(sqlite3 *db, const char *venue, const char *src_tail,
-                           const char *leaf) {
+static int klr_expect_none(sqlite3 *db, const char *venue, const char *src_tail, const char *leaf) {
     char got[1024];
     int n = klr_targets(db, src_tail, leaf, got, sizeof(got));
     if (n == 0) {

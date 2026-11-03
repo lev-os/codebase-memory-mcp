@@ -71,9 +71,8 @@ int cbm_pipeline_overload_targets(const cbm_gbuf_t *gb, const cbm_gbuf_node_t *t
                                   const CBMCall *call, CBMLanguage lang,
                                   const cbm_gbuf_node_t **out, int cap) {
     char params[OVL_PROP_MAX];
-    if (!gb || !target || !call || !out || cap < 1 || !cbm_overload_lang(lang) ||
-        !target->name || !target->qualified_name ||
-        !ovl_node_params(target, params, sizeof(params))) {
+    if (!gb || !target || !call || !out || cap < 1 || !cbm_overload_lang(lang) || !target->name ||
+        !target->qualified_name || !ovl_node_params(target, params, sizeof(params))) {
         return 0;
     }
     const cbm_gbuf_node_t **same = NULL;

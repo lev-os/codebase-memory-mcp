@@ -374,8 +374,8 @@ bool cbm_registry_name_guess_vetoed(const cbm_registry_t *r, CBMLanguage caller_
  * (same-named types). cbm_registry_resolve_call_scoped runs it once the
  * strategy chain found nothing. */
 bool cbm_registry_lang_climbs_supertypes(CBMLanguage lang);
-void cbm_registry_add_supertypes(cbm_registry_t *r, const char *type_name,
-                                 const char *const *bases, CBMLanguage lang);
+void cbm_registry_add_supertypes(cbm_registry_t *r, const char *type_name, const char *const *bases,
+                                 CBMLanguage lang);
 cbm_resolution_t cbm_registry_resolve_inherited_member(const cbm_registry_t *r,
                                                        const char *callee_name,
                                                        CBMLanguage caller_lang);

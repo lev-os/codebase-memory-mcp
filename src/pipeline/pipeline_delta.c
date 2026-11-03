@@ -738,8 +738,8 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
         }
         /* Pin the gbuf id to the database id: proxies ARE their rows. */
         cbm_gbuf_set_next_id(gbuf, id);
-        int64_t got = cbm_gbuf_upsert_node(gbuf, label, name, qn, fp ? fp : "", start_line,
-                                           end_line, props);
+        int64_t got =
+            cbm_gbuf_upsert_node(gbuf, label, name, qn, fp ? fp : "", start_line, end_line, props);
         cbm_free(CBM_MEM_CLASS_OTHER, overload_props);
         cbm_free(CBM_MEM_CLASS_OTHER, generated_props);
         cbm_free(CBM_MEM_CLASS_OTHER, owner_props);

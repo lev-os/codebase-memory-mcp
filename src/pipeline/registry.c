@@ -2892,10 +2892,9 @@ static void supertype_simple_name(const char *spelling, char *out, size_t cap) {
     out[n] = '\0';
 }
 
-void cbm_registry_add_supertypes(cbm_registry_t *r, const char *type_name,
-                                 const char *const *bases, CBMLanguage lang) {
-    if (!r || !type_name || !type_name[0] || !bases ||
-        !cbm_registry_lang_climbs_supertypes(lang)) {
+void cbm_registry_add_supertypes(cbm_registry_t *r, const char *type_name, const char *const *bases,
+                                 CBMLanguage lang) {
+    if (!r || !type_name || !type_name[0] || !bases || !cbm_registry_lang_climbs_supertypes(lang)) {
         return;
     }
     char self[CBM_SZ_256];
@@ -3009,8 +3008,8 @@ static bool supertype_walk_visit(supertype_walk_t *walk, const char *name) {
  * first; -1: the first type that owns it owns it more than once (same-named
  * types), so nothing binds; 0: none. */
 static int climb_supertypes(const cbm_registry_t *r, const qn_array_t *arr, const char *member,
-                            const char *type, CBMLanguage caller, int depth,
-                            supertype_walk_t *walk, const char **hit) {
+                            const char *type, CBMLanguage caller, int depth, supertype_walk_t *walk,
+                            const char **hit) {
     const supertype_list_t *list = cbm_ht_get(r->supertypes, type);
     if (!list || !list->names || depth >= SUPERTYPE_MAX_DEPTH) {
         return 0;
@@ -3048,8 +3047,7 @@ static int climb_supertypes(const cbm_registry_t *r, const qn_array_t *arr, cons
 cbm_resolution_t cbm_registry_resolve_inherited_member(const cbm_registry_t *r,
                                                        const char *callee_name,
                                                        CBMLanguage caller_lang) {
-    if (!r || !r->supertypes || !callee_name ||
-        !cbm_registry_lang_climbs_supertypes(caller_lang)) {
+    if (!r || !r->supertypes || !callee_name || !cbm_registry_lang_climbs_supertypes(caller_lang)) {
         return empty_result();
     }
     /* `[...].T.m`: T is the segment before the last; it names a type. */
