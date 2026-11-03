@@ -14,6 +14,7 @@
 #include "foundation/arena.h"
 #include <foundation/compat_fs.h>
 #include <pipeline/pipeline.h>
+#include <pipeline/pipeline_internal.h>
 #include <store/store.h>
 #include <sqlite3.h>
 
@@ -502,6 +503,190 @@ TEST(overload_calls_ambiguous_binds_every_candidate) {
     PASS();
 }
 
+/* ── Incremental == full ───────────────────────────────────────── */
+
+/* Every edge of the project as "TYPE source -> target" lines with the
+ * project's QN prefix removed, sorted; NULL when the database cannot be read
+ * (the caller frees). */
+static char *ovl_edge_set(const char *db_path) {
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    sqlite3 *db = store ? cbm_store_get_db(store) : NULL;
+    sqlite3_stmt *st = NULL;
+    if (!db ||
+        sqlite3_prepare_v2(db,
+                           "SELECT e.type || ' ' || replace(s.qualified_name, e.project || '.', '') "
+                           "|| ' -> ' || replace(t.qualified_name, e.project || '.', '') "
+                           "FROM edges e JOIN nodes s ON s.id=e.source_id "
+                           "JOIN nodes t ON t.id=e.target_id ORDER BY 1",
+                           -1, &st, NULL) != SQLITE_OK) {
+        if (store) {
+            cbm_store_close(store);
+        }
+        return NULL;
+    }
+    size_t cap = 4096;
+    size_t len = 0;
+    char *buf = malloc(cap);
+    if (buf) {
+        buf[0] = '\0';
+    }
+    while (buf && sqlite3_step(st) == SQLITE_ROW) {
+        const char *line = (const char *)sqlite3_column_text(st, 0);
+        size_t l = line ? strlen(line) : 0;
+        if (len + l + 2 > cap) {
+            cap = (len + l + 2) * 2;
+            char *grown = realloc(buf, cap);
+            if (!grown) {
+                free(buf);
+                buf = NULL;
+                break;
+            }
+            buf = grown;
+        }
+        memcpy(buf + len, line, l);
+        len += l;
+        buf[len++] = '\n';
+        buf[len] = '\0';
+    }
+    sqlite3_finalize(st);
+    cbm_store_close(store);
+    return buf;
+}
+
+static int ovl_index(const char *repo, const char *db_path) {
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    int rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    if (pipeline) {
+        cbm_pipeline_free(pipeline);
+    }
+    return rc;
+}
+
+/* Index `files`, rewrite only `files[1]` (the caller) as `edited`, re-index
+ * incrementally, and require the closure-repair route, the same edge set as a
+ * fresh full index of the edited tree, and `want` among those edges. */
+static int ovl_incremental_matches_full(const ovl_file_t files[2], const char *edited,
+                                        const char *want) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_ovl_incr_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return 1;
+    }
+    char repo[300];
+    snprintf(repo, sizeof(repo), "%s/repo", tmp);
+    char inc_db[400];
+    char full_db[400];
+    snprintf(inc_db, sizeof(inc_db), "%s/inc.db", tmp);
+    snprintf(full_db, sizeof(full_db), "%s/full.db", tmp);
+    ovl_env_t save = ovl_env_select(false);
+    int rc = 1;
+    char *inc = NULL;
+    char *full = NULL;
+    int route = -1;
+    if (ovl_write(repo, files[0].path, files[0].content) &&
+        ovl_write(repo, files[1].path, files[1].content) && ovl_index(repo, inc_db) == 0 &&
+        ovl_write(repo, files[1].path, edited)) {
+        cbm_pipeline_incremental_test_reset_faults();
+        if (ovl_index(repo, inc_db) == 0) {
+            route = (int)cbm_pipeline_incremental_test_last_route();
+            if (ovl_index(repo, full_db) == 0) {
+                inc = ovl_edge_set(inc_db);
+                full = ovl_edge_set(full_db);
+            }
+        }
+    }
+    ovl_env_restore(&save);
+    if (inc && full && strcmp(inc, full) == 0 && strstr(full, want) &&
+        route == (int)CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR) {
+        rc = 0;
+    } else {
+        fprintf(stderr, "  route %d (want %d), want edge [%s]\n--- incremental\n%s--- full\n%s",
+                route, (int)CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR, want, inc ? inc : "(null)",
+                full ? full : "(null)");
+    }
+    free(inc);
+    free(full);
+    th_rmtree(tmp);
+    return rc;
+}
+
+/* The reviewer's case: an edit to the caller file alone re-resolves its calls
+ * against proxies of the unchanged overloads, which must bind exactly as a
+ * full index does (each call to the member its arguments fit). */
+TEST(overload_incremental_java_matches_full) {
+    static const ovl_file_t files[] = {
+        {"src/demo/Foo.java", "package demo;\n"
+                              "public class Foo {\n"
+                              "    public void m(int a) {}\n"
+                              "    public void m(String s) {}\n"
+                              "    public void m(int a, int b) {}\n"
+                              "}\n"},
+        {"src/demo/Caller.java", "package demo;\n"
+                                 "public class Caller {\n"
+                                 "    private final Foo f = new Foo();\n"
+                                 "    void run() { f.m(1); f.m(1, 2); }\n"
+                                 "}\n"},
+    };
+    static const char edited[] = "package demo;\n"
+                                 "public class Caller {\n"
+                                 "    private final Foo f = new Foo();\n"
+                                 "    void run() { f.m(1); f.m(1, 2); f.m(\"s\"); }\n"
+                                 "}\n";
+    ASSERT_EQ(ovl_incremental_matches_full(
+                  files, edited, "CALLS src.demo.Caller.run -> src.demo.Foo.m(int,int)\n"),
+              0);
+    PASS();
+}
+
+TEST(overload_incremental_kotlin_matches_full) {
+    static const ovl_file_t files[] = {
+        {"src/demo/Foo.kt", "package demo\n"
+                            "class Foo {\n"
+                            "    fun m(a: Int) {}\n"
+                            "    fun m(s: String) {}\n"
+                            "    fun m(a: Int, b: Int) {}\n"
+                            "}\n"},
+        {"src/demo/Caller.kt", "package demo\n"
+                               "class Caller {\n"
+                               "    private val f = Foo()\n"
+                               "    fun run() { f.m(1); f.m(1, 2) }\n"
+                               "}\n"},
+    };
+    static const char edited[] = "package demo\n"
+                                 "class Caller {\n"
+                                 "    private val f = Foo()\n"
+                                 "    fun run() { f.m(1); f.m(1, 2); f.m(\"s\") }\n"
+                                 "}\n";
+    ASSERT_EQ(ovl_incremental_matches_full(files, edited,
+                                           "CALLS src.demo.Caller.Caller.run -> "
+                                           "src.demo.Foo.Foo.m(Int,Int)\n"),
+              0);
+    PASS();
+}
+
+TEST(overload_incremental_swift_matches_full) {
+    static const ovl_file_t files[] = {
+        {"Sources/Demo/Foo.swift", "class Foo {\n"
+                                   "    func m(_ a: Int) {}\n"
+                                   "    func m(named: String) {}\n"
+                                   "    func m(_ a: Int, to b: Int) {}\n"
+                                   "}\n"},
+        {"Sources/Demo/Caller.swift", "class Caller {\n"
+                                      "    let f = Foo()\n"
+                                      "    func run() { f.m(1); f.m(1, to: 2) }\n"
+                                      "}\n"},
+    };
+    static const char edited[] = "class Caller {\n"
+                                 "    let f = Foo()\n"
+                                 "    func run() { f.m(1); f.m(1, to: 2); f.m(named: \"x\") }\n"
+                                 "}\n";
+    ASSERT_EQ(ovl_incremental_matches_full(files, edited,
+                                           "CALLS Sources.Demo.Caller.Caller.run -> "
+                                           "Sources.Demo.Foo.Foo.m(named:String)\n"),
+              0);
+    PASS();
+}
+
 SUITE(overloads) {
     RUN_TEST(overload_shape_swift_labels);
     RUN_TEST(overload_shape_counts);
@@ -514,4 +699,7 @@ SUITE(overloads) {
     RUN_TEST(overload_calls_swift_sequential);
     RUN_TEST(overload_calls_swift_parallel);
     RUN_TEST(overload_calls_ambiguous_binds_every_candidate);
+    RUN_TEST(overload_incremental_java_matches_full);
+    RUN_TEST(overload_incremental_kotlin_matches_full);
+    RUN_TEST(overload_incremental_swift_matches_full);
 }

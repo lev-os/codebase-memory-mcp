@@ -30,6 +30,7 @@
  */
 #include "foundation/constants.h"
 #include "pipeline/pipeline_internal.h"
+#include "callable_overload.h"
 
 #include <stdint.h> /* intptr_t — SQLITE_TRANSIENT wrapper */
 #include <stdio.h>
@@ -590,16 +591,16 @@ static char *delta_owner_props(const char *project, const char *name, const char
     return out;
 }
 
-/* `props` (a JSON object) with a generated member's mark (cbm.h
- * CBM_PROP_GENERATED) added, or NULL when `generated` is NULL/empty
- * (CBM_MEM_CLASS_OTHER; the caller frees). */
-static char *delta_generated_props(const char *props, const char *generated) {
-    if (!generated || !generated[0]) {
+/* `props` (a JSON object) with the string member `key` = `value` added, or
+ * NULL when `value` is NULL/empty (CBM_MEM_CLASS_OTHER; the caller frees).
+ * `key` is a fixed identifier; `value` is escaped. */
+static char *delta_with_prop(const char *props, const char *key, const char *value) {
+    if (!value || !value[0]) {
         return NULL;
     }
     size_t pl = props ? strlen(props) : 0;
     bool has_members = pl > PAIR_LEN && props[0] == '{' && props[pl - SKIP_ONE] == '}';
-    size_t cap = pl + PAIR_LEN * strlen(generated) + CBM_SZ_32;
+    size_t cap = pl + strlen(key) + PAIR_LEN * strlen(value) + CBM_SZ_32;
     char *out = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, cap);
     if (!out) {
         return NULL;
@@ -612,8 +613,8 @@ static char *delta_generated_props(const char *props, const char *generated) {
     } else {
         out[k++] = '{';
     }
-    k += (size_t)snprintf(out + k, cap - k, "\"%s\":\"", CBM_PROP_GENERATED);
-    for (const char *p = generated; *p && k + CBM_SZ_3 < cap; p++) {
+    k += (size_t)snprintf(out + k, cap - k, "\"%s\":\"", key);
+    for (const char *p = value; *p && k + CBM_SZ_3 < cap; p++) {
         if (*p == '"' || *p == '\\') {
             out[k++] = '\\';
         }
@@ -672,7 +673,15 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
      * And a generated member's mark (a Java record's implicit accessor, a
      * Method node): the registry seed reads it to register the member by
      * qualified name only, as the full build does (cbm_node_props_generated);
-     * without it the proxy came back into the short-name index. */
+     * without it the proxy came back into the short-name index.
+     *
+     * And a same-file overload's parameter shape (callable_overload.h
+     * CBM_OVERLOAD_PARAMS_PROP, on Function/Method rows of a split group):
+     * cbm_pipeline_overload_targets binds a re-resolved call to the member
+     * its arguments fit by reading it off every member, and the registry seed
+     * keeps members 2..n out of the short-name index by it
+     * (cbm_node_is_split_overload). Without it an incremental run bound
+     * every call to the group's first member. */
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(
             db,
@@ -687,7 +696,10 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
             " THEN json_extract(properties, '$.parent_class') END,"
             " CASE WHEN label = 'Method'"
             " AND instr(properties, '\"" CBM_PROP_GENERATED "\"') > 0"
-            " THEN json_extract(properties, '$." CBM_PROP_GENERATED "') END"
+            " THEN json_extract(properties, '$." CBM_PROP_GENERATED "') END,"
+            " CASE WHEN label IN ('Function','Method')"
+            " AND instr(properties, '\"" CBM_OVERLOAD_PARAMS_PROP "\"') > 0"
+            " THEN json_extract(properties, '$." CBM_OVERLOAD_PARAMS_PROP "') END"
             " FROM nodes"
             " WHERE project = ?1 AND label NOT IN"
             " ('Macro','Comment','Section','Branch','Commit','Tag')"
@@ -712,14 +724,23 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
         int end_line = sqlite3_column_int(stmt, 7);
         const char *parent = (const char *)sqlite3_column_text(stmt, 8);
         const char *generated = (const char *)sqlite3_column_text(stmt, 9);
+        const char *overload = (const char *)sqlite3_column_text(stmt, 10);
         char *owner_props =
             parent ? delta_owner_props(project, name, qn, parent, client_props) : NULL;
         const char *props = owner_props ? owner_props : (client_props ? client_props : "{}");
-        char *generated_props = delta_generated_props(props, generated);
+        char *generated_props = delta_with_prop(props, CBM_PROP_GENERATED, generated);
+        if (generated_props) {
+            props = generated_props;
+        }
+        char *overload_props = delta_with_prop(props, CBM_OVERLOAD_PARAMS_PROP, overload);
+        if (overload_props) {
+            props = overload_props;
+        }
         /* Pin the gbuf id to the database id: proxies ARE their rows. */
         cbm_gbuf_set_next_id(gbuf, id);
         int64_t got = cbm_gbuf_upsert_node(gbuf, label, name, qn, fp ? fp : "", start_line,
-                                           end_line, generated_props ? generated_props : props);
+                                           end_line, props);
+        cbm_free(CBM_MEM_CLASS_OTHER, overload_props);
         cbm_free(CBM_MEM_CLASS_OTHER, generated_props);
         cbm_free(CBM_MEM_CLASS_OTHER, owner_props);
         if (got != id) {
