@@ -1385,6 +1385,65 @@ TEST(lrp_ts_barrel_reexport_member_calls) {
     PASS();
 }
 
+/* JS namespace imports. `import * as ns from './m'; ns.fn()` binds the
+ * call to m's `fn` (N1). When m only re-exports the name, the call binds
+ * through the re-export to the defining file: `export *` (N2), a renamed
+ * `export { a as b }` (N3) and a barrel folder's index.js (N4). A decoy
+ * function with the N2 name lives in another file, so a name guess cannot
+ * make N2 pass and the decoy must get no edge (D). */
+TEST(lrp_js_namespace_import_member_calls) {
+    static const LRP_File f[] = {
+        {"src/lib/direct.js", "export function directFn(x) { return x + 1; }\n"},
+        {"src/lib/impl.js", "export function starFn(x) { return x * 2; }\n"
+                            "export function innerFn(x) { return x - 1; }\n"},
+        {"src/lib/barrel.js", "export * from './impl';\n"
+                              "export { innerFn as renamedFn } from './impl';\n"},
+        {"src/lib/pkg/pkgimpl.js", "export function pkgFn(x) { return x * 3; }\n"},
+        {"src/lib/pkg/index.js", "export { pkgFn } from './pkgimpl';\n"},
+        {"src/other/decoy.js", "export function starFn(x) { return 0; }\n"},
+        {"src/app.js", "import * as direct from './lib/direct';\n"
+                       "import * as barrel from './lib/barrel';\n"
+                       "import * as pkg from './lib/pkg';\n"
+                       "export function run(x) {\n"
+                       "  const a = direct.directFn(x);\n"
+                       "  const b = barrel.starFn(x);\n"
+                       "  const c = barrel.renamedFn(x);\n"
+                       "  const d = pkg.pkgFn(x);\n"
+                       "  return a + b + c + d;\n"
+                       "}\n"},
+        /* A namespace import before another import: its member entry fills
+         * the map's first-estimate slots, so the next import must grow it. */
+        {"src/two.js", "import * as direct from './lib/direct';\n"
+                       "import { pkgFn } from './lib/pkg/pkgimpl';\n"
+                       "export function runTwo(x) { return direct.directFn(x) + pkgFn(x); }\n"},
+    };
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, (int)(sizeof(f) / sizeof(f[0])));
+    ASSERT_NOT_NULL(store);
+
+    int n1 = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "direct.directFn");
+    int n2 = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "impl.starFn");
+    int n3 = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "impl.innerFn");
+    int n4 = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "pkgimpl.pkgFn");
+    int d = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "decoy.starFn");
+    int t1 = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "two.runTwo",
+                                         "direct.directFn");
+    int t2 = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "two.runTwo",
+                                         "pkgimpl.pkgFn");
+    printf("  [js/namespace] N1=%d N2=%d N3=%d N4=%d decoy=%d T1=%d T2=%d\n", n1, n2, n3, n4, d,
+           t1, t2);
+    lrp_cleanup(&lp, store);
+
+    ASSERT_EQ(n1, 1);
+    ASSERT_EQ(n2, 1);
+    ASSERT_EQ(n3, 1);
+    ASSERT_EQ(n4, 1);
+    ASSERT_EQ(d, 0);
+    ASSERT_EQ(t1, 1);
+    ASSERT_EQ(t2, 1);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  * ─── GROUP 7: JAVA (lsp_cross NOT WIRED) ─────────────────────────────
  * ══════════════════════════════════════════════════════════════════════
@@ -2033,6 +2092,7 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_ts_s7_generic);
     RUN_TEST(lrp_ts_s8_field_type_hint);
     RUN_TEST(lrp_ts_barrel_reexport_member_calls);
+    RUN_TEST(lrp_js_namespace_import_member_calls);
 
     /* ── Java (lsp_cross NOT WIRED) — S1 GREEN, S2–S8 RED reproductions ── */
     RUN_TEST(lrp_java_s1_crossfile_call);

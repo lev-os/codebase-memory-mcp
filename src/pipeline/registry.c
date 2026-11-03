@@ -1880,6 +1880,32 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
         return empty_result();
     }
 
+    /* Whole-callee key. The JS/TS import map adds "ns.member" for a call
+     * through a namespace import whose member it followed to the defining
+     * file (cbm_pxc_build_import_map). It wins over the split lookup below,
+     * which only sees the imported module and misses re-exported members. */
+    if (suffix && suffix[0]) {
+        char whole[CBM_SZ_512];
+        int wn = snprintf(whole, sizeof(whole), "%s.%s", prefix, suffix);
+        const char *member_qn = NULL;
+        if (wn > 0 && (size_t)wn < sizeof(whole)) {
+            if (_import_map_cache) {
+                member_qn = (const char *)cbm_ht_get(_import_map_cache, whole);
+            } else {
+                for (int i = 0; i < map_count; i++) {
+                    if (strcmp(keys[i], whole) == 0) {
+                        member_qn = vals[i];
+                        break;
+                    }
+                }
+            }
+        }
+        const char *direct = member_qn ? cbm_ht_get_key(r->exact, member_qn) : NULL;
+        if (direct) {
+            return (cbm_resolution_t){direct, "import_map", CONF_IMPORT_MAP, REG_RESOLVED};
+        }
+    }
+
     /* Build candidate: resolved.suffix or resolved.prefix.
      * When the callee has a dot ("pkg.Func"), prefix="pkg" is the import key
      * and suffix="Func" is the function name, so the target QN is

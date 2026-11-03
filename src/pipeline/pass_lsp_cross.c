@@ -1468,7 +1468,19 @@ static bool pxc_edge_string_prop(const char *json, const char *key, char *out, s
     return true;
 }
 
-/* `visited` holds barrel file QNs already searched for `name`: barrels form
+static void pxc_free_visit_key(const char *key, void *value, void *userdata) {
+    (void)key;
+    (void)userdata;
+    free(value);
+}
+
+/* Free a `visited` table built by pxc_barrel_symbol_qn and its owned keys. */
+static void pxc_barrel_visited_free(CBMHashTable *visited) {
+    cbm_ht_foreach(visited, pxc_free_visit_key, NULL);
+    cbm_ht_free(visited);
+}
+
+/* `visited` holds (barrel file QN, name) pairs already searched: barrels form
  * DAGs (and cycles) where one lib index is reachable through many paths, and
  * re-walking it on each path is exponential in the depth cap. */
 static char *pxc_barrel_symbol_qn(const cbm_gbuf_t *gbuf, const char *project_name,
@@ -1501,10 +1513,24 @@ static char *pxc_barrel_symbol_qn(const cbm_gbuf_t *gbuf, const char *project_na
             free(file_qn);
         }
     }
-    if (!file_node || cbm_ht_has(visited, file_node->qualified_name)) {
+    if (!file_node || !file_node->qualified_name) {
         return NULL;
     }
-    cbm_ht_set(visited, file_node->qualified_name, (void *)file_node);
+    /* Key on file and name: a named re-export renames the symbol, so one
+     * file can be searched for two names in one walk (`export *` and
+     * `export { a as b }` from the same module). The key owns its bytes and
+     * is the stored value; pxc_barrel_visited_free releases it. */
+    size_t vk_len = strlen(file_node->qualified_name) + 1 + strlen(name) + 1;
+    char *visit_key = (char *)malloc(vk_len);
+    if (!visit_key) {
+        return NULL;
+    }
+    snprintf(visit_key, vk_len, "%s\x1f%s", file_node->qualified_name, name);
+    if (cbm_ht_has(visited, visit_key)) {
+        free(visit_key);
+        return NULL;
+    }
+    cbm_ht_set(visited, visit_key, visit_key);
     char *defined = pxc_defined_symbol_qn(gbuf, project_name, rel, name);
     if (defined) {
         return defined;
@@ -1561,6 +1587,114 @@ static bool pxc_import_map_has_local(const char *const *keys, int count, const c
             return true;
     }
     return false;
+}
+
+/* True when `local` is a JS/TS module-object binding: `import * as local`
+ * or `const local = require(...)`. Such an import has no member, is not a
+ * default import and is not a re-export. A local that also names a member
+ * import is not treated as one. */
+static bool pxc_js_namespace_local(const CBMFileResult *result, const char *local) {
+    if (!result || !local) {
+        return false;
+    }
+    bool found = false;
+    for (int i = 0; i < result->imports.count; i++) {
+        const CBMImport *imp = &result->imports.items[i];
+        if (!imp->local_name || strcmp(imp->local_name, local) != 0) {
+            continue;
+        }
+        if (imp->member || imp->is_default || imp->reexport != CBM_REEXPORT_NONE ||
+            !cbm_import_binds_runtime_name(imp)) {
+            return false;
+        }
+        found = true;
+    }
+    return found;
+}
+
+/* A JS identifier: the member part of `ns.member`. */
+static bool pxc_js_identifier(const char *s) {
+    if (!s || !s[0] || (s[0] >= '0' && s[0] <= '9')) {
+        return false;
+    }
+    for (const char *p = s; *p; p++) {
+        char c = *p;
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '_' || c == '$')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Grow the parallel key/value arrays of an import map to hold `need` slots.
+ * Namespace members add entries beyond the one-per-edge first estimate, so
+ * every write in cbm_pxc_build_import_map_ex reserves first. */
+static bool pxc_import_map_reserve(const char ***keys, const char ***vals, size_t *capacity,
+                                   size_t need) {
+    if (need <= *capacity) {
+        return true;
+    }
+    size_t grown = *capacity * 2 > need ? *capacity * 2 : need;
+    const char **nk = (const char **)realloc((void *)*keys, grown * sizeof(char *));
+    if (!nk) {
+        return false;
+    }
+    *keys = nk;
+    const char **nv = (const char **)realloc((void *)*vals, grown * sizeof(char *));
+    if (!nv) {
+        return false; /* keys grew, capacity did not: still consistent */
+    }
+    *vals = nv;
+    *capacity = grown;
+    return true;
+}
+
+/* Calls through a namespace import. For each call `local.member()` in the
+ * file, follow the imported module (and its re-export chain, as for a named
+ * import) to the one file that defines `member`, and add the key
+ * "local.member" with that definition's QN. The registry looks up the whole
+ * callee as a key before it splits it, so `ns.fn()` binds to fn's defining
+ * file even when the imported module only re-exports fn. Nothing is added
+ * when no definition, or more than one, is found. */
+static void pxc_add_js_namespace_members(const cbm_gbuf_t *gbuf, const char *project_name,
+                                         const CBMFileResult *result, const char *local,
+                                         const cbm_gbuf_node_t *target, const char ***keys,
+                                         const char ***vals, int *count, size_t *capacity) {
+    if (!result || !target || !target->label ||
+        (strcmp(target->label, "Module") != 0 && strcmp(target->label, "Folder") != 0)) {
+        return;
+    }
+    size_t local_len = strlen(local);
+    for (int i = 0; i < result->calls.count; i++) {
+        const char *callee = result->calls.items[i].callee_name;
+        if (!callee || strncmp(callee, local, local_len) != 0 || callee[local_len] != '.' ||
+            !pxc_js_identifier(callee + local_len + 1) ||
+            pxc_import_map_has_local(*keys, *count, callee)) {
+            continue;
+        }
+        CBMHashTable *visited = cbm_ht_create(16);
+        char *qn = visited ? pxc_barrel_symbol_qn(gbuf, project_name, target,
+                                                  callee + local_len + 1, 0, visited)
+                           : NULL;
+        pxc_barrel_visited_free(visited);
+        if (!qn) {
+            continue;
+        }
+        char *key = strdup(callee);
+        if (!key) {
+            free(qn);
+            continue;
+        }
+        if (!pxc_import_map_reserve(keys, vals, capacity, (size_t)*count + 1)) {
+            free(key);
+            free(qn);
+            return;
+        }
+        (*keys)[*count] = key;
+        (*vals)[*count] = qn;
+        (*count)++;
+    }
 }
 
 /* Recover a Python import directly from extraction metadata when graph import
@@ -1710,7 +1844,7 @@ int cbm_pxc_build_import_map_ex(const cbm_gbuf_t *gbuf, const char *project_name
             CBMHashTable *visited = direct ? NULL : cbm_ht_create(16);
             if (visited) {
                 barrel = pxc_barrel_symbol_qn(gbuf, project_name, target, local, 0, visited);
-                cbm_ht_free(visited);
+                pxc_barrel_visited_free(visited);
             }
             free(direct);
             if (barrel) {
@@ -1718,9 +1852,18 @@ int cbm_pxc_build_import_map_ex(const cbm_gbuf_t *gbuf, const char *project_name
                 value = barrel;
             }
         }
+        if (!pxc_import_map_reserve(&keys, &vals, &capacity, (size_t)count + 1)) {
+            free(local);
+            free(value);
+            continue;
+        }
         keys[count] = local;
         vals[count] = value;
         count++;
+        if (pxc_is_js_family(lang) && pxc_js_namespace_local(result, local)) {
+            pxc_add_js_namespace_members(gbuf, project_name, result, local, target, &keys, &vals,
+                                         &count, &capacity);
+        }
     }
 
     /* IMPORTS edges are best-effort graph relationships. The cross-LSP still
@@ -1745,7 +1888,8 @@ int cbm_pxc_build_import_map_ex(const cbm_gbuf_t *gbuf, const char *project_name
         if (!value)
             continue;
         char *local = strdup(imp->local_name);
-        if (!local) {
+        if (!local || !pxc_import_map_reserve(&keys, &vals, &capacity, (size_t)count + 1)) {
+            free(local);
             free(value);
             continue;
         }
