@@ -280,6 +280,8 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
     cr_str(c, &d->decl_namespace);
     cr_str(c, &d->variant_key);
     cr_str(c, &d->alias_target);
+    cr_str(c, &d->callable_sig);
+    cr_str(c, &d->callable_params);
 }
 
 static void cr_walk_call(cr_ctx_t *c, CBMCall *call) {
@@ -287,6 +289,7 @@ static void cr_walk_call(cr_ctx_t *c, CBMCall *call) {
     cr_str(c, &call->enclosing_func_qn);
     cr_str(c, &call->first_string_arg);
     cr_str(c, &call->second_arg_name);
+    cr_str(c, &call->arg_shape);
     int argc = call->arg_count;
     if (argc > CBM_MAX_CALL_ARGS) {
         argc = CBM_MAX_CALL_ARGS;

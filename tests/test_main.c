@@ -1876,6 +1876,7 @@ extern void suite_yaml(void);
 extern void suite_integration(void);
 extern void suite_lang_contract(void);
 extern void suite_conditional_variants(void);
+extern void suite_overloads(void);
 extern void suite_spawns(void);
 extern void suite_edge_imports(void);
 extern void suite_edge_structural(void);
@@ -2537,6 +2538,7 @@ int main(int argc, char **argv) {
     /* Per-language graph contracts (node/edge types, attribution, no-crash) */
     RUN_SELECTED_SUITE(lang_contract);
     RUN_SELECTED_SUITE(conditional_variants);
+    RUN_SELECTED_SUITE(overloads);
     RUN_SELECTED_SUITE(spawns);
     RUN_SELECTED_SUITE(edge_imports);
     RUN_SELECTED_SUITE(edge_structural);

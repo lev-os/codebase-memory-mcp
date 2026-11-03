@@ -1355,7 +1355,8 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
     }
     /* A generated member stays out of the short-name index here as in the
      * full index (pass_definitions.c); its node carries the mark. */
-    if (cbm_node_props_generated(node->properties_json)) {
+    if (cbm_node_props_generated(node->properties_json) ||
+        cbm_node_is_split_overload(node->qualified_name, node->name, node->properties_json)) {
         cbm_registry_add_qn_only(seed->registry, node->qualified_name, node->label);
         return;
     }

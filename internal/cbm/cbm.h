@@ -321,6 +321,19 @@ typedef struct {
      * for a defined type `type A B` (its method set is its own) and in every
      * other language. Tail field: zero-init stays valid. */
     const char *alias_target;
+    /* Overload identity (Java, Kotlin, Swift callables only; NULL elsewhere).
+     * callable_sig is the signature suffix callable_sig.h builds in the
+     * language's planned mode (TYPED; Swift LABELED_TYPED). callable_params is
+     * the parameter shape a call is matched against
+     * (cbm_callable_params_shape). Both are read once the file's def list is
+     * final: when two or more callables of one file share a QN and a label,
+     * each one whose signature an earlier one does not already have takes
+     * base QN + callable_sig (qn_sig_off set), the first keeps the base QN,
+     * and every member carries callable_params as its `overload_params`
+     * property. A QN no other callable of the file shares never changes.
+     * Tail fields: zero-init stays valid. */
+    const char *callable_sig;
+    const char *callable_params;
 } CBMDefinition;
 
 /* extra_props key of a generated member, one the compiler writes and the
@@ -396,6 +409,11 @@ typedef struct {
                                      // (self.compiler.apply_converters()). An object the
                                      // class owns, not a parameter: read by the weak-member
                                      // guard's unique-name exemption. Default false.
+    /* Java, Kotlin, Swift: the arguments written at the site, one entry each,
+     * comma-separated: the Swift argument label or "_", and "*" for a
+     * trailing closure/lambda ("" = no arguments). NULL = not recorded. Read
+     * only to choose among same-file overloads (cbm_callable_shape_matches). */
+    const char *arg_shape;
 } CBMCall;
 
 // What an import statement names, when the syntax says so. Only PHP's

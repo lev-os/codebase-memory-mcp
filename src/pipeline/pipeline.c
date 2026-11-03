@@ -2590,12 +2590,13 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
             str_def_misc += census_len(def->route_path) + census_len(def->route_method) +
                             census_len(def->impl_trait) + census_len(def->http_base_url) +
                             census_list(def->extra_props) + census_len(def->decl_namespace) +
-                            census_len(def->variant_key) + census_len(def->alias_target);
+                            census_len(def->variant_key) + census_len(def->alias_target) +
+                            census_len(def->callable_sig) + census_len(def->callable_params);
         }
         for (int c = 0; c < r->calls.count; c++) {
             const CBMCall *call = &r->calls.items[c];
             str_call_names += census_len(call->callee_name) + census_len(call->first_string_arg) +
-                              census_len(call->second_arg_name);
+                              census_len(call->second_arg_name) + census_len(call->arg_shape);
             str_call_enclosing += census_len(call->enclosing_func_qn);
             for (int a = 0; a < call->arg_count && a < CBM_MAX_CALL_ARGS; a++) {
                 str_call_args += census_len(call->args[a].expr) + census_len(call->args[a].value) +

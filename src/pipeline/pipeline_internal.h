@@ -2009,4 +2009,27 @@ void cbm_pipeline_persist_test_run_after_stage_created(void);
 void cbm_pipeline_persist_test_reset_faults(void);
 #endif
 
+/* ── Same-file overloads (internal/cbm/callable_overload.h) ───────── */
+
+/* Most overload members a call that the argument shape cannot decide binds
+ * to; the edges it gets carry this strategy and at most this confidence. */
+enum { CBM_OVERLOAD_TARGETS_MAX = 16 };
+#define CBM_OVERLOAD_AMBIGUOUS_STRATEGY "overload_ambiguous"
+#define CBM_OVERLOAD_AMBIGUOUS_CONFIDENCE 0.3
+
+/* The members of the overload group `target` belongs to that a call with
+ * call->arg_shape can bind to, written to out[0..cap). 0: `target` is in no
+ * group (keep it). 1: that member alone (it may be `target`). More: the
+ * shape does not decide; bind to each of them with the ambiguous strategy.
+ * Same answer in both resolvers. */
+int cbm_pipeline_overload_targets(const cbm_gbuf_t *gb, const cbm_gbuf_node_t *target,
+                                  const CBMCall *call, CBMLanguage lang,
+                                  const cbm_gbuf_node_t **out, int cap);
+
+/* A stored node that is a split overload member 2..n (a suffixed QN with the
+ * overload property): the incremental registry seed files it by QN only, as
+ * the full index does (CBMDefinition.qn_sig_off). */
+bool cbm_node_is_split_overload(const char *qualified_name, const char *name,
+                                const char *properties_json);
+
 #endif /* CBM_PIPELINE_INTERNAL_H */

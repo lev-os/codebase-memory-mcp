@@ -660,6 +660,12 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     if (pxc_is_jvm_lang(lang) && namespace_name && namespace_name[0]) {
         dst->qualified_name = pxc_jvm_def_qn(arena, src, namespace_name, label);
         dst->receiver_type = pxc_jvm_type_qn(arena, namespace_name, src->parent_class);
+    } else if (src->qn_sig_off > 0) {
+        /* A split overload (callable_overload.h): the LSP def keeps the base
+         * QN and carries the suffix as `sig`, as go_lsp.h documents. */
+        dst->qualified_name = cbm_arena_strndup(arena, src->qualified_name, src->qn_sig_off);
+        dst->sig = cbm_arena_strdup(arena, src->qualified_name + src->qn_sig_off);
+        dst->receiver_type = src->parent_class ? cbm_arena_strdup(arena, src->parent_class) : NULL;
     } else {
         dst->qualified_name = cbm_arena_strdup(arena, src->qualified_name);
         dst->receiver_type = src->parent_class ? cbm_arena_strdup(arena, src->parent_class) : NULL;
@@ -2278,6 +2284,7 @@ static void pxc_append_synthetic_calls(CBMArena *dst_arena, CBMCallArray *dst_ca
             src->first_string_arg ? cbm_arena_strdup(dst_arena, src->first_string_arg) : NULL;
         dst.second_arg_name =
             src->second_arg_name ? cbm_arena_strdup(dst_arena, src->second_arg_name) : NULL;
+        dst.arg_shape = src->arg_shape ? cbm_arena_strdup(dst_arena, src->arg_shape) : NULL;
         dst.args = NULL;
         if (src->args && src->arg_count > 0) {
             dst.args = cbm_arena_calloc(dst_arena, (size_t)src->arg_count * sizeof(CBMCallArg));
