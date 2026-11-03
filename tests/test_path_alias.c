@@ -409,6 +409,94 @@ TEST(path_alias_loader_honors_discovery_exclusions) {
     PASS();
 }
 
+/* ── jsconfig.json fallback beside a tsconfig.json without paths ── */
+
+/* A folder holds both configs. The tsconfig.json keeps precedence when it
+ * declares paths or extends another config; otherwise the jsconfig.json
+ * paths are used. Made-up fixture: root (fallback), pkg-a (tsconfig paths
+ * win), pkg-b (tsconfig extends, so its jsconfig is not read). */
+TEST(path_alias_loader_jsconfig_fallback) {
+    char tmpl[256];
+    snprintf(tmpl, sizeof(tmpl), "/tmp/cbm_palias_jsfb_XXXXXX");
+    char *root = cbm_mkdtemp(tmpl);
+    ASSERT_NOT_NULL(root);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/pkg-a", root);
+    cbm_mkdir(path);
+    snprintf(path, sizeof(path), "%s/pkg-b", root);
+    cbm_mkdir(path);
+
+    static const struct {
+        const char *rel;
+        const char *body;
+    } files[] = {
+        {"tsconfig.json", "{ \"compilerOptions\": { \"baseUrl\": \".\", \"strict\": true } }\n"},
+        {"jsconfig.json", "{ \"compilerOptions\": { \"baseUrl\": \".\",\n"
+                          "  \"paths\": { \"@app/*\": [\"src/app/*\"] } } }\n"},
+        {"pkg-a/tsconfig.json",
+         "{ \"compilerOptions\": { \"paths\": { \"@a/*\": [\"./lib/*\"] } } }\n"},
+        {"pkg-a/jsconfig.json",
+         "{ \"compilerOptions\": { \"paths\": { \"@a/*\": [\"./other/*\"] } } }\n"},
+        {"pkg-b/tsconfig.json", "{ \"extends\": \"../tsconfig.json\" }\n"},
+        {"pkg-b/jsconfig.json",
+         "{ \"compilerOptions\": { \"paths\": { \"@b/*\": [\"./src/*\"] } } }\n"},
+    };
+    enum { N_FILES = sizeof(files) / sizeof(files[0]) };
+    for (int i = 0; i < N_FILES; i++) {
+        snprintf(path, sizeof(path), "%s/%s", root, files[i].rel);
+        ASSERT_EQ(write_file(path, files[i].body), 0);
+    }
+
+    cbm_path_alias_collection_t *coll = cbm_load_path_aliases(root);
+    ASSERT_NOT_NULL(coll);
+    ASSERT_EQ(coll->count, 2);
+
+    /* Root: the tsconfig.json has no paths, so the jsconfig.json supplies them. */
+    const cbm_path_alias_map_t *m = cbm_path_alias_find_for_file(coll, "src/feature/x.js");
+    ASSERT_NOT_NULL(m);
+    char *r = cbm_path_alias_resolve(m, "@app/util");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(r, "src/app/util");
+    free(r);
+    bool root_source_is_jsconfig = false;
+    for (int i = 0; i < coll->count; i++) {
+        if (coll->scopes[i].dir_prefix[0] == '\0') {
+            root_source_is_jsconfig =
+                strcmp(coll->scopes[i].source_rel_path, "jsconfig.json") == 0;
+        }
+    }
+    ASSERT_TRUE(root_source_is_jsconfig);
+
+    /* pkg-a: the tsconfig.json declares paths, so it wins. */
+    m = cbm_path_alias_find_for_file(coll, "pkg-a/src/x.ts");
+    ASSERT_NOT_NULL(m);
+    r = cbm_path_alias_resolve(m, "@a/thing");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(r, "pkg-a/lib/thing");
+    free(r);
+
+    /* pkg-b: the tsconfig.json extends another config, so the jsconfig.json
+     * beside it is not read; the file falls back to the root scope. */
+    m = cbm_path_alias_find_for_file(coll, "pkg-b/src/x.ts");
+    ASSERT_NOT_NULL(m);
+    r = cbm_path_alias_resolve(m, "@b/thing");
+    ASSERT_NULL(r);
+
+    cbm_path_alias_collection_free(coll);
+
+    for (int i = N_FILES - 1; i >= 0; i--) {
+        snprintf(path, sizeof(path), "%s/%s", root, files[i].rel);
+        unlink(path);
+    }
+    snprintf(path, sizeof(path), "%s/pkg-a", root);
+    rmdir(path);
+    snprintf(path, sizeof(path), "%s/pkg-b", root);
+    rmdir(path);
+    rmdir(root);
+    PASS();
+}
+
 /* ── Loader returns NULL when no configs found ─────────────────── */
 
 TEST(path_alias_loader_no_configs) {
@@ -580,6 +668,7 @@ void suite_path_alias(void) {
     RUN_TEST(path_alias_loader_monorepo);
     RUN_TEST(path_alias_loader_monorepo_dotdot_climb);
     RUN_TEST(path_alias_loader_honors_discovery_exclusions);
+    RUN_TEST(path_alias_loader_jsconfig_fallback);
     RUN_TEST(path_alias_loader_no_configs);
     RUN_TEST(path_alias_loader_skips_linked_directory);
 #ifdef _WIN32
