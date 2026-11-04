@@ -655,7 +655,7 @@ static char *delta_with_json_array(const char *props, const char *key, const cha
 /* Load the stored JS/TS re-export IMPORTS edges (`export { a as b } from`,
  * `export * from`) between proxies into the delta gbuf. A re-resolved caller
  * that imports through a barrel follows the BARREL's edges to the defining
- * file (pass_lsp_cross.c pxc_barrel_symbol_qn), and an unchanged barrel is a
+ * file (pass_lsp_cross.c barrel registry), and an unchanged barrel is a
  * proxy with no edges of its own; without these rows the walk stopped at the
  * barrel and the call fell back to a name guess. Only the re-export rows,
  * with their stored properties (local_name/imported/reexport): a small set.
