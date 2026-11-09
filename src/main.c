@@ -60,6 +60,11 @@ enum {
      * that never finishes, so a command cannot hang indefinitely. */
     MAIN_STARTUP_CONTENTION_CEILING_MS = 120000,
     MAIN_MCP_STARTUP_TIMEOUT_MS = 30000,
+    /* How long a new MCP session waits for a daemon of another build to leave
+     * before it answers with the refusal. Clients time out on initialize
+     * (Codex after 10 s by default), so the refusal must come well inside that;
+     * a session that closes within this window still lets the new build in. */
+    MAIN_MCP_CONFLICT_WAIT_MS = 5000,
     MAIN_STARTUP_TIMEOUT_MIN_MS = 1000,
     MAIN_STARTUP_TIMEOUT_MAX_MS = 600000,
     MAIN_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000,
@@ -79,6 +84,15 @@ enum {
      * test_thread_stack_tls_contract.sh keeps the two from converging again. */
     PARENT_WATCHDOG_STACK_SIZE = 256 * CBM_SZ_1K,
 };
+
+static uint32_t main_startup_timeout_ms(void);
+
+/* The MCP client's wait for another build's cohort to leave: the short refusal
+ * window, never longer than the startup budget. */
+static uint32_t main_mcp_conflict_wait_ms(void) {
+    uint32_t budget = main_startup_timeout_ms();
+    return budget < MAIN_MCP_CONFLICT_WAIT_MS ? budget : MAIN_MCP_CONFLICT_WAIT_MS;
+}
 
 /* Daemon startup budget, overridable for loaded hosts: a fixed 30 s races
  * whatever else the machine is doing (parallel test waves, CI legs), and a
@@ -3321,19 +3335,41 @@ int main(int argc, char **argv) {
     if (role == CBM_DAEMON_PROCESS_HOOK_CLIENT && seam_forced_build && seam_forced_build[0]) {
         identity.build_fingerprint = seam_hook_build;
     }
+    /* The same seam for an MCP client, so the refusal session is testable
+     * against a daemon of this binary (tests/test_mcp_conflict_refusal.sh). */
+    static char seam_mcp_build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    const char *seam_mcp_forced =
+        cbm_safe_getenv("CBM_TEST_MCP_CLIENT_BUILD", seam_mcp_build, sizeof(seam_mcp_build), NULL);
+    if (role == CBM_DAEMON_PROCESS_MCP_CLIENT && seam_mcp_forced && seam_mcp_forced[0]) {
+        identity.build_fingerprint = seam_mcp_build;
+    }
 #endif
 
     cbm_version_cohort_manager_t *client_cohort_manager = cbm_version_cohort_manager_new(endpoint);
     cbm_version_cohort_lease_t *client_cohort_lease = NULL;
     cbm_daemon_conflict_t client_cohort_conflict;
+    /* An MCP client waits only the short refusal window for another build to
+     * leave; see MAIN_MCP_CONFLICT_WAIT_MS. */
+    uint32_t client_cohort_wait_ms =
+        role == CBM_DAEMON_PROCESS_HOOK_CLIENT  ? MAIN_HOOK_REQUEST_TIMEOUT_MS
+        : role == CBM_DAEMON_PROCESS_MCP_CLIENT ? main_mcp_conflict_wait_ms()
+                                                : main_startup_timeout_ms();
     cbm_version_cohort_status_t client_cohort_status =
         client_cohort_manager
             ? cbm_version_cohort_acquire(client_cohort_manager, &identity,
-                                         main_deadline_after(role == CBM_DAEMON_PROCESS_HOOK_CLIENT
-                                                                 ? MAIN_HOOK_REQUEST_TIMEOUT_MS
-                                                                 : main_startup_timeout_ms()),
+                                         main_deadline_after(client_cohort_wait_ms),
                                          &client_cohort_lease, &client_cohort_conflict)
             : CBM_VERSION_COHORT_IO;
+    /* The short window is for a conflict only. A lock that is merely slow on a
+     * loaded host (BUSY) keeps the rest of the startup budget, as before. */
+    if (client_cohort_manager && role == CBM_DAEMON_PROCESS_MCP_CLIENT &&
+        client_cohort_status == CBM_VERSION_COHORT_BUSY &&
+        client_cohort_wait_ms < main_startup_timeout_ms()) {
+        client_cohort_status = cbm_version_cohort_acquire(
+            client_cohort_manager, &identity,
+            main_deadline_after(main_startup_timeout_ms() - client_cohort_wait_ms),
+            &client_cohort_lease, &client_cohort_conflict);
+    }
     if (client_cohort_status != CBM_VERSION_COHORT_OK) {
         char message[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
         bool formatted =
