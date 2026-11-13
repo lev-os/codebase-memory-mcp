@@ -275,6 +275,8 @@ static const RFile k_nest_alias_files[] = {
                                          "    return [\"a\"];\n"
                                          "  }\n"
                                          "}\n"},
+    {"apps/api/src/other/cat.service.ts",
+     "export class CatService { findAll(): string[] { return [\"decoy\"]; } }\n"},
     {"apps/api/src/cats/cat.controller.ts",
      "import { CatService } from \"@app/cats/cat.service\";\n"
      "\n"
@@ -293,12 +295,36 @@ TEST(repro_issue514_ctor_param_property_alias_import_callers) {
         &lp, k_nest_alias_files, (int)(sizeof(k_nest_alias_files) / sizeof(k_nest_alias_files[0])));
     ASSERT_NOT_NULL(store);
 
-    char *resp = rh514_trace_inbound(&lp, "findAll");
+    char caller_qn[512];
+    char target_qn[512];
+    snprintf(caller_qn, sizeof(caller_qn), "%s.apps.api.src.cats.cat.controller.CatController.list",
+             lp.project);
+    snprintf(target_qn, sizeof(target_qn), "%s.apps.api.src.cats.cat.service.CatService.findAll",
+             lp.project);
+    cbm_node_t *caller = calloc(1, sizeof(*caller));
+    cbm_node_t *target = calloc(1, sizeof(*target));
+    ASSERT_NOT_NULL(caller);
+    ASSERT_NOT_NULL(target);
+    ASSERT_EQ(cbm_store_find_node_by_qn(store, lp.project, caller_qn, caller), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(store, lp.project, target_qn, target), CBM_STORE_OK);
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source_type(store, caller->id, "CALLS", &edges, &edge_count),
+              CBM_STORE_OK);
+    fprintf(stderr, "  [514] alias caller CALLS edges=%d; expected target=%s\n", edge_count,
+            target_qn);
+    ASSERT_EQ(edge_count, 1);
+    ASSERT_EQ(edges[0].target_id, target->id);
+    cbm_store_free_edges(edges, edge_count);
+    cbm_store_free_nodes(caller, 1);
+    cbm_store_free_nodes(target, 1);
+
+    /* A qualified lookup selects the intended method despite its decoy. */
+    char *resp = rh514_trace_inbound(&lp, target_qn);
     ASSERT_NOT_NULL(resp);
     fprintf(stderr, "  [514] trace_path inbound (alias) response: %.400s\n", resp);
-
     ASSERT_NULL(strstr(resp, "function not found"));
-    ASSERT_NOT_NULL(strstr(resp, "CatController.list"));
+    ASSERT_NOT_NULL(strstr(resp, caller_qn));
 
     free(resp);
     rh_cleanup(&lp, store);
