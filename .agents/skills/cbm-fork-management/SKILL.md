@@ -12,7 +12,9 @@ Our copy lives first. Upstream is a courtesy that follows its own rules. Validat
 | Thing | Value |
 |---|---|
 | Upstream | `DeusData/codebase-memory-mcp`, remote `origin`, branch `main`. Only @DeusData merges and speaks for the project. |
-| Our copy | `lev-os/codebase-memory-mcp`, remote `lev-os`, integration branch `lev`. |
+| Our copy | `lev-os/codebase-memory-mcp`, integration branch `lev`. The remote is named `lev-os` in a checkout that also has upstream as `origin`. |
+| Home checkout | A sibling of Leviathan: `<parent>/codebase-memory-mcp`, linked as `leviathan/siblings/codebase-memory-mcp` (listed in Leviathan's `.lev/config/siblings.yaml`). |
+| Skills | `.agents/skills/` holds them; `.claude/skills` is a link to that folder. |
 | Work branches | `fix/<topic>`, `np/<topic>`, `carry/<upstream number>-<topic>`, in `.worktrees/<name>` inside this repository. |
 | This skill, fast-build tools, any build or CI config we change | `lev` only. Never in a branch that goes upstream. |
 
