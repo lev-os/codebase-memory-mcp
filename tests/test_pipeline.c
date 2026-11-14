@@ -36298,8 +36298,7 @@ TEST(pipeline_js_top_level_declaration_keeps_plain_name) {
  * `this.stop()` in a callback reaches the class's own method, never the
  * same-name arrow of an object literal in another method (Adapter.handle.stop
  * sorts before Adapter.stop, so a name-only guess picks it on a tie). In an
- * index file the type-aware resolver gives no answer, so the name-based
- * resolver must find the class itself. */
+ * index file the resolver must use the same folder scope as its symbols. */
 TEST(pipeline_js_this_call_in_arrow_reaches_class_method) {
     static const char *const files[] = {"main.ts", "pkg/index.ts", "pkg/index.js"};
     static const char *const mods[] = {"main", "pkg", "pkg"};
@@ -36351,6 +36350,122 @@ TEST(pipeline_js_this_call_in_arrow_reaches_class_method) {
         cbm_pipeline_free(p);
         th_rmtree(tmp);
     }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* Index-file symbols belong to the folder, while ordinary files keep their
+ * stem. Both paths must resolve the same calls by type, even with namesakes
+ * elsewhere. Compare the complete target/strategy rows at each call site so
+ * a registry guess or a decoy edge cannot satisfy the test. */
+TEST(pipeline_ts_index_file_resolver_matches_main) {
+    static const char *const exts[] = {"ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"};
+    static const char source[] =
+        "import { Service } from './service';\n"
+        "import { make } from './factory';\n"
+        "export class A { go() { this.stop(); } stop() {} }\n"
+        "function helper() {}\n"
+        "export function run() { helper(); }\n"
+        "export function start() { const svc = new Service(); svc.start(); }\n"
+        "export function build() { make().build(); }\n";
+    char tmp[256] = "/tmp/cbm_ts_index_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    for (size_t x = 0; x < sizeof(exts) / sizeof(exts[0]); x++) {
+        char dir[512], path[128];
+        snprintf(dir, sizeof(dir), "%s/%s/pkg", tmp, exts[x]);
+        ASSERT_TRUE(cbm_mkdir_p(dir, 0755));
+        snprintf(dir, sizeof(dir), "%s/%s/other", tmp, exts[x]);
+        ASSERT_TRUE(cbm_mkdir_p(dir, 0755));
+        snprintf(path, sizeof(path), "%s/pkg/index.%s", exts[x], exts[x]);
+        write_temp_file(tmp, path, source);
+        snprintf(path, sizeof(path), "%s/pkg/main.%s", exts[x], exts[x]);
+        write_temp_file(tmp, path, source);
+        snprintf(path, sizeof(path), "%s/pkg/service.ts", exts[x]);
+        write_temp_file(tmp, path, "export class Service { start() {} }\n");
+        /* JS callers consume the same declared return type as TS callers. */
+        snprintf(path, sizeof(path), "%s/pkg/factory.ts", exts[x]);
+        write_temp_file(tmp, path, "export class Builder { build() {} }\n"
+                                   "export function make(): Builder { return new Builder(); }\n");
+        snprintf(path, sizeof(path), "%s/other/index.%s", exts[x], exts[x]);
+        write_temp_file(tmp, path, "export class A { stop() {} }\n"
+                                   "export function helper() {}\n"
+                                   "export class Service { start() {} }\n"
+                                   "export class Builder { build() {} }\n"
+                                   "export function make() { return new Builder(); }\n");
+    }
+    /* Above the fused-parallel threshold even if an extension is not found. */
+    for (int i = 0; i < 60; i++) {
+        char path[64], body[96];
+        snprintf(path, sizeof(path), "pad%d.ts", i);
+        snprintf(body, sizeof(body), "export function pad%d() { return %d; }\n", i, i);
+        write_temp_file(tmp, path, body);
+    }
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        XlangEnvSave saved = xlang_env_select(mode != 0);
+        char db[512];
+        snprintf(db, sizeof(db), "%s/%s.db", tmp, mode ? "par" : "seq");
+        cbm_pipeline_t *p = js_twin_index(tmp, db);
+        xlang_env_restore(&saved);
+        ASSERT_NOT_NULL(p);
+        const char *project = cbm_pipeline_project_name(p);
+        for (size_t x = 0; x < sizeof(exts) / sizeof(exts[0]); x++) {
+            for (int main_file = 0; main_file < 2; main_file++) {
+                char file[128], module[128], got[1024], want[1024], what[160];
+                snprintf(file, sizeof(file), "%s/pkg/%s.%s", exts[x],
+                         main_file ? "main" : "index", exts[x]);
+                snprintf(module, sizeof(module), "%s.pkg%s", exts[x], main_file ? ".main" : "");
+                static const struct {
+                    int line;
+                    const char *caller;
+                    const char *target;
+                    const char *strategy;
+                } calls[] = {
+                    {3, "A.go", "A.stop", "lsp_ts_method"},
+                    {5, "run", "helper", "lsp_ts_local"},
+                    {6, "start", "service.Service.start", "lsp_ts_method"},
+                    {7, "build", "factory.Builder.build", "lsp_ts_method"},
+                };
+                for (size_t i = 0; i < sizeof(calls) / sizeof(calls[0]); i++) {
+                    js_twin_rows(db, project,
+                                 "SELECT s.qualified_name, t.qualified_name || ' [' || "
+                                 "coalesce(json_extract(e.properties, '$.strategy'), '') || ']' "
+                                 "FROM edges e JOIN nodes s ON s.id = e.source_id "
+                                 "JOIN nodes t ON t.id = e.target_id "
+                                 "WHERE e.project = ?1 AND e.type = 'CALLS' "
+                                 "AND json_extract(e.properties, '$.line') = ?2 "
+                                 "AND substr(s.file_path, -length(?3)) = ?3 "
+                                 "AND t.label = ?4 ORDER BY 1, 2",
+                                 calls[i].line, file, i == 1 ? "Function" : "Method", true,
+                                 got, sizeof(got));
+                    if (i < 2) {
+                        snprintf(want, sizeof(want), "%s.%s -> %s.%s [%s]", module,
+                                 calls[i].caller, module, calls[i].target, calls[i].strategy);
+                    } else {
+                        snprintf(want, sizeof(want), "%s.%s -> %s.pkg.%s [%s]", module,
+                                 calls[i].caller, exts[x], calls[i].target, calls[i].strategy);
+                    }
+                    snprintf(what, sizeof(what), "%s %s:%d", mode ? "parallel" : "sequential",
+                             file, calls[i].line);
+                    ok = js_twin_expect(what, got, want) && ok;
+                }
+                /* The inner factory call also retains its imported identity. */
+                js_twin_rows(db, project,
+                             "SELECT t.qualified_name, json_extract(e.properties, '$.strategy') "
+                             "FROM edges e JOIN nodes s ON s.id = e.source_id "
+                             "JOIN nodes t ON t.id = e.target_id "
+                             "WHERE e.project = ?1 AND e.type = 'CALLS' "
+                             "AND json_extract(e.properties, '$.line') = ?2 "
+                             "AND substr(s.file_path, -length(?3)) = ?3 "
+                             "AND t.label = ?4 ORDER BY 1, 2",
+                             7, file, "Function", true, got, sizeof(got));
+                snprintf(want, sizeof(want), "%s.pkg.factory.make -> lsp_ts_import", exts[x]);
+                ok = js_twin_expect(file, got, want) && ok;
+            }
+        }
+        cbm_pipeline_free(p);
+    }
+    th_rmtree(tmp);
     ASSERT_TRUE(ok);
     PASS();
 }
@@ -36524,6 +36639,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_twin_insert_incremental_equals_full);
     RUN_TEST(pipeline_js_top_level_declaration_keeps_plain_name);
     RUN_TEST(pipeline_js_this_call_in_arrow_reaches_class_method);
+    RUN_TEST(pipeline_ts_index_file_resolver_matches_main);
     RUN_TEST(pipeline_js_local_twin_stays_out_of_name_guesses);
     RUN_TEST(pipeline_js_twin_names_rebuild_old_index);
     RUN_TEST(pipeline_js_twin_callables_scale);

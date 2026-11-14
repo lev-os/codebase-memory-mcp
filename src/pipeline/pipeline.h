@@ -238,8 +238,10 @@ size_t cbm_pipeline_fqn_symbol_prefix_len(const char *project, const char *rel_p
 
 /* Language-aware module QN. When `module_is_dir` is true (Java/Go package
  * semantics) the module is derived from the CONTAINING DIRECTORY (the filename
- * stem is dropped), so it agrees with the extraction-side def QNs; when false
- * it is exactly cbm_pipeline_fqn_module(). Caller must free(). */
+ * stem is dropped), so it agrees with the extraction-side def QNs. JS/TS
+ * resolver scopes omit a terminal index segment; raw Module/file identities
+ * from cbm_pipeline_fqn_module() stay unchanged. Other languages keep their
+ * filename-stem module. Caller must free(). */
 char *cbm_pipeline_fqn_module_dir(const char *project, const char *rel_path, bool module_is_dir);
 
 /* Folder QN: project.dir.parts. Caller must free(). */

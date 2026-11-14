@@ -428,6 +428,28 @@ TEST(fqn_module_init_py) {
     PASS();
 }
 
+/* Resolver scopes match symbol QNs, not the raw Module/file identity. */
+TEST(fqn_resolver_index_scope) {
+    static const char *const exts[] = {"ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"};
+    for (size_t i = 0; i < sizeof(exts) / sizeof(exts[0]); i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "pkg/index.%s", exts[i]);
+        ASSERT_FQN(cbm_pipeline_fqn_module_dir("p", path, false), "p.pkg");
+        ASSERT_FQN(cbm_pipeline_fqn_module("p", path), "p.pkg.index");
+        snprintf(path, sizeof(path), "index.%s", exts[i]);
+        ASSERT_FQN(cbm_pipeline_fqn_module_dir("p", path, false), "p");
+        snprintf(path, sizeof(path), "pkg/index/main.%s", exts[i]);
+        ASSERT_FQN(cbm_pipeline_fqn_module_dir("p", path, false), "p.pkg.index.main");
+    }
+    ASSERT_FQN(cbm_pipeline_fqn_module_dir("p", "pkg\\index.ts", false), "p.pkg");
+    ASSERT_FQN(cbm_pipeline_fqn_module_dir("p", "pkg/indexer.ts", false), "p.pkg.indexer");
+    ASSERT_FQN(cbm_pipeline_fqn_module_dir("p", "pkg/__init__.py", false), "p.pkg.__init__");
+    ASSERT_FQN(cbm_pipeline_fqn_module_dir("p", "pkg/mod.rs", false), "p.pkg.mod");
+    ASSERT_FQN(cbm_pipeline_fqn_module_dir("p", "pkg/main.go", true), "p.pkg");
+    ASSERT_FQN(cbm_pipeline_fqn_module_dir("p", NULL, false), "p");
+    PASS();
+}
+
 TEST(fqn_module_index_js) {
     ASSERT_FQN(cbm_pipeline_fqn_module("proj", "components/index.js"), "proj.components.index");
     PASS();
@@ -787,6 +809,7 @@ SUITE(fqn) {
     RUN_TEST(fqn_module_go);
     RUN_TEST(fqn_module_init_py);
     RUN_TEST(fqn_module_index_js);
+    RUN_TEST(fqn_resolver_index_scope);
     RUN_TEST(fqn_module_empty_path);
     RUN_TEST(fqn_module_null_path);
     RUN_TEST(fqn_module_null_project);

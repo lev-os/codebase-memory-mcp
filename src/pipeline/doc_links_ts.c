@@ -312,13 +312,11 @@ static bool tr_add_globals(tr_index_t *ix) {
 /* The QN prefix of a file's declarations: an index module's QN loses its
  * last segment, as a symbol QN does in fqn.c. */
 static const char *tr_symbol_prefix(tr_index_t *ix, const char *module_qn) {
-    static const char suffix[] = ".index";
-    size_t sl = sizeof(suffix) - SKIP_ONE;
-    size_t n = module_qn ? strlen(module_qn) : 0;
-    if (n <= sl || strcmp(module_qn + n - sl, suffix) != 0) {
+    size_t n = cbm_fqn_js_symbol_scope_len(module_qn);
+    if (!module_qn || !module_qn[n]) {
         return module_qn;
     }
-    return tr_copy(ix, module_qn, n - sl);
+    return tr_copy(ix, module_qn, n);
 }
 
 static void *tr_build(const cbm_doclink_build_in_t *in) {

@@ -165,8 +165,15 @@ char *cbm_pipeline_fqn_module(const char *project, const char *rel_path) {
 
 char *cbm_pipeline_fqn_module_dir(const char *project, const char *rel_path, bool module_is_dir) {
     if (!module_is_dir) {
-        /* Filename-stem module (default for all but Java/Go). */
-        return cbm_pipeline_fqn_module(project, rel_path);
+        char *module = cbm_pipeline_fqn_module(project, rel_path);
+        CBMLanguage lang = rel_path ? cbm_language_for_filename(rel_path) : CBM_LANG_COUNT;
+        if (module && (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
+                       lang == CBM_LANG_TSX)) {
+            /* Both pipeline modes and the cross-file def collector must use
+             * the same scope as JS/TS symbols, not the raw index-file Module. */
+            module[cbm_fqn_js_symbol_scope_len(module)] = '\0';
+        }
+        return module;
     }
     /* Directory-module languages (Java package, Go package): the module is the
      * CONTAINING DIRECTORY — strip the basename so a sibling file in the same

@@ -5287,7 +5287,58 @@ TEST(tslsp_tsx_ordinary_same_leaf_calls_join_by_exact_site) {
 
 /* ── Suite registration ────────────────────────────────────────────────────── */
 
+/* The local resolver uses the symbol scope of an index file, while its raw
+ * module identity stays distinct from the containing folder. */
+TEST(ts_lsp_index_file_local_scope) {
+    static const struct { const char *ext; CBMLanguage lang; } files[] = {
+        {"ts", CBM_LANG_TYPESCRIPT}, {"tsx", CBM_LANG_TSX},
+        {"js", CBM_LANG_JAVASCRIPT}, {"jsx", CBM_LANG_JAVASCRIPT},
+        {"mts", CBM_LANG_TYPESCRIPT}, {"cts", CBM_LANG_TYPESCRIPT},
+        {"mjs", CBM_LANG_JAVASCRIPT}, {"cjs", CBM_LANG_JAVASCRIPT},
+    };
+    static const char source[] = "class A { go() { this.stop(); } stop() {} }\n"
+                                 "function helper() {}\n"
+                                 "export function run() { helper(); }\n";
+    bool ok = true;
+    for (size_t x = 0; x < sizeof(files) / sizeof(files[0]); x++) {
+        for (int main_file = 0; main_file < 2; main_file++) {
+            char path[64], module[64], caller[96], target[96];
+            snprintf(path, sizeof(path), "pkg/%s.%s", main_file ? "main" : "index", files[x].ext);
+            snprintf(module, sizeof(module), "test.pkg%s", main_file ? ".main" : "");
+            CBMFileResult *r = extract_with(source, files[x].lang, path);
+            ASSERT_NOT_NULL(r);
+            snprintf(target, sizeof(target), "test.pkg.%s", main_file ? "main" : "index");
+            ok = strcmp(r->module_qn, target) == 0 && ok;
+            static const char *const callers[] = {"A.go", "run"};
+            static const char *const targets[] = {"A.stop", "helper"};
+            static const char *const strategies[] = {"lsp_ts_method", "lsp_ts_local"};
+            for (int i = 0; i < 2; i++) {
+                snprintf(caller, sizeof(caller), "%s.%s", module, callers[i]);
+                snprintf(target, sizeof(target), "%s.%s", module, targets[i]);
+                int hits = 0;
+                for (int c = 0; c < r->resolved_calls.count; c++) {
+                    const CBMResolvedCall *rc = &r->resolved_calls.items[c];
+                    if (rc->caller_qn && rc->callee_qn && rc->strategy &&
+                        strcmp(rc->caller_qn, caller) == 0 && strcmp(rc->callee_qn, target) == 0 &&
+                        strcmp(rc->strategy, strategies[i]) == 0) {
+                        hits++;
+                    }
+                }
+                if (hits != 1) {
+                    fprintf(stderr, "%s %s -> %s [%s]: got %d, want 1\n", path, caller, target,
+                            strategies[i], hits);
+                    ok = false;
+                }
+            }
+            cbm_free_result(r);
+        }
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(ts_lsp) {
+    RUN_TEST(ts_lsp_index_file_local_scope);
     /* Smoke (Phase 1) */
     RUN_TEST(tslsp_smoke_empty_file);
     RUN_TEST(tslsp_smoke_minimal_function);

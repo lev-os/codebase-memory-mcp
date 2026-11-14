@@ -1954,6 +1954,19 @@ size_t cbm_fqn_symbol_scope_len(const char *module_qn) {
     return len;
 }
 
+/* JS/TS file modules keep .index as their identity, while symbols omit it.
+ * Call this once on the raw file module, never on an already-derived scope. */
+size_t cbm_fqn_js_symbol_scope_len(const char *module_qn) {
+    if (!module_qn)
+        return 0;
+    size_t len = strlen(module_qn);
+    static const char suffix[] = ".index";
+    size_t suffix_len = sizeof(suffix) - 1;
+    if (len > suffix_len && memcmp(module_qn + len - suffix_len, suffix, suffix_len) == 0)
+        return len - suffix_len;
+    return len;
+}
+
 char *cbm_fqn_module(CBMArena *a, const char *project, const char *rel_path) {
     return cbm_fqn_compute(a, project, rel_path, NULL);
 }

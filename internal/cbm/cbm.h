@@ -1595,4 +1595,9 @@ bool cbm_label_is_registry_symbol(const char *label);
  * Module/file identity is unchanged. NULL returns zero. */
 size_t cbm_fqn_symbol_scope_len(const char *module_qn);
 
+/* JS/TS symbol scope only: omit one trailing .index from a raw file Module
+ * QN, matching cbm_fqn_compute with a symbol name. Callers must establish the
+ * language and must not normalize an already-derived scope. NULL returns zero. */
+size_t cbm_fqn_js_symbol_scope_len(const char *module_qn);
+
 #endif // CBM_H

@@ -6169,10 +6169,17 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     CBMTypeRegistry reg;
     cbm_registry_init(&reg, arena);
     cbm_ts_stdlib_register(&reg, arena);
-    register_file_defs(arena, &reg, result, result->module_qn);
+    const char *module_qn = result->module_qn;
+    size_t scope_len = cbm_fqn_js_symbol_scope_len(module_qn);
+    if (module_qn && module_qn[scope_len]) {
+        module_qn = cbm_arena_strndup(arena, module_qn, scope_len);
+        if (!module_qn)
+            return;
+    }
+    register_file_defs(arena, &reg, result, module_qn);
 
     TSLSPContext ctx;
-    ts_lsp_init(&ctx, arena, source, source_len, &reg, result->module_qn, js_mode, jsx_mode,
+    ts_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, js_mode, jsx_mode,
                 dts_mode, &result->resolved_calls);
     ctx.usages = &result->usages;
 
