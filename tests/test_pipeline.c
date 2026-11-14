@@ -36111,6 +36111,43 @@ TEST(pipeline_js_local_callee_is_nearest_binding) {
     PASS();
 }
 
+/* A parameter default runs before the body, in a scope of its own: it cannot
+ * see a `var` of the body. `run()` in `value = run()` names the module's run,
+ * not the arrow the body binds to run; in the body, the body's run binds. */
+TEST(pipeline_js_param_default_skips_body_var) {
+    static const char *const exts[] = {"js", "tsx"};
+    bool ok = true;
+    for (int x = 0; x < 2; x++) {
+        char tmp[256] = "/tmp/cbm_js_param_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        char main_file[32];
+        snprintf(main_file, sizeof(main_file), "main.%s", exts[x]);
+        write_temp_file(tmp, main_file,
+                        "export function run() { return 1; }\n"
+                        "export function use(value = run()) { var run = () => 2; return value; }\n"
+                        "export function body() { var run = () => 3; return run(); }\n");
+        char db[512];
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        cbm_pipeline_t *p = js_twin_index(tmp, db);
+        ASSERT_NOT_NULL(p);
+        const char *project = cbm_pipeline_project_name(p);
+        char got[1024];
+        char what[64];
+        snprintf(what, sizeof(what), "%s line 2", exts[x]);
+        js_twin_qn_at(db, project, main_file, "run", 2, got, sizeof(got));
+        ok = js_twin_expect(what, got, "main.use.run") && ok;
+        js_twin_calls_at(db, project, main_file, 2, got, sizeof(got));
+        ok = js_twin_expect(what, got, "main.use -> main.run") && ok;
+        snprintf(what, sizeof(what), "%s line 3", exts[x]);
+        js_twin_calls_at(db, project, main_file, 3, got, sizeof(got));
+        ok = js_twin_expect(what, got, "main.body -> main.body.run") && ok;
+        cbm_pipeline_free(p);
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 /* A getter and its setter share a name: the first keeps it, the second takes
  * "#2". In an object literal they take the object's name first, as the
  * module-level function of that name keeps the plain one. */
@@ -36520,6 +36557,7 @@ TEST(pipeline_js_twin_callables_scale) {
 SUITE(pipeline) {
     RUN_TEST(pipeline_js_module_binding_keeps_plain_name);
     RUN_TEST(pipeline_js_local_callee_is_nearest_binding);
+    RUN_TEST(pipeline_js_param_default_skips_body_var);
     RUN_TEST(pipeline_js_accessor_pairs_keep_their_calls);
     RUN_TEST(pipeline_js_twin_insert_incremental_equals_full);
     RUN_TEST(pipeline_js_top_level_declaration_keeps_plain_name);

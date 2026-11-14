@@ -14617,22 +14617,29 @@ static void js_twin_pattern_decls(js_twin_walk_t *w, TSNode pat, uint32_t lo, ui
 }
 
 /* The scope a declaration under the ancestors anc[0..depth) binds in: the
- * nearest block for let, const, class and function; the nearest callable,
- * static block or program for var (`var_scope`). */
+ * nearest block for let, const, class and function; the body of the nearest
+ * callable, or the nearest static block or program, for var (`var_scope`).
+ * A parameter default runs in the parameters' own scope, before the body:
+ * a var of the body is not visible there. */
 static bool js_twin_scope(const TSNode *anc, int depth, bool var_scope, uint32_t *lo,
                           uint32_t *hi) {
     for (int i = depth - SKIP_ONE; i >= 0; i--) {
         const char *k = ts_node_type(anc[i]);
         bool hit = strcmp(k, "program") == 0 || strcmp(k, "class_static_block") == 0;
+        TSNode at = anc[i];
         if (var_scope) {
-            hit = hit || js_twin_bodied_kind(k);
+            if (js_twin_bodied_kind(k)) {
+                TSNode body = ts_node_child_by_field_name(anc[i], TS_FIELD("body"));
+                hit = true;
+                at = ts_node_is_null(body) ? anc[i] : body;
+            }
         } else {
             hit = hit || strcmp(k, "statement_block") == 0 || strcmp(k, "switch_body") == 0 ||
                   strcmp(k, "for_statement") == 0 || strcmp(k, "for_in_statement") == 0;
         }
         if (hit) {
-            *lo = ts_node_start_byte(anc[i]);
-            *hi = ts_node_end_byte(anc[i]);
+            *lo = ts_node_start_byte(at);
+            *hi = ts_node_end_byte(at);
             return true;
         }
     }
