@@ -73,6 +73,9 @@ typedef struct {
     // first completed eval; see TsEvalMemo in ts_lsp.c). Kills the exponential
     // re-evaluation of shared subexpressions under overload resolution.
     struct TsEvalMemo *eval_memo;
+    // The registry's functions sorted by QN, so a lookup in a registry with no
+    // hash index is a search, not a scan (TsFuncOrder in ts_lsp.c).
+    struct TsFuncOrder *func_order;
 } TSLSPContext;
 
 #ifdef CBM_ENABLE_TEST_SEAMS

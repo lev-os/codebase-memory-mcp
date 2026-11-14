@@ -453,6 +453,41 @@ static tr_res_t tr_decl_res(const tr_ctx_t *c, const tr_file_t *f, const char *n
     return r;
 }
 
+/* A function or class declared in a function body at `line` of file f. Its
+ * node holds the file-level name when it starts on that line. A callable the
+ * graph split from a same-name one has a name of its own (`file.outer.name`,
+ * `file.name#2`): then it is the one node of that name in the file that
+ * starts there. Else a graph gap. */
+static tr_res_t tr_nested_res(const tr_ctx_t *c, const tr_file_t *f, const char *name,
+                              uint32_t line) {
+    tr_res_t r = tr_decl_res(c, f, name);
+    if (r.kind == TR_NODE && r.node->start_line == (int)line) {
+        return r;
+    }
+    const cbm_gbuf_node_t **nodes = NULL;
+    int count = 0;
+    const cbm_gbuf_node_t *found = NULL;
+    int hits = 0;
+    if (cbm_gbuf_find_by_name(c->g, name, &nodes, &count) == 0) {
+        for (int i = 0; i < count; i++) {
+            const cbm_gbuf_node_t *n = nodes[i];
+            if (n && n->label && n->file_path && n->start_line == (int)line &&
+                strcmp(n->file_path, f->path) == 0 &&
+                (strcmp(n->label, "Function") == 0 || strcmp(n->label, "Method") == 0 ||
+                 strcmp(n->label, "Class") == 0)) {
+                found = n;
+                hits++;
+            }
+        }
+    }
+    if (hits != SKIP_ONE) {
+        return tr_mk(TR_GAP); /* no node of its own, or two on its line */
+    }
+    r = tr_mk(TR_NODE);
+    r.node = found;
+    return r;
+}
+
 static int tr_file_at(const tr_index_t *ix, const char *path) {
     void *v = cbm_ht_get(ix->by_path, path);
     return v ? (int)((uintptr_t)v - SKIP_ONE) : CBM_NOT_FOUND;
@@ -916,8 +951,7 @@ static tr_res_t tr_head(tr_ctx_t *c, const CBMDocLink *link, const char *name) {
         }
     }
     /* a function or class declared in a function body around the reference,
-     * innermost first; the graph keeps it under a file-level name, which is
-     * its own only when the node starts on its line */
+     * innermost first: the node of its name that starts on its line */
     const tr_nest_t *vis = NULL;
     for (int i = 0; i < src->nnested; i++) {
         const tr_nest_t *v = &src->nested[i];
@@ -927,10 +961,7 @@ static tr_res_t tr_head(tr_ctx_t *c, const CBMDocLink *link, const char *name) {
         }
     }
     if (vis) {
-        tr_res_t r = tr_decl_res(c, src, name);
-        if (r.kind == TR_NODE && r.node->start_line != (int)vis->line) {
-            r = tr_mk(TR_GAP); /* the node is another declaration's of that name */
-        }
+        tr_res_t r = tr_nested_res(c, src, name, vis->line);
         r.exact = true;
         return r;
     }

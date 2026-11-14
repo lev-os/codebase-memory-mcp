@@ -358,6 +358,16 @@ bool cbm_def_props_generated(const char *const *extra_props);
  * string property. Pure; unit-tested in test_registry.c. */
 bool cbm_node_props_generated(const char *properties_json);
 
+/* True when a definition's extra_props carry CBM_PROP_FUNCTION_LOCAL: a
+ * same-name JS/TS callable declared in a function body, which only that
+ * function's code can name. The three graph registration sites register it
+ * by qualified name only, as a Python function's locals. Pure. */
+bool cbm_def_props_function_local(const char *const *extra_props);
+
+/* The stored-node twin of cbm_def_props_function_local, for the incremental
+ * registry seed. Pure. */
+bool cbm_node_props_function_local(const char *properties_json);
+
 /* True when code in `caller` can call a symbol defined in `target` by bare
  * name: same language, same interop family (JS/TS + script hosts, C/C++/CUDA/
  * ObjC, JVM, .NET, ...; the table lives in registry.c), or Swift with the C

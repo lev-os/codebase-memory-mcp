@@ -14134,16 +14134,49 @@ typedef struct {
     uint32_t start_byte; /* CBMDefinition.node_start_byte */
 } js_twin_t;
 
+/* A name a declaration binds and the scope it binds it in: a function
+ * declaration, a variable, a parameter, a catch clause, an import, the own
+ * name of a function expression (cbm_js_twin_bind_local_callees). */
+typedef struct {
+    int name;    /* index into js_twin_table_t.names */
+    uint32_t lo; /* the scope: bytes [lo, hi) */
+    uint32_t hi;
+    uint32_t member_start; /* the callable it binds, when `member` */
+    bool member;
+    const char *qn; /* that callable's QN once named; NULL: no group member */
+    int parent;     /* the nearest entry of the name whose scope holds this one */
+} js_twin_decl_t;
+
 typedef struct {
     js_twin_t *items; /* sorted by (base_qn, start_byte) */
     int count;
+    const char **names; /* the names of the groups' callables, sorted */
+    int nnames;
+    js_twin_decl_t *decls; /* sorted by (name, lo, hi descending) */
+    int ndecls;
+    int *name_first; /* the decls of names[i]: [name_first[i], name_first[i + 1]) */
 } js_twin_table_t;
 
+/* One callable of a same-name group: the defs built from one syntax node. */
 typedef struct {
-    CBMDefinition *def;
-    int depth; /* callables around it: 0 = not nested in a callable */
-    int index; /* position in the def list (tie break) */
-} js_twin_ref_t;
+    CBMDefinition **defs; /* in the start-sorted candidate list */
+    int ndefs;
+    uint32_t start_byte;
+    int rank;              /* JS_TWIN_RANK_*: who holds the plain name first */
+    const char *owner;     /* the named owner path ("box", "api.users"), or NULL */
+    const char *preferred; /* the QN it asks for */
+    const char *final_qn;  /* the QN it was given; NULL when in no group */
+    bool found;            /* the tree walk met its bodied node */
+    bool local;            /* declared in a function body or static block */
+} js_twin_member_t;
+
+enum {
+    JS_TWIN_RANK_EXPORTED = 0,  /* `export function f`, `export const f = () => {}` */
+    JS_TWIN_RANK_MODULE = 1,    /* a top-level function, or a const holding a callable */
+    JS_TWIN_RANK_NESTED = 2,    /* a member, a nested callable */
+    JS_TWIN_OWNER_SEGS = 8,     /* owner path segments kept */
+    JS_TWIN_PATTERN_DEPTH = 32, /* nesting of a destructuring pattern followed */
+};
 
 static bool js_twin_lang(CBMLanguage lang) {
     return lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
@@ -14158,46 +14191,47 @@ static bool js_twin_bodied_kind(const char *k) {
            strcmp(k, "method_definition") == 0;
 }
 
-/* The bodied callable node starting at `byte`, or a null node (a signature,
- * or nothing recorded there). Named nodes only: the `function` keyword token
- * that starts a declaration has the type name of a function expression. */
-static TSNode js_twin_node(TSNode root, uint32_t byte) {
-    TSNode n = ts_node_descendant_for_byte_range(root, byte, byte);
-    while (!ts_node_is_null(n) && ts_node_start_byte(n) == byte) {
-        if (ts_node_is_named(n) && js_twin_bodied_kind(ts_node_type(n))) {
-            return n;
-        }
-        n = ts_node_parent(n);
-    }
-    TSNode null_node = {0};
-    return null_node;
+static bool js_twin_function_value_kind(const char *k) {
+    return strcmp(k, "function_expression") == 0 || strcmp(k, "function") == 0 ||
+           strcmp(k, "generator_function") == 0;
 }
 
-static int js_twin_depth(TSNode n) {
-    int depth = 0;
-    for (TSNode p = ts_node_parent(n); !ts_node_is_null(p); p = ts_node_parent(p)) {
-        const char *k = ts_node_type(p);
+/* Whether a node whose ancestors are anc[0..depth) sits in a function body
+ * or a class static block, where only that code can name it. */
+static bool js_twin_in_body(const TSNode *anc, int depth) {
+    for (int i = 0; i < depth; i++) {
+        const char *k = ts_node_type(anc[i]);
         if (js_twin_bodied_kind(k) || strcmp(k, "class_static_block") == 0) {
-            depth++;
+            return true;
         }
     }
-    return depth;
+    return false;
 }
 
-static int js_twin_ref_cmp(const void *pa, const void *pb) {
-    const js_twin_ref_t *a = pa;
-    const js_twin_ref_t *b = pb;
-    int c = strcmp(a->def->qualified_name, b->def->qualified_name);
-    if (c != 0) {
-        return c;
+/* Mark a definition as a function-local twin (CBM_PROP_FUNCTION_LOCAL),
+ * keeping the facts it already carries. */
+static void js_twin_mark_local(CBMArena *a, CBMDefinition *d) {
+    int n = 0;
+    while (d->extra_props && d->extra_props[n]) {
+        n++;
     }
-    if (a->depth != b->depth) {
-        return a->depth < b->depth ? -1 : 1;
+    const char **kv =
+        (const char **)cbm_arena_alloc(a, (size_t)(n + PAIR_LEN + SKIP_ONE) * sizeof(char *));
+    if (!kv) {
+        return;
     }
-    if (a->def->node_start_byte != b->def->node_start_byte) {
-        return a->def->node_start_byte < b->def->node_start_byte ? -1 : 1;
+    for (int i = 0; i < n; i++) {
+        kv[i] = d->extra_props[i];
     }
-    return (a->index > b->index) - (a->index < b->index);
+    kv[n] = CBM_PROP_FUNCTION_LOCAL;
+    kv[n + SKIP_ONE] = "true";
+    kv[n + PAIR_LEN] = NULL;
+    d->extra_props = kv;
+}
+
+static bool js_twin_declaration_kind(const char *k) {
+    return strcmp(k, "function_declaration") == 0 ||
+           strcmp(k, "generator_function_declaration") == 0;
 }
 
 static int js_twin_cmp(const void *pa, const void *pb) {
@@ -14219,14 +14253,668 @@ static bool js_twin_candidate(const CBMDefinition *d) {
            (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Method") == 0);
 }
 
+static int js_twin_def_start_cmp(const void *pa, const void *pb) {
+    const CBMDefinition *a = *(CBMDefinition *const *)pa;
+    const CBMDefinition *b = *(CBMDefinition *const *)pb;
+    if (a->node_start_byte != b->node_start_byte) {
+        return a->node_start_byte < b->node_start_byte ? -1 : 1;
+    }
+    /* One node, two defs: keep the def list's order. */
+    return (a > b) - (a < b);
+}
+
+static int js_twin_member_start_cmp(const void *key, const void *elem) {
+    uint32_t byte = *(const uint32_t *)key;
+    uint32_t start = ((const js_twin_member_t *)elem)->start_byte;
+    return (byte > start) - (byte < start);
+}
+
+/* Members by the QN their group shares, then by source position. */
+static int js_twin_member_base_cmp(const void *pa, const void *pb) {
+    const js_twin_member_t *a = *(js_twin_member_t *const *)pa;
+    const js_twin_member_t *b = *(js_twin_member_t *const *)pb;
+    int c = strcmp(a->defs[0]->qualified_name, b->defs[0]->qualified_name);
+    if (c != 0) {
+        return c;
+    }
+    return (a->start_byte > b->start_byte) - (a->start_byte < b->start_byte);
+}
+
+/* Members by the QN they ask for; the module binding first, then by source
+ * position (the order "#<n>" is numbered in). */
+static int js_twin_member_pref_cmp(const void *pa, const void *pb) {
+    const js_twin_member_t *a = *(js_twin_member_t *const *)pa;
+    const js_twin_member_t *b = *(js_twin_member_t *const *)pb;
+    int c = strcmp(a->preferred, b->preferred);
+    if (c != 0) {
+        return c;
+    }
+    if (a->rank != b->rank) {
+        return a->rank < b->rank ? -1 : 1;
+    }
+    return (a->start_byte > b->start_byte) - (a->start_byte < b->start_byte);
+}
+
+/* The text of `n` when it is a plain name (an identifier, a property name). */
+static bool js_twin_name_text(const CBMExtractCtx *ctx, TSNode n, const char **s, size_t *len) {
+    if (ts_node_is_null(n)) {
+        return false;
+    }
+    const char *k = ts_node_type(n);
+    if (strcmp(k, "identifier") != 0 && strcmp(k, "property_identifier") != 0 &&
+        strcmp(k, "private_property_identifier") != 0) {
+        return false;
+    }
+    uint32_t b = ts_node_start_byte(n);
+    uint32_t e = ts_node_end_byte(n);
+    if (e <= b || e > (uint32_t)ctx->source_len) {
+        return false;
+    }
+    *s = ctx->source + b;
+    *len = e - b;
+    return true;
+}
+
+static bool js_twin_child_is(TSNode parent, const char *field, uint32_t field_len, TSNode child) {
+    TSNode c = ts_node_child_by_field_name(parent, field, field_len);
+    return !ts_node_is_null(c) && ts_node_eq(c, child);
+}
+
+/* The name a callable node goes by: its own, or the binding that holds it
+ * (cbm_resolve_func_name's rule). `parent` is the node's parent. */
+static bool js_twin_callable_name(const CBMExtractCtx *ctx, TSNode fn, TSNode parent,
+                                  const char **s, size_t *len) {
+    const char *k = ts_node_type(fn);
+    if (js_twin_declaration_kind(k) || strcmp(k, "method_definition") == 0 ||
+        js_twin_function_value_kind(k)) {
+        if (js_twin_name_text(ctx, ts_node_child_by_field_name(fn, TS_FIELD("name")), s, len)) {
+            return true;
+        }
+        if (!js_twin_function_value_kind(k)) {
+            return false;
+        }
+    }
+    if (ts_node_is_null(parent)) {
+        return false;
+    }
+    const char *pk = ts_node_type(parent);
+    if (strcmp(pk, "variable_declarator") == 0 || strcmp(pk, "public_field_definition") == 0) {
+        return js_twin_child_is(parent, TS_FIELD("value"), fn) &&
+               js_twin_name_text(ctx, ts_node_child_by_field_name(parent, TS_FIELD("name")), s,
+                                 len);
+    }
+    if (strcmp(pk, "field_definition") == 0) {
+        return js_twin_child_is(parent, TS_FIELD("value"), fn) &&
+               js_twin_name_text(ctx, ts_node_child_by_field_name(parent, TS_FIELD("property")), s,
+                                 len);
+    }
+    if (strcmp(pk, "pair") == 0) {
+        return js_twin_child_is(parent, TS_FIELD("value"), fn) &&
+               js_twin_name_text(ctx, ts_node_child_by_field_name(parent, TS_FIELD("key")), s, len);
+    }
+    return false;
+}
+
+/* A block whose declarations are the module's own: the program, or the body
+ * of a TypeScript namespace (whose members the def walk qualifies by it). */
+static bool js_twin_module_block(const TSNode *anc, int i) {
+    const char *k = ts_node_type(anc[i]);
+    if (strcmp(k, "program") == 0) {
+        return true;
+    }
+    if (strcmp(k, "statement_block") != 0 || i == 0) {
+        return false;
+    }
+    const char *pk = ts_node_type(anc[i - SKIP_ONE]);
+    return strcmp(pk, "internal_module") == 0 || strcmp(pk, "module") == 0;
+}
+
+/* JS_TWIN_RANK_* of the callable `fn` named `name`; anc[0..depth) are its
+ * ancestors, anc[depth - 1] its parent. The plain name belongs to the
+ * module-level binding of that name: an exported one first, then a
+ * top-level declaration. */
+static int js_twin_rank(const CBMExtractCtx *ctx, TSNode fn, const TSNode *anc, int depth,
+                        const char *name) {
+    const char *k = ts_node_type(fn);
+    int p; /* the parent of the statement that declares it */
+    if (js_twin_declaration_kind(k)) {
+        p = depth - SKIP_ONE; /* the declaration is the statement */
+    } else if (js_twin_function_value_kind(k) || strcmp(k, "arrow_function") == 0) {
+        int i = depth - SKIP_ONE; /* the parent */
+        if (i < 0) {
+            return JS_TWIN_RANK_NESTED;
+        }
+        const char *pk = ts_node_type(anc[i]);
+        if (strcmp(pk, "export_statement") == 0) { /* export default function f() {} */
+            return i > 0 && js_twin_module_block(anc, i - SKIP_ONE) ? JS_TWIN_RANK_EXPORTED
+                                                                    : JS_TWIN_RANK_NESTED;
+        }
+        const char *s = NULL;
+        size_t len = 0;
+        if (strcmp(pk, "variable_declarator") != 0 || i < SKIP_ONE ||
+            !js_twin_child_is(anc[i], TS_FIELD("value"), fn) ||
+            !js_twin_name_text(ctx, ts_node_child_by_field_name(anc[i], TS_FIELD("name")), &s,
+                               &len) ||
+            strlen(name) != len || memcmp(name, s, len) != 0) {
+            return JS_TWIN_RANK_NESTED; /* `const alias = function name() {}` binds alias */
+        }
+        const char *dk = ts_node_type(anc[i - SKIP_ONE]); /* the declaration */
+        if (strcmp(dk, "lexical_declaration") != 0 && strcmp(dk, "variable_declaration") != 0) {
+            return JS_TWIN_RANK_NESTED;
+        }
+        p = i - PAIR_LEN;
+    } else {
+        return JS_TWIN_RANK_NESTED; /* a method */
+    }
+    if (p < 0) {
+        return JS_TWIN_RANK_NESTED;
+    }
+    if (strcmp(ts_node_type(anc[p]), "export_statement") == 0) {
+        return p > 0 && js_twin_module_block(anc, p - SKIP_ONE) ? JS_TWIN_RANK_EXPORTED
+                                                                : JS_TWIN_RANK_NESTED;
+    }
+    return js_twin_module_block(anc, p) ? JS_TWIN_RANK_MODULE : JS_TWIN_RANK_NESTED;
+}
+
+/* The named owner of the callable whose ancestors are anc[0..depth): the
+ * nearest named callable around it, or the object literal it sits in, named
+ * by its binding and the keys on the way (`api.users` for
+ * `const api = { users: { list() {} } }`). NULL when only the module or a
+ * class, which its QN already names, holds it. */
+static const char *js_twin_owner(CBMExtractCtx *ctx, const TSNode *anc, int depth) {
+    const char *seg[JS_TWIN_OWNER_SEGS];
+    size_t seg_len[JS_TWIN_OWNER_SEGS];
+    int n = 0;
+    bool named = false;
+    for (int i = depth - SKIP_ONE; i >= 0 && !named && n < JS_TWIN_OWNER_SEGS; i--) {
+        TSNode x = anc[i];
+        const char *k = ts_node_type(x);
+        TSNode parent = i > 0 ? anc[i - SKIP_ONE] : (TSNode){0};
+        if (strcmp(k, "object") == 0 && !ts_node_is_null(parent)) {
+            const char *pk = ts_node_type(parent);
+            const char *field = NULL;
+            uint32_t field_len = 0;
+            if (strcmp(pk, "pair") == 0) {
+                field = "key";
+                field_len = (uint32_t)strlen(field);
+            } else if (strcmp(pk, "variable_declarator") == 0 ||
+                       strcmp(pk, "public_field_definition") == 0) {
+                field = "name";
+                field_len = (uint32_t)strlen(field);
+            } else if (strcmp(pk, "field_definition") == 0) {
+                field = "property";
+                field_len = (uint32_t)strlen(field);
+            }
+            if (field && js_twin_child_is(parent, TS_FIELD("value"), x) &&
+                js_twin_name_text(ctx, ts_node_child_by_field_name(parent, field, field_len),
+                                  &seg[n], &seg_len[n])) {
+                named = strcmp(pk, "pair") != 0; /* a binding ends the path */
+                n++;
+            }
+            continue;
+        }
+        if (js_twin_bodied_kind(k)) {
+            if (js_twin_callable_name(ctx, x, parent, &seg[n], &seg_len[n])) {
+                n++;
+                named = true;
+            }
+            continue;
+        }
+        if (strcmp(k, "program") == 0 || strcmp(k, "class_declaration") == 0 ||
+            strcmp(k, "class") == 0 || strcmp(k, "abstract_class_declaration") == 0 ||
+            strcmp(k, "internal_module") == 0 || strcmp(k, "module") == 0) {
+            break;
+        }
+    }
+    if (!named || n == 0) {
+        return NULL; /* object keys with no binding name nothing */
+    }
+    size_t total = 0;
+    for (int i = 0; i < n; i++) {
+        total += seg_len[i] + SKIP_ONE;
+    }
+    char *out = cbm_arena_alloc(ctx->arena, total);
+    if (!out) {
+        return NULL;
+    }
+    size_t at = 0;
+    for (int i = n - SKIP_ONE; i >= 0; i--) { /* outermost first */
+        memcpy(out + at, seg[i], seg_len[i]);
+        at += seg_len[i];
+        out[at++] = i ? '.' : '\0';
+    }
+    return out;
+}
+
+typedef struct {
+    TSNode *items;
+    int count;
+    int cap;
+} js_twin_anc_t;
+
+static bool js_twin_anc_push(js_twin_anc_t *s, TSNode n) {
+    if (s->count == s->cap) {
+        int ncap = s->cap ? s->cap * PAIR_LEN : CBM_SZ_64;
+        TSNode *g = realloc(s->items, (size_t)ncap * sizeof(*g));
+        if (!g) {
+            return false;
+        }
+        s->items = g;
+        s->cap = ncap;
+    }
+    s->items[s->count++] = n;
+    return true;
+}
+
+typedef struct {
+    js_twin_decl_t *items;
+    int count;
+    int cap;
+} js_twin_decls_t;
+
+/* What the cursor walk reads and fills. */
+typedef struct {
+    CBMExtractCtx *ctx;
+    js_twin_member_t *members; /* sorted by start byte */
+    int nmembers;
+    const char **names; /* the members' names, sorted */
+    int nnames;
+    js_twin_decls_t decls;
+    bool oom;
+} js_twin_walk_t;
+
+typedef struct {
+    const char *s;
+    size_t n;
+} js_twin_slice_t;
+
+static int js_twin_slice_cmp(const void *key, const void *elem) {
+    const js_twin_slice_t *k = key;
+    const char *name = *(const char *const *)elem;
+    int c = strncmp(k->s, name, k->n);
+    if (c != 0) {
+        return c;
+    }
+    return name[k->n] == '\0' ? 0 : -1; /* the key is a prefix of the name */
+}
+
+/* Record that `name_node` binds its name in [lo, hi), and the callable it
+ * holds when `callable` is a member of that name. Names no member has are
+ * left out: no call to them is bound. */
+static void js_twin_add_decl(js_twin_walk_t *w, TSNode name_node, uint32_t lo, uint32_t hi,
+                             TSNode callable) {
+    if (ts_node_is_null(name_node) || w->oom) {
+        return;
+    }
+    const char *k = ts_node_type(name_node);
+    if (strcmp(k, "identifier") != 0 && strcmp(k, "shorthand_property_identifier_pattern") != 0) {
+        return;
+    }
+    uint32_t b = ts_node_start_byte(name_node);
+    uint32_t e = ts_node_end_byte(name_node);
+    if (e <= b || e > (uint32_t)w->ctx->source_len) {
+        return;
+    }
+    js_twin_slice_t key = {w->ctx->source + b, e - b};
+    const char **hit =
+        bsearch(&key, w->names, (size_t)w->nnames, sizeof(*w->names), js_twin_slice_cmp);
+    if (!hit) {
+        return;
+    }
+    js_twin_decl_t d = {.name = (int)(hit - w->names), .lo = lo, .hi = hi, .parent = -1};
+    if (!ts_node_is_null(callable)) {
+        uint32_t start = ts_node_start_byte(callable);
+        const js_twin_member_t *m = bsearch(&start, w->members, (size_t)w->nmembers,
+                                            sizeof(*w->members), js_twin_member_start_cmp);
+        /* `const alias = function run() {}` binds alias, not the callable run. */
+        if (m && strcmp(m->defs[0]->name, *hit) == 0) {
+            d.member = true;
+            d.member_start = start;
+        }
+    }
+    js_twin_decls_t *ds = &w->decls;
+    if (ds->count == ds->cap) {
+        int ncap = ds->cap ? ds->cap * PAIR_LEN : CBM_SZ_64;
+        js_twin_decl_t *g = realloc(ds->items, (size_t)ncap * sizeof(*g));
+        if (!g) {
+            w->oom = true;
+            return;
+        }
+        ds->items = g;
+        ds->cap = ncap;
+    }
+    ds->items[ds->count++] = d;
+}
+
+/* The names a parameter list or a destructuring pattern binds, in [lo, hi). */
+static void js_twin_pattern_decls(js_twin_walk_t *w, TSNode pat, uint32_t lo, uint32_t hi,
+                                  int depth) {
+    if (ts_node_is_null(pat) || depth > JS_TWIN_PATTERN_DEPTH) {
+        return;
+    }
+    const char *k = ts_node_type(pat);
+    if (strcmp(k, "identifier") == 0 || strcmp(k, "shorthand_property_identifier_pattern") == 0) {
+        js_twin_add_decl(w, pat, lo, hi, (TSNode){0});
+        return;
+    }
+    TSNode sub = {0};
+    if (strcmp(k, "required_parameter") == 0 || strcmp(k, "optional_parameter") == 0) {
+        sub = ts_node_child_by_field_name(pat, TS_FIELD("pattern"));
+    } else if (strcmp(k, "assignment_pattern") == 0 ||
+               strcmp(k, "object_assignment_pattern") == 0) {
+        sub = ts_node_child_by_field_name(pat, TS_FIELD("left"));
+    } else if (strcmp(k, "pair_pattern") == 0) {
+        sub = ts_node_child_by_field_name(pat, TS_FIELD("value"));
+    } else if (strcmp(k, "formal_parameters") == 0 || strcmp(k, "object_pattern") == 0 ||
+               strcmp(k, "array_pattern") == 0 || strcmp(k, "rest_pattern") == 0) {
+        uint32_t nc = ts_node_named_child_count(pat);
+        for (uint32_t i = 0; i < nc; i++) {
+            js_twin_pattern_decls(w, ts_node_named_child(pat, i), lo, hi, depth + SKIP_ONE);
+        }
+        return;
+    }
+    js_twin_pattern_decls(w, sub, lo, hi, depth + SKIP_ONE);
+}
+
+/* The scope a declaration under the ancestors anc[0..depth) binds in: the
+ * nearest block for let, const, class and function; the nearest callable,
+ * static block or program for var (`var_scope`). */
+static bool js_twin_scope(const TSNode *anc, int depth, bool var_scope, uint32_t *lo,
+                          uint32_t *hi) {
+    for (int i = depth - SKIP_ONE; i >= 0; i--) {
+        const char *k = ts_node_type(anc[i]);
+        bool hit = strcmp(k, "program") == 0 || strcmp(k, "class_static_block") == 0;
+        if (var_scope) {
+            hit = hit || js_twin_bodied_kind(k);
+        } else {
+            hit = hit || strcmp(k, "statement_block") == 0 || strcmp(k, "switch_body") == 0 ||
+                  strcmp(k, "for_statement") == 0 || strcmp(k, "for_in_statement") == 0;
+        }
+        if (hit) {
+            *lo = ts_node_start_byte(anc[i]);
+            *hi = ts_node_end_byte(anc[i]);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The declarations node `n` makes; anc[0..depth) are its ancestors. */
+static void js_twin_node_decls(js_twin_walk_t *w, TSNode n, const char *k, const TSNode *anc,
+                               int depth) {
+    uint32_t lo = 0;
+    uint32_t hi = 0;
+    if (js_twin_bodied_kind(k)) {
+        /* Parameters bind in the callable; a function expression's own name
+         * only inside it; a declaration's in the block around it. */
+        TSNode params = ts_node_child_by_field_name(n, TS_FIELD("parameters"));
+        if (ts_node_is_null(params)) {
+            params = ts_node_child_by_field_name(n, TS_FIELD("parameter"));
+        }
+        js_twin_pattern_decls(w, params, ts_node_start_byte(n), ts_node_end_byte(n), 0);
+        TSNode own = ts_node_child_by_field_name(n, TS_FIELD("name"));
+        if (js_twin_function_value_kind(k)) {
+            js_twin_add_decl(w, own, ts_node_start_byte(n), ts_node_end_byte(n), n);
+        } else if (js_twin_declaration_kind(k) && js_twin_scope(anc, depth, false, &lo, &hi)) {
+            js_twin_add_decl(w, own, lo, hi, n);
+        }
+    } else if (strcmp(k, "variable_declarator") == 0) {
+        bool var =
+            depth > 0 && strcmp(ts_node_type(anc[depth - SKIP_ONE]), "variable_declaration") == 0;
+        if (!js_twin_scope(anc, depth, var, &lo, &hi)) {
+            return;
+        }
+        TSNode name = ts_node_child_by_field_name(n, TS_FIELD("name"));
+        TSNode value = ts_node_child_by_field_name(n, TS_FIELD("value"));
+        if (!ts_node_is_null(name) && strcmp(ts_node_type(name), "identifier") == 0) {
+            bool callable = !ts_node_is_null(value) && js_twin_bodied_kind(ts_node_type(value));
+            js_twin_add_decl(w, name, lo, hi, callable ? value : (TSNode){0});
+        } else {
+            js_twin_pattern_decls(w, name, lo, hi, 0);
+        }
+    } else if (strcmp(k, "class_declaration") == 0 ||
+               strcmp(k, "abstract_class_declaration") == 0) {
+        if (js_twin_scope(anc, depth, false, &lo, &hi)) {
+            js_twin_add_decl(w, ts_node_child_by_field_name(n, TS_FIELD("name")), lo, hi,
+                             (TSNode){0});
+        }
+    } else if (strcmp(k, "catch_clause") == 0) {
+        js_twin_pattern_decls(w, ts_node_child_by_field_name(n, TS_FIELD("parameter")),
+                              ts_node_start_byte(n), ts_node_end_byte(n), 0);
+    } else if (strcmp(k, "for_in_statement") == 0) {
+        TSNode kind = ts_node_child_by_field_name(n, TS_FIELD("kind"));
+        if (ts_node_is_null(kind)) {
+            return; /* `for (x of xs)` assigns, it declares nothing */
+        }
+        bool var = strcmp(ts_node_type(kind), "var") == 0;
+        lo = ts_node_start_byte(n);
+        hi = ts_node_end_byte(n);
+        if (!var || js_twin_scope(anc, depth, true, &lo, &hi)) {
+            js_twin_pattern_decls(w, ts_node_child_by_field_name(n, TS_FIELD("left")), lo, hi, 0);
+        }
+    } else if (strcmp(k, "import_specifier") == 0) {
+        TSNode local = ts_node_child_by_field_name(n, TS_FIELD("alias"));
+        if (ts_node_is_null(local)) {
+            local = ts_node_child_by_field_name(n, TS_FIELD("name"));
+        }
+        js_twin_add_decl(w, local, 0, UINT32_MAX, (TSNode){0});
+    } else if (strcmp(k, "namespace_import") == 0 || strcmp(k, "import_clause") == 0) {
+        uint32_t nc = ts_node_named_child_count(n);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode c = ts_node_named_child(n, i);
+            if (strcmp(ts_node_type(c), "identifier") == 0) {
+                js_twin_add_decl(w, c, 0, UINT32_MAX, (TSNode){0});
+            }
+        }
+    }
+}
+
+/* One cursor walk over the tree: each member meets its bodied node, which
+ * gives its rank and owner, and every declaration of a member's name is
+ * recorded with its scope. The stack holds the ancestors of the node. */
+static bool js_twin_walk(js_twin_walk_t *w) {
+    js_twin_anc_t anc = {0};
+    TSTreeCursor cur = ts_tree_cursor_new(w->ctx->root);
+    bool ok = true;
+    for (;;) {
+        TSNode n = ts_tree_cursor_current_node(&cur);
+        const char *k = ts_node_is_named(n) ? ts_node_type(n) : NULL;
+        if (k && js_twin_bodied_kind(k)) {
+            uint32_t byte = ts_node_start_byte(n);
+            js_twin_member_t *m = bsearch(&byte, w->members, (size_t)w->nmembers,
+                                          sizeof(*w->members), js_twin_member_start_cmp);
+            CBMDefinition *d = m ? m->defs[0] : NULL;
+            if (m && !m->found && ts_node_start_point(n).row + TS_LINE_OFFSET == d->start_line) {
+                m->found = true;
+                m->rank = js_twin_rank(w->ctx, n, anc.items, anc.count, d->name);
+                m->owner = js_twin_owner(w->ctx, anc.items, anc.count);
+                m->local = js_twin_in_body(anc.items, anc.count);
+            }
+        }
+        if (k) {
+            js_twin_node_decls(w, n, k, anc.items, anc.count);
+        }
+        if (ts_tree_cursor_goto_first_child(&cur)) {
+            if (!js_twin_anc_push(&anc, n)) {
+                ok = false;
+                break;
+            }
+            continue;
+        }
+        bool more = false;
+        for (;;) {
+            if (ts_tree_cursor_goto_next_sibling(&cur)) {
+                more = true;
+                break;
+            }
+            if (!ts_tree_cursor_goto_parent(&cur)) {
+                break;
+            }
+            anc.count--;
+        }
+        if (!more) {
+            break;
+        }
+    }
+    ts_tree_cursor_delete(&cur);
+    free(anc.items);
+    return ok && !w->oom;
+}
+
+static int js_twin_decl_cmp(const void *pa, const void *pb) {
+    const js_twin_decl_t *a = pa;
+    const js_twin_decl_t *b = pb;
+    if (a->name != b->name) {
+        return a->name < b->name ? -1 : 1;
+    }
+    if (a->lo != b->lo) {
+        return a->lo < b->lo ? -1 : 1;
+    }
+    if (a->hi != b->hi) {
+        return a->hi > b->hi ? -1 : 1; /* the wider scope first */
+    }
+    return (a->member_start > b->member_start) - (a->member_start < b->member_start);
+}
+
+/* Name the callable of each declaration, sort them, make one entry of the
+ * declarations of one name in one scope (two that bind different callables
+ * leave the name open there), link each to the nearest one around it and
+ * copy them into the table. */
+static bool js_twin_finish_decls(CBMArena *arena, js_twin_table_t *table, js_twin_walk_t *w) {
+    js_twin_decl_t *d = w->decls.items;
+    int n = w->decls.count;
+    for (int i = 0; i < n; i++) {
+        const js_twin_member_t *m =
+            d[i].member ? bsearch(&d[i].member_start, w->members, (size_t)w->nmembers,
+                                  sizeof(*w->members), js_twin_member_start_cmp)
+                        : NULL;
+        d[i].qn = m ? m->final_qn : NULL;
+    }
+    if (n > 0) {
+        qsort(d, (size_t)n, sizeof(*d), js_twin_decl_cmp);
+    }
+    int out = 0;
+    for (int i = 0; i < n; i++) {
+        if (out > 0 && d[out - SKIP_ONE].name == d[i].name && d[out - SKIP_ONE].lo == d[i].lo &&
+            d[out - SKIP_ONE].hi == d[i].hi) {
+            const char *a = d[out - SKIP_ONE].qn;
+            if (!a || !d[i].qn || strcmp(a, d[i].qn) != 0) {
+                d[out - SKIP_ONE].qn = NULL;
+            }
+            continue;
+        }
+        d[out++] = d[i];
+    }
+    n = out;
+    int *stack = malloc((size_t)(n ? n : SKIP_ONE) * sizeof(*stack));
+    table->names =
+        cbm_arena_alloc(arena, (size_t)(w->nnames ? w->nnames : SKIP_ONE) * sizeof(*table->names));
+    table->name_first =
+        cbm_arena_alloc(arena, (size_t)(w->nnames + SKIP_ONE) * sizeof(*table->name_first));
+    table->decls = cbm_arena_alloc(arena, (size_t)(n ? n : SKIP_ONE) * sizeof(*table->decls));
+    if (!stack || !table->names || !table->name_first || !table->decls) {
+        free(stack);
+        return false;
+    }
+    int sp = 0;
+    for (int i = 0; i < n; i++) {
+        if (i == 0 || d[i].name != d[i - SKIP_ONE].name) {
+            sp = 0;
+        }
+        while (sp > 0 &&
+               !(d[stack[sp - SKIP_ONE]].lo <= d[i].lo && d[i].hi <= d[stack[sp - SKIP_ONE]].hi)) {
+            sp--;
+        }
+        d[i].parent = sp ? stack[sp - SKIP_ONE] : -1;
+        stack[sp++] = i;
+    }
+    free(stack);
+    memcpy(table->names, w->names, (size_t)w->nnames * sizeof(*table->names));
+    table->nnames = w->nnames;
+    if (n > 0) {
+        memcpy(table->decls, d, (size_t)n * sizeof(*d));
+    }
+    table->ndecls = n;
+    for (int k = 0, i = 0; k <= w->nnames; k++) {
+        while (i < n && d[i].name < k) {
+            i++;
+        }
+        table->name_first[k] = i;
+    }
+    return true;
+}
+
+/* The nearest declaration of names[name] whose scope holds [lo, hi), or NULL
+ * when none does (a global, or a name of another file). */
+static const js_twin_decl_t *js_twin_nearest(const js_twin_table_t *t, int name, uint32_t lo,
+                                             uint32_t hi) {
+    int a = t->name_first[name];
+    int b = t->name_first[name + SKIP_ONE];
+    int l = a;
+    int r = b;
+    while (l < r) { /* the first scope that starts after lo */
+        int mid = l + (r - l) / PAIR_LEN;
+        if (t->decls[mid].lo <= lo) {
+            l = mid + SKIP_ONE;
+        } else {
+            r = mid;
+        }
+    }
+    /* Scopes nest: the last one starting at or before lo, or one around it. */
+    for (int k = l - SKIP_ONE; k >= a; k = t->decls[k].parent) {
+        if (t->decls[k].lo <= lo && hi <= t->decls[k].hi) {
+            return &t->decls[k];
+        }
+    }
+    return NULL;
+}
+
+/* Every QN of a def of the file, sorted: a name the split asks for must be
+ * no other definition's. */
+static const char **js_twin_all_qns(const CBMExtractCtx *ctx, int *count) {
+    int total = ctx->result->defs.count;
+    const char **qns = malloc((size_t)(total ? total : SKIP_ONE) * sizeof(*qns));
+    int n = 0;
+    for (int i = 0; qns && i < total; i++) {
+        if (ctx->result->defs.items[i].qualified_name) {
+            qns[n++] = ctx->result->defs.items[i].qualified_name;
+        }
+    }
+    if (qns) {
+        qsort(qns, (size_t)n, sizeof(*qns), js_qn_ptr_cmp);
+    }
+    *count = n;
+    return qns;
+}
+
+/* The QN member `m` of the group sharing `base` asks for: the plain one for a
+ * module binding or a callable without a named owner, else base's scope +
+ * owner + name, unless another definition of the file holds that. */
+static const char *js_twin_preferred(CBMExtractCtx *ctx, const js_twin_member_t *m,
+                                     const char *base, const char **all_qns, int nall) {
+    const char *name = m->defs[0]->name;
+    size_t bl = strlen(base);
+    size_t nl = strlen(name);
+    if (m->rank != JS_TWIN_RANK_NESTED || !m->owner || bl <= nl + SKIP_ONE ||
+        base[bl - nl - SKIP_ONE] != '.' || strcmp(base + bl - nl, name) != 0) {
+        return base;
+    }
+    const char *qn = cbm_arena_sprintf(ctx->arena, "%.*s.%s.%s", (int)(bl - nl - SKIP_ONE), base,
+                                       m->owner, name);
+    if (!qn || bsearch(&qn, all_qns, (size_t)nall, sizeof(*all_qns), js_qn_ptr_cmp)) {
+        return base;
+    }
+    return qn;
+}
+
 void cbm_js_split_twin_callables(CBMExtractCtx *ctx) {
     ctx->js_twins = NULL;
-    if (!js_twin_lang(ctx->language) || ctx->result->defs.count < 2) {
+    if (!js_twin_lang(ctx->language) || ctx->result->defs.count < PAIR_LEN) {
         return;
     }
     CBMDefinition *defs = ctx->result->defs.items;
     int count = ctx->result->defs.count;
-    /* Most files have no twin: find one before any tree lookup. */
+    /* Most files have no twin: find one before any tree work. */
     const char **qns = malloc((size_t)count * sizeof(*qns));
     if (!qns) {
         return;
@@ -14240,98 +14928,145 @@ void cbm_js_split_twin_callables(CBMExtractCtx *ctx) {
     qsort(qns, (size_t)nq, sizeof(*qns), js_qn_ptr_cmp);
     bool any = false;
     for (int i = 1; i < nq && !any; i++) {
-        any = strcmp(qns[i - 1], qns[i]) == 0;
+        any = strcmp(qns[i - SKIP_ONE], qns[i]) == 0;
     }
-    if (!any) {
+    CBMDefinition **cands = any ? malloc((size_t)count * sizeof(*cands)) : NULL;
+    js_twin_member_t *members = any ? malloc((size_t)count * sizeof(*members)) : NULL;
+    js_twin_member_t **order = any ? malloc((size_t)count * sizeof(*order)) : NULL;
+    const char **names = any ? malloc((size_t)count * sizeof(*names)) : NULL;
+    int nall = 0;
+    const char **all_qns = any ? js_twin_all_qns(ctx, &nall) : NULL;
+    if (!cands || !members || !order || !names || !all_qns) {
         free(qns);
+        free(cands);
+        free(members);
+        free(order);
+        free((void *)names);
+        free((void *)all_qns);
         return;
     }
-    js_twin_ref_t *refs = malloc((size_t)count * sizeof(*refs));
-    if (!refs) {
-        free(qns);
-        return;
-    }
-    int n = 0;
+    int nc = 0;
     for (int i = 0; i < count; i++) {
         CBMDefinition *d = &defs[i];
         if (!js_twin_candidate(d)) {
             continue;
         }
         /* A QN held once is no group; check both neighbours in the sorted list. */
-        const char **hit = bsearch(&d->qualified_name, qns, (size_t)nq, sizeof(*qns),
-                                   js_qn_ptr_cmp);
-        bool shared = hit && ((hit > qns && strcmp(hit[-1], *hit) == 0) ||
-                              (hit + 1 < qns + nq && strcmp(hit[1], *hit) == 0));
-        if (!shared) {
-            continue;
+        const char **hit =
+            bsearch(&d->qualified_name, qns, (size_t)nq, sizeof(*qns), js_qn_ptr_cmp);
+        if (hit && ((hit > qns && strcmp(hit[-1], *hit) == 0) ||
+                    (hit + 1 < qns + nq && strcmp(hit[1], *hit) == 0))) {
+            cands[nc++] = d;
         }
-        TSNode node = js_twin_node(ctx->root, d->node_start_byte);
-        if (ts_node_is_null(node) ||
-            ts_node_start_point(node).row + TS_LINE_OFFSET != d->start_line) {
-            continue; /* a signature, or a def not built from its own node */
-        }
-        refs[n].def = d;
-        refs[n].depth = js_twin_depth(node);
-        refs[n].index = i;
-        n++;
     }
     free(qns);
-    qsort(refs, (size_t)n, sizeof(*refs), js_twin_ref_cmp);
-
-    js_twin_table_t *table = cbm_arena_alloc(ctx->scratch ? ctx->scratch : ctx->arena,
-                                             sizeof(*table));
-    js_twin_t *items = n ? cbm_arena_alloc(ctx->scratch ? ctx->scratch : ctx->arena,
-                                           (size_t)n * sizeof(*items))
-                         : NULL;
-    if (!table || !items) {
-        free(refs);
-        return;
+    /* One node extracted twice is one member: neighbours once sorted. */
+    qsort(cands, (size_t)nc, sizeof(*cands), js_twin_def_start_cmp);
+    int nm = 0;
+    for (int i = 0; i < nc;) {
+        int j = i + SKIP_ONE;
+        while (j < nc && cands[j]->node_start_byte == cands[i]->node_start_byte) {
+            j++;
+        }
+        members[nm++] = (js_twin_member_t){.defs = &cands[i],
+                                           .ndefs = j - i,
+                                           .start_byte = cands[i]->node_start_byte,
+                                           .rank = JS_TWIN_RANK_NESTED};
+        i = j;
     }
-    int t = 0;
-    for (int start = 0; start < n;) {
-        int end = start + 1;
-        while (end < n &&
-               strcmp(refs[end].def->qualified_name, refs[start].def->qualified_name) == 0) {
+    /* The names a call can bind a member by. */
+    int nn = 0;
+    for (int i = 0; i < nm; i++) {
+        names[nn++] = members[i].defs[0]->name;
+    }
+    qsort(names, (size_t)nn, sizeof(*names), js_qn_ptr_cmp);
+    int un = 0;
+    for (int i = 0; i < nn; i++) {
+        if (un == 0 || strcmp(names[un - SKIP_ONE], names[i]) != 0) {
+            names[un++] = names[i];
+        }
+    }
+    js_twin_walk_t w = {
+        .ctx = ctx, .members = members, .nmembers = nm, .names = names, .nnames = un};
+    bool walked = js_twin_walk(&w);
+
+    /* The members the walk met (signatures and the like stay out), by group. */
+    int no = 0;
+    for (int i = 0; walked && i < nm; i++) {
+        if (members[i].found) {
+            order[no++] = &members[i];
+        }
+    }
+    qsort(order, (size_t)no, sizeof(*order), js_twin_member_base_cmp);
+    int kept = 0;
+    for (int start = 0; start < no;) {
+        const char *base = order[start]->defs[0]->qualified_name;
+        int end = start + SKIP_ONE;
+        while (end < no && strcmp(order[end]->defs[0]->qualified_name, base) == 0) {
             end++;
         }
-        const char *base = refs[start].def->qualified_name;
-        int rank = 1;
-        int group_first = t;
-        for (int k = start + 1; k < end; k++) {
-            CBMDefinition *d = refs[k].def;
-            const char *qn = NULL;
-            /* One node extracted twice is one definition: it keeps one QN. */
-            for (int m = start; m < k && !qn; m++) {
-                if (refs[m].def->node_start_byte == d->node_start_byte) {
-                    qn = refs[m].def->qualified_name;
-                }
-            }
-            if (!qn) {
-                qn = cbm_arena_sprintf(ctx->arena, "%s#%d", base, ++rank);
-            }
-            if (!qn) {
-                continue;
-            }
-            d->qualified_name = qn;
-            if (qn != base) {
-                items[t].base_qn = base;
-                items[t].qn = qn;
-                items[t].start_byte = d->node_start_byte;
-                t++;
-            }
-        }
-        if (t > group_first) {
-            /* The member that kept the QN: a call can bind to it too. */
-            items[t].base_qn = base;
-            items[t].qn = base;
-            items[t].start_byte = refs[start].def->node_start_byte;
-            t++;
+        for (int k = start; end - start > SKIP_ONE && k < end; k++) {
+            order[k]->preferred = js_twin_preferred(ctx, order[k], base, all_qns, nall);
+            order[kept++] = order[k];
         }
         start = end;
     }
-    free(refs);
+    free((void *)all_qns);
+    no = kept;
+
+    CBMArena *table_arena = ctx->scratch ? ctx->scratch : ctx->arena;
+    js_twin_table_t *table = cbm_arena_calloc(table_arena, sizeof(*table));
+    js_twin_t *items = no ? cbm_arena_alloc(table_arena, (size_t)no * sizeof(*items)) : NULL;
+    if (!table || !items) {
+        free(cands);
+        free(members);
+        free(order);
+        free((void *)names);
+        free(w.decls.items);
+        return;
+    }
+    /* Within each run of one asked-for QN the first keeps it and the others
+     * take "#<n>", numbered from 2 in that order. */
+    qsort(order, (size_t)no, sizeof(*order), js_twin_member_pref_cmp);
+    int t = 0;
+    for (int start = 0; start < no;) {
+        const char *pref = order[start]->preferred;
+        int end = start + SKIP_ONE;
+        while (end < no && strcmp(order[end]->preferred, pref) == 0) {
+            end++;
+        }
+        for (int k = start; k < end; k++) {
+            js_twin_member_t *m = order[k];
+            const char *base = m->defs[0]->qualified_name;
+            const char *qn =
+                k == start ? pref
+                           : cbm_arena_sprintf(ctx->arena, "%s#%d", pref, k - start + SKIP_ONE);
+            if (!qn) {
+                continue;
+            }
+            for (int d = 0; d < m->ndefs; d++) {
+                m->defs[d]->qualified_name = qn;
+                if (m->local) {
+                    js_twin_mark_local(ctx->arena, m->defs[d]);
+                }
+            }
+            m->final_qn = qn;
+            items[t++] = (js_twin_t){.base_qn = base, .qn = qn, .start_byte = m->start_byte};
+        }
+        start = end;
+    }
+    bool decls_ok = t > 0 && js_twin_finish_decls(table_arena, table, &w);
+    free(cands);
+    free(members);
+    free(order);
+    free((void *)names);
+    free(w.decls.items);
     if (t == 0) {
         return;
+    }
+    if (!decls_ok) {
+        table->ndecls = 0; /* names stand; no call is bound by scope */
+        table->nnames = 0;
     }
     qsort(items, (size_t)t, sizeof(*items), js_twin_cmp);
     table->items = items;
@@ -14350,23 +15085,36 @@ const char *cbm_js_twin_qn(const CBMExtractCtx *ctx, const char *base_qn, uint32
     return hit ? hit->qn : NULL;
 }
 
-/* Length of the base QN of a split member QN ("<base>#<n>", n >= 2), or 0. */
-static size_t js_twin_base_len(const char *qn) {
-    const char *hash = qn ? strrchr(qn, '#') : NULL;
-    if (!hash || hash == qn || !hash[1]) {
-        return 0;
+/* Does the last segment of `qn` name `name`, with or without the "#<n>" a
+ * split member takes? */
+static bool js_twin_leaf_matches(const char *qn, const char *name) {
+    const char *dot = qn ? strrchr(qn, '.') : NULL;
+    const char *leaf = dot ? dot + SKIP_ONE : qn;
+    if (!leaf || !name) {
+        return false;
     }
-    for (const char *p = hash + 1; *p; p++) {
+    size_t n = strlen(name);
+    if (strncmp(leaf, name, n) != 0) {
+        return false;
+    }
+    const char *rest = leaf + n;
+    if (*rest == '\0') {
+        return true;
+    }
+    if (*rest != '#' || !rest[SKIP_ONE]) {
+        return false;
+    }
+    for (const char *p = rest + SKIP_ONE; *p; p++) {
         if (*p < '0' || *p > '9') {
-            return 0;
+            return false;
         }
     }
-    return (size_t)(hash - qn);
+    return true;
 }
 
 /* Strategy of a row the lexical binder writes. It joins its call by the
- * call's own leaf (kept in `reason`), since the split QN's leaf is `name#n`
- * (cbm_pipeline_invocation_reason_join_strategy). */
+ * call's own leaf (kept in `reason`), since a split QN's leaf can be
+ * `name#n` (cbm_pipeline_invocation_reason_join_strategy). */
 #define JS_TWIN_BOUND_STRATEGY "lsp_ts_local_scope"
 /* The confidence of the TS resolver's own module-local rows (lsp_ts_local). */
 #define JS_TWIN_BOUND_CONFIDENCE 0.95f
@@ -14381,11 +15129,11 @@ static int js_call_site_cmp(const void *pa, const void *pb) {
 }
 
 /* A row the lexical binder wrote (cbm_js_twin_bind_local_callees): its
- * target is a split member and its reason is the call's own leaf. */
+ * target is a member of a same-name group and its reason is the call's own
+ * leaf. */
 static bool js_twin_bound_row(const CBMResolvedCall *rc) {
-    return rc->kind == CBM_RESOLVED_INVOCATION && rc->caller_qn && rc->reason &&
-           js_twin_base_len(rc->callee_qn) && rc->strategy &&
-           strcmp(rc->strategy, JS_TWIN_BOUND_STRATEGY) == 0;
+    return rc->kind == CBM_RESOLVED_INVOCATION && rc->caller_qn && rc->callee_qn && rc->reason &&
+           rc->strategy && strcmp(rc->strategy, JS_TWIN_BOUND_STRATEGY) == 0;
 }
 
 static int js_rc_site_cmp(const void *pa, const void *pb) {
@@ -14395,12 +15143,6 @@ static int js_rc_site_cmp(const void *pa, const void *pb) {
         return a->site_start_byte < b->site_start_byte ? -1 : 1;
     }
     return (a->site_end_byte > b->site_end_byte) - (a->site_end_byte < b->site_end_byte);
-}
-
-/* The bare last segment of a QN or a callee text. */
-static const char *js_twin_leaf(const char *name) {
-    const char *dot = name ? strrchr(name, '.') : NULL;
-    return dot ? dot + 1 : name;
 }
 
 /* Every other invocation row at a bound site, from the same caller and for
@@ -14439,13 +15181,8 @@ static void js_twin_unify_bound_callees(CBMFileResult *r) {
         if (!hit || strcmp((*hit)->caller_qn, rc->caller_qn) != 0) {
             continue;
         }
-        size_t base_len = js_twin_base_len((*hit)->callee_qn);
-        const char *leaf = js_twin_leaf(rc->callee_qn);
-        const char *bound_leaf = (*hit)->reason;
-        if (strcmp(leaf, bound_leaf) != 0 &&
-            !(strlen(rc->callee_qn) == base_len &&
-              memcmp(rc->callee_qn, (*hit)->callee_qn, base_len) == 0)) {
-            continue;
+        if (!js_twin_leaf_matches(rc->callee_qn, (*hit)->reason)) {
+            continue; /* another call at the site */
         }
         rc->callee_qn = (*hit)->callee_qn;
         rc->strategy = (*hit)->strategy;
@@ -14512,58 +15249,7 @@ void cbm_js_rebind_resolved_calls(CBMFileResult *r) {
     js_twin_unify_bound_callees(r);
 }
 
-/* ── Calls to a split member, by scope ──────────────────────────────── */
-typedef struct {
-    const char *leaf;  /* the name the member is declared by */
-    const char *qn;    /* the member's QN */
-    const char *base;  /* the QN its group shares */
-    uint32_t scope_lo; /* the block that declares it */
-    uint32_t scope_hi;
-} js_twin_scope_t;
-
-static int js_twin_scope_cmp(const void *pa, const void *pb) {
-    const js_twin_scope_t *a = pa;
-    const js_twin_scope_t *b = pb;
-    return strcmp(a->leaf, b->leaf);
-}
-
-static bool js_scope_block_kind(const char *k) {
-    return strcmp(k, "statement_block") == 0 || strcmp(k, "program") == 0 ||
-           strcmp(k, "class_static_block") == 0;
-}
-
-/* The block whose statements declare the callable `fn` by name, as a
- * function declaration or as the value of a variable declarator; a null
- * node when `fn` is not so declared (an object-literal or class member). */
-static TSNode js_declaring_block(TSNode fn) {
-    TSNode null_node = {0};
-    const char *k = ts_node_type(fn);
-    TSNode stmt = fn;
-    if (strcmp(k, "function_declaration") != 0 &&
-        strcmp(k, "generator_function_declaration") != 0) {
-        TSNode vd = ts_node_parent(fn);
-        if (ts_node_is_null(vd) || strcmp(ts_node_type(vd), "variable_declarator") != 0) {
-            return null_node;
-        }
-        TSNode value = ts_node_child_by_field_name(vd, TS_FIELD("value"));
-        TSNode name = ts_node_child_by_field_name(vd, TS_FIELD("name"));
-        if (ts_node_is_null(value) || !ts_node_eq(value, fn) || ts_node_is_null(name) ||
-            strcmp(ts_node_type(name), "identifier") != 0) {
-            return null_node;
-        }
-        stmt = ts_node_parent(vd);
-        if (ts_node_is_null(stmt) || (strcmp(ts_node_type(stmt), "lexical_declaration") != 0 &&
-                                      strcmp(ts_node_type(stmt), "variable_declaration") != 0)) {
-            return null_node;
-        }
-    }
-    TSNode block = ts_node_parent(stmt);
-    if (!ts_node_is_null(block) && strcmp(ts_node_type(block), "export_statement") == 0) {
-        block = ts_node_parent(block);
-    }
-    return !ts_node_is_null(block) && js_scope_block_kind(ts_node_type(block)) ? block : null_node;
-}
-
+/* ── Calls to a group member, by scope ──────────────────────────────── */
 static bool js_plain_identifier(const char *s) {
     if (!s || !*s) {
         return false;
@@ -14581,41 +15267,15 @@ static bool js_plain_identifier(const char *s) {
 void cbm_js_twin_bind_local_callees(CBMExtractCtx *ctx) {
     const js_twin_table_t *table = ctx ? ctx->js_twins : NULL;
     CBMFileResult *r = ctx ? ctx->result : NULL;
-    if (!table || !r || r->calls.count == 0) {
+    if (!table || table->ndecls == 0 || !r || r->calls.count == 0) {
         return;
     }
-    js_twin_scope_t *scopes = malloc((size_t)table->count * sizeof(*scopes));
-    if (!scopes) {
-        return;
-    }
-    int ns = 0;
-    for (int i = 0; i < table->count; i++) {
-        const js_twin_t *it = &table->items[i];
-        TSNode fn = js_twin_node(ctx->root, it->start_byte);
-        TSNode block = ts_node_is_null(fn) ? fn : js_declaring_block(fn);
-        if (ts_node_is_null(block)) {
-            continue;
-        }
-        scopes[ns].leaf = js_twin_leaf(it->base_qn);
-        scopes[ns].qn = it->qn;
-        scopes[ns].base = it->base_qn;
-        scopes[ns].scope_lo = ts_node_start_byte(block);
-        scopes[ns].scope_hi = ts_node_end_byte(block);
-        ns++;
-    }
-    if (ns == 0) {
-        free(scopes);
-        return;
-    }
-    qsort(scopes, (size_t)ns, sizeof(*scopes), js_twin_scope_cmp);
-
     /* The resolver rows by site, to correct one rather than add a second. */
     const CBMResolvedCall **rows = NULL;
     int nr = r->resolved_calls.count;
     if (nr > 0) {
         rows = malloc((size_t)nr * sizeof(*rows));
         if (!rows) {
-            free(scopes);
             return;
         }
         for (int i = 0; i < nr; i++) {
@@ -14631,35 +15291,18 @@ void cbm_js_twin_bind_local_callees(CBMExtractCtx *ctx) {
             !js_plain_identifier(c->callee_name)) {
             continue;
         }
-        js_twin_scope_t key = {.leaf = c->callee_name};
-        const js_twin_scope_t *hit =
-            bsearch(&key, scopes, (size_t)ns, sizeof(*scopes), js_twin_scope_cmp);
-        if (!hit) {
+        const char **name = bsearch(&c->callee_name, table->names, (size_t)table->nnames,
+                                    sizeof(*table->names), js_qn_ptr_cmp);
+        if (!name) {
             continue;
         }
-        while (hit > scopes && strcmp(hit[-1].leaf, c->callee_name) == 0) {
-            hit--;
-        }
-        /* The innermost declaring block around the call names the callee;
-         * two members declared in one block leave it open. */
-        const js_twin_scope_t *best = NULL;
-        bool tie = false;
-        const js_twin_scope_t *end = scopes + ns;
-        for (const js_twin_scope_t *e = hit; e < end && strcmp(e->leaf, c->callee_name) == 0; e++) {
-            if (c->site_start_byte < e->scope_lo || c->site_end_byte > e->scope_hi) {
-                continue;
-            }
-            uint32_t span = e->scope_hi - e->scope_lo;
-            uint32_t best_span = best ? best->scope_hi - best->scope_lo : UINT32_MAX;
-            if (!best || span < best_span) {
-                best = e;
-                tie = false;
-            } else if (span == best_span && strcmp(e->qn, best->qn) != 0) {
-                tie = true;
-            }
-        }
-        if (!best || tie || best->qn == best->base || strcmp(best->qn, best->base) == 0) {
-            continue; /* the member that kept the QN is the one name lookup finds */
+        /* The nearest binding of the name names the callee. A parameter, a
+         * variable, a catch clause or an import that is nearer leaves the
+         * call alone, as do two callables of one name in one scope. */
+        const js_twin_decl_t *d = js_twin_nearest(table, (int)(name - table->names),
+                                                  c->site_start_byte, c->site_end_byte);
+        if (!d || !d->qn) {
+            continue;
         }
         bool corrected = false;
         if (rows) {
@@ -14677,7 +15320,7 @@ void cbm_js_twin_bind_local_callees(CBMExtractCtx *ctx) {
                     strcmp(rc->caller_qn, c->enclosing_func_qn) != 0) {
                     continue;
                 }
-                rc->callee_qn = best->qn;
+                rc->callee_qn = d->qn;
                 rc->strategy = JS_TWIN_BOUND_STRATEGY;
                 rc->reason = c->callee_name;
                 rc->confidence = JS_TWIN_BOUND_CONFIDENCE;
@@ -14695,7 +15338,7 @@ void cbm_js_twin_bind_local_callees(CBMExtractCtx *ctx) {
         }
         CBMResolvedCall rc = {0};
         rc.caller_qn = c->enclosing_func_qn;
-        rc.callee_qn = best->qn;
+        rc.callee_qn = d->qn;
         rc.strategy = JS_TWIN_BOUND_STRATEGY;
         rc.confidence = JS_TWIN_BOUND_CONFIDENCE;
         rc.reason = c->callee_name;
@@ -14711,7 +15354,6 @@ void cbm_js_twin_bind_local_callees(CBMExtractCtx *ctx) {
     }
     free(added);
     free(rows);
-    free(scopes);
 }
 
 void cbm_extract_definitions(CBMExtractCtx *ctx) {

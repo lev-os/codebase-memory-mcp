@@ -355,6 +355,14 @@ typedef struct {
  * it (pipeline.h cbm_def_props_generated). */
 #define CBM_PROP_GENERATED "generated"
 
+/* extra_props key of a same-name JS/TS callable declared in a function body
+ * (cbm_js_split_twin_callables gives it a derived name such as
+ * observable.iterator.next): only that function's code can name it, so the
+ * pipeline registers it by qualified name only, as it does a Python
+ * function's locals (pipeline.h cbm_def_props_function_local). Value
+ * "true". */
+#define CBM_PROP_FUNCTION_LOCAL "function_local"
+
 /* Argument captured from a call expression */
 typedef struct {
     const char *expr;      // raw expression text ("payload.info", "MY_URL", "'hello'")
@@ -1476,10 +1484,14 @@ void cbm_extract_definitions_without_module(CBMExtractCtx *ctx);
  * so two callables of one file that share a QN -- `first` in two object
  * literals, `setup` in two test callbacks, a getter and its setter -- became
  * one node holding the calls of both. Run once the def list of the walk is
- * final and before the call-scope walk: in each group of two or more bodied
- * Function/Method defs with one QN, the outermost (then the first) keeps the
- * QN and every other takes QN + "#<n>", n = its 2-based rank in the group.
- * Signatures stay out of the groups. */
+ * final and before the call-scope walk. In each group of two or more bodied
+ * Function/Method defs with one QN, the module-level binding of the name (an
+ * exported one, then a top-level declaration) keeps the QN, so an import of
+ * the name reaches it; a member or nested callable with a named owner takes
+ * the owner's path (`file.box.run`, `file.outer.run`); the rest ask for the
+ * QN. Where two ask for one QN, the first (the module binding, then by
+ * source position) keeps it and each other takes QN + "#<n>", n from 2 in
+ * that order. Signatures stay out of the groups. */
 void cbm_js_split_twin_callables(CBMExtractCtx *ctx);
 /* The QN the split gave the callable whose syntax node starts at `start_byte`
  * and whose unsplit QN is `base_qn` (`base_qn` itself for the member that kept
@@ -1491,10 +1503,14 @@ const char *cbm_js_twin_qn(const CBMExtractCtx *ctx, const char *base_qn, uint32
  * caller; then a resolver row at a site the scope binder bound takes the
  * bound target. Idempotent. */
 void cbm_js_rebind_resolved_calls(CBMFileResult *r);
-/* After the per-file JS/TS resolver ran: a bare call `name()` whose innermost
- * declaring block around it declares a split member `name` (a function
- * declaration, or a variable whose value is a function) targets that member.
- * The resolver row at the call's site is corrected, or one is added. */
+/* After the per-file JS/TS resolver ran: a bare call `name()` whose nearest
+ * binding of `name` is a callable of a same-name group targets that callable.
+ * The binding is found by the scopes around the call: a block's function
+ * declarations and variables, a callable's parameters, a catch clause, the
+ * module's imports, a function expression's own name inside it. A nearer
+ * parameter, variable or import leaves the call alone. The resolver row at
+ * the call's site is corrected, or one is added. Near-linear: the
+ * declarations of the groups' names come from the split's one tree walk. */
 void cbm_js_twin_bind_local_callees(CBMExtractCtx *ctx);
 // dbt lineage for Jinja-templated SQL models: emits a Model def plus one usage
 // per ref()/source() call. No-op unless the file parses as SQL and actually

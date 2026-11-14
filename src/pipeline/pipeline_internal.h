@@ -277,9 +277,11 @@ cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const c
                                                 CBMLanguage lang);
 /* The registry step of BOTH call resolvers once the LSP has not answered:
  * for Python, the def or class `callee_name` binds in the nearest def enclosing
- * `scope_qn` (cbm_registry_resolve_lexical, "lexical_scope"); otherwise, or
- * when there is no such local, cbm_registry_resolve_call_lang. `caller_test`:
- * the calling definition's test verdict, as for cbm_registry_resolve_ref. */
+ * `scope_qn` (cbm_registry_resolve_lexical, "lexical_scope"); for JS/TS,
+ * `this.name` names the member `name` the class around `scope_qn` declares
+ * ("this_member"); otherwise, or when there is no such def,
+ * cbm_registry_resolve_call_lang. `caller_test`: the calling definition's
+ * test verdict, as for cbm_registry_resolve_ref. */
 cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const char *callee_name,
                                                   const char *module_qn,
                                                   const char **import_map_keys,
@@ -1781,8 +1783,14 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      alias configs, and a call through a namespace or require() binding of
  *      a File target reaches that file's definitions. Older indexes rebuild
  *      once to drop the old edges.
+ *  16: two JS/TS callables of one file with one qualified name are two
+ *      nodes, and a call is recorded under the callable that holds it. The
+ *      module-level binding of the name keeps the plain name; a member or
+ *      nested callable takes its owner's path (`file.box.run`) or "#<n>"
+ *      (cbm_js_split_twin_callables). An index built before holds one node
+ *      for such callables, or other names, so it rebuilds once on upgrade.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 15 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 16 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

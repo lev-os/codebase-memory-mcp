@@ -161,6 +161,8 @@ static void ts_write_repo(const char *repo) {
                   "  function uniqueInside() {}\n"
                   "}\n"
                   "export function other() {\n"
+                  "  /** Calls {@link helperInside}. */\n"
+                  "  function besides() {}\n"
                   "  function helperInside() {}\n"
                   "}\n");
     /* a script: no import, no export, so its names are global */
@@ -267,11 +269,11 @@ TEST(doc_mentions_ts_resolution) {
     /* this. is the container's; a namespace's own names first */
     ASSERT_TRUE(ts_edge(db, "src.widget.Widget.turn", "src.widget.Widget.spin"));
     ASSERT_TRUE(ts_edge(db, "src.widget.Space.Inner.deep", "src.widget.Space.Inner.deep2"));
-    /* a function body's own declaration binds; two of one name share one node */
+    /* a function body's own declaration binds; two of one name are two
+     * nodes, each named by the function around it */
     ASSERT_TRUE(ts_edge(db, "src.closure.inside", "src.closure.uniqueInside"));
-    char reason[64];
-    dm_row(db, "src/closure.ts", "helperInside", reason, sizeof(reason), NULL, 0);
-    ASSERT_STR_EQ(reason, "graph_gap");
+    ASSERT_TRUE(ts_edge(db, "src.closure.inside", "src.closure.outer.helperInside"));
+    ASSERT_TRUE(ts_edge(db, "src.closure.besides", "src.closure.other.helperInside"));
     th_cleanup(tmp);
     PASS();
 }

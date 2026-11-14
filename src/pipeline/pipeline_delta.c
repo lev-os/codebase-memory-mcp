@@ -698,7 +698,9 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
      * Method node): the registry seed reads it to register the member by
      * qualified name only, as the full build does (cbm_node_props_generated);
      * without it the proxy came back into the short-name index. TypeScript
-     * signatures retain is_abstract for the same exact-only registry rule.
+     * signatures retain is_abstract for the same exact-only registry rule,
+     * and a function-local JS/TS twin (Function or Method) its
+     * CBM_PROP_FUNCTION_LOCAL mark.
      *
      * And a same-file overload's parameter shape (callable_overload.h
      * CBM_OVERLOAD_PARAMS_PROP, on Function/Method rows of a split group):
@@ -747,7 +749,10 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
             " CASE WHEN label IN ('Function','Method')"
             " AND instr(properties, '\"" CBM_OVERLOAD_PARAMS_PROP "\"') > 0"
             " THEN json_extract(properties, '$." CBM_OVERLOAD_PARAMS_PROP "') END,"
-            " instr(properties, '\"is_test\":true') > 0"
+            " instr(properties, '\"is_test\":true') > 0,"
+            " CASE WHEN label IN ('Function','Method')"
+            " AND instr(properties, '\"" CBM_PROP_FUNCTION_LOCAL "\"') > 0"
+            " THEN json_extract(properties, '$." CBM_PROP_FUNCTION_LOCAL "') END"
             " FROM nodes"
             " WHERE project = ?1 AND label NOT IN"
             " ('Macro','Comment','Section','Branch','Commit','Tag')"
@@ -774,6 +779,7 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
         const char *generated = (const char *)sqlite3_column_text(stmt, 9);
         const char *overload = (const char *)sqlite3_column_text(stmt, 10);
         bool is_test = sqlite3_column_int(stmt, 11) != 0;
+        const char *function_local = (const char *)sqlite3_column_text(stmt, 12);
         char *owner_props =
             parent ? delta_owner_props(project, name, qn, parent, client_props) : NULL;
         const char *props = owner_props ? owner_props : (client_props ? client_props : "{}");
@@ -785,9 +791,14 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
         if (overload_props) {
             props = overload_props;
         }
+        char *local_props = delta_with_prop(props, CBM_PROP_FUNCTION_LOCAL, function_local);
+        if (local_props) {
+            props = local_props;
+        }
         char *test_props = is_test ? delta_test_props(props) : NULL;
         if (is_test && !test_props) {
             cbm_log_error("delta.preseed_verdict_alloc_failed", "qn", qn ? qn : "");
+            cbm_free(CBM_MEM_CLASS_OTHER, local_props);
             cbm_free(CBM_MEM_CLASS_OTHER, overload_props);
             cbm_free(CBM_MEM_CLASS_OTHER, generated_props);
             cbm_free(CBM_MEM_CLASS_OTHER, owner_props);
@@ -799,6 +810,7 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
         int64_t got = cbm_gbuf_upsert_node(gbuf, label, name, qn, fp ? fp : "", start_line,
                                            end_line, test_props ? test_props : props);
         cbm_free(CBM_MEM_CLASS_OTHER, test_props);
+        cbm_free(CBM_MEM_CLASS_OTHER, local_props);
         cbm_free(CBM_MEM_CLASS_OTHER, overload_props);
         cbm_free(CBM_MEM_CLASS_OTHER, generated_props);
         cbm_free(CBM_MEM_CLASS_OTHER, owner_props);

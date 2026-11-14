@@ -70,6 +70,8 @@ const char *cbm_confidence_band(double score) {
 #define CONF_SAME_MODULE 0.90
 /* Python lexical scope — a def bound in an enclosing function (LEGB) */
 #define CONF_LEXICAL_SCOPE 0.95
+/* JS/TS `this.name()` — a member the caller's own class declares */
+#define CONF_THIS_MEMBER 0.90
 /* Strategy 3: unique_name — only one candidate project-wide */
 #define CONF_UNIQUE_NAME 0.75
 /* Strategy 4: suffix_match — multiple candidates, filtered */
@@ -1805,9 +1807,10 @@ static bool registry_label_is_callable(const char *label) {
 
 /* Length of the QN prefix the defs of the caller's file carry: its module QN
  * (cbm_pipeline_fqn_module), minus the trailing `__init__` / `index` segment
- * that symbol QNs drop (pkg/__init__.py defines proj.pkg.f). 0 when there is
- * no module QN or `qualified_name` does not extend that prefix. */
-static size_t python_def_prefix_len(const char *module_qn, const char *qualified_name) {
+ * that symbol QNs drop (pkg/__init__.py defines proj.pkg.f, pkg/index.ts
+ * proj.pkg.C). 0 when there is no module QN or `qualified_name` does not
+ * extend that prefix. */
+static size_t def_prefix_len(const char *module_qn, const char *qualified_name) {
     static const char *const dropped[] = {".__init__", ".index"};
     size_t n = module_qn ? strlen(module_qn) : 0;
     for (size_t i = 0; i < sizeof(dropped) / sizeof(dropped[0]); i++) {
@@ -2056,6 +2059,19 @@ bool cbm_def_props_generated(const char *const *extra_props) {
 bool cbm_node_props_generated(const char *properties_json) {
     /* The key as the definition passes write it: "generated":"<value>". */
     return properties_json && strstr(properties_json, "\"" CBM_PROP_GENERATED "\":\"") != NULL;
+}
+
+bool cbm_def_props_function_local(const char *const *extra_props) {
+    for (const char *const *kv = extra_props; kv && kv[0] && kv[SKIP_ONE]; kv += PAIR_LEN) {
+        if (strcmp(kv[0], CBM_PROP_FUNCTION_LOCAL) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool cbm_node_props_function_local(const char *properties_json) {
+    return properties_json && strstr(properties_json, "\"" CBM_PROP_FUNCTION_LOCAL "\":\"") != NULL;
 }
 
 /* ── Lookup ──────────────────────────────────────────────────────── */
@@ -5405,7 +5421,7 @@ cbm_resolution_t cbm_registry_resolve_lexical(const cbm_registry_t *r, const cha
     char scope[CBM_SZ_512];
     char candidate[CBM_SZ_512];
     size_t len = scope_qn ? strlen(scope_qn) : 0;
-    size_t floor = python_def_prefix_len(module_qn, scope_qn);
+    size_t floor = def_prefix_len(module_qn, scope_qn);
     if (!r || !callee_name || !callee_name[0] || strchr(callee_name, '.') ||
         strstr(callee_name, "::") || len == 0 || len >= sizeof(scope) || floor == 0) {
         return empty_result();
@@ -5434,11 +5450,79 @@ cbm_resolution_t cbm_registry_resolve_lexical(const cbm_registry_t *r, const cha
     return empty_result();
 }
 
+/* An identifier a JS/TS member access can name (`stop`, `$get`, `#close`). */
+static bool js_member_name(const char *s) {
+    if (!s || !s[0]) {
+        return false;
+    }
+    for (const char *c = s; *c; c++) {
+        bool word = (*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') ||
+                    (*c >= '0' && *c <= '9') || *c == '_' || *c == '$' || (*c == '#' && c == s);
+        if (!word) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* JS/TS `this.name()` in a method names a member of the method's class. When
+ * no type-aware resolver answered (the TS LSP types no `this` in some files),
+ * the class around the caller holds the target if it declares `name`: the
+ * walk goes outward from `scope_qn` inside the caller's own file, through
+ * registered callables only, to the first Class. A prefix that is no def is
+ * an object literal (Adapter.handle.stop), whose methods can see the literal
+ * as `this`, and ends the walk. A caller outside any class, a longer path
+ * (`this.a.b()`) and a member the class does not declare (inherited) stay
+ * with the other strategies. It runs before them because a name-only guess
+ * ranks every same-name callable alike, and a tie went to a callable that an
+ * object literal in another method holds. Uncached: the answer depends on
+ * the caller. */
+static cbm_resolution_t resolve_js_this_member(const cbm_registry_t *r, const char *callee_name,
+                                               const char *scope_qn, const char *module_qn) {
+    static const char self[] = "this.";
+    const size_t self_len = sizeof(self) - SKIP_ONE;
+    char scope[CBM_SZ_512];
+    char candidate[CBM_SZ_512];
+    size_t len = scope_qn ? strlen(scope_qn) : 0;
+    if (!r || !callee_name || strncmp(callee_name, self, self_len) != 0 ||
+        !js_member_name(callee_name + self_len) || len == 0 || len >= sizeof(scope)) {
+        return empty_result();
+    }
+    size_t floor = def_prefix_len(module_qn, scope_qn);
+    if (floor == 0) {
+        return empty_result();
+    }
+    memcpy(scope, scope_qn, len + SKIP_ONE);
+    while (strlen(scope) > floor) {
+        const char *label = cbm_ht_get(r->exact, scope);
+        if (label && strcmp(label, "Class") == 0) {
+            int n = snprintf(candidate, sizeof(candidate), "%s.%s", scope, callee_name + self_len);
+            const char *stored_key =
+                n > 0 && (size_t)n < sizeof(candidate) ? cbm_ht_get_key(r->exact, candidate) : NULL;
+            if (stored_key && registry_label_is_callable(cbm_ht_get(r->exact, stored_key))) {
+                return (cbm_resolution_t){stored_key, "this_member", CONF_THIS_MEMBER,
+                                          REG_RESOLVED};
+            }
+            break;
+        }
+        if (!registry_label_is_callable(label)) {
+            break;
+        }
+        char *dot = strrchr(scope, '.');
+        if (!dot) {
+            break;
+        }
+        *dot = '\0';
+    }
+    return empty_result();
+}
+
 /* The registry step both call resolvers (pass_calls.c, pass_parallel.c) run
  * once the LSP has not answered: a Python bare name bound in an enclosing def
  * first (the LSP binds those locals itself; this covers the sites it did not
- * resolve), then the language-aware chain. One entry point, so the two
- * resolvers cannot diverge on the rule. */
+ * resolve), or a JS/TS `this.name` the caller's class declares, then the
+ * language-aware chain. One entry point, so the two resolvers cannot diverge
+ * on the rule. */
 cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const char *callee_name,
                                                   const char *module_qn,
                                                   const char **import_map_keys,
@@ -5450,6 +5534,12 @@ cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const
             cbm_registry_resolve_lexical(r, callee_name, scope_qn, module_qn);
         if (lexical.qualified_name && lexical.qualified_name[0]) {
             return lexical;
+        }
+    }
+    if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
+        cbm_resolution_t member = resolve_js_this_member(r, callee_name, scope_qn, module_qn);
+        if (member.qualified_name && member.qualified_name[0]) {
+            return member;
         }
     }
     return resolve_call_lang(r, callee_name, module_qn, import_map_keys, import_map_vals,
