@@ -256,6 +256,81 @@ static bool node_kind_is(TSNode node, const char *kind) {
     return strcmp(ts_node_type(node), kind) == 0;
 }
 
+static bool ts_is_function_declaration(TSNode node) {
+    return node_kind_is(node, "function_declaration") ||
+           node_kind_is(node, "generator_function_declaration");
+}
+
+static bool ts_is_function_value(TSNode node) {
+    return node_kind_is(node, "arrow_function") || node_kind_is(node, "function_expression") ||
+           node_kind_is(node, "function") || node_kind_is(node, "generator_function");
+}
+
+/* Record only syntactic module/namespace bindings, not members or callables
+ * inside bodies. This keeps the registry's flat object-method names from
+ * supplying a free function's target or return type. */
+static void ts_collect_module_callables(TSLSPContext *ctx, TSNode node, const char *module_qn) {
+    if (ts_node_is_null(node) || !module_qn)
+        return;
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "program") == 0 ||
+        (strcmp(kind, "statement_block") == 0 &&
+         node_kind_is(ts_node_parent(node), "internal_module")) ||
+        strcmp(kind, "export_statement") == 0 || strcmp(kind, "ambient_declaration") == 0 ||
+        strcmp(kind, "lexical_declaration") == 0 || strcmp(kind, "variable_declaration") == 0) {
+        TSTreeCursor cursor = ts_tree_cursor_new(node);
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            do {
+                ts_collect_module_callables(ctx, ts_tree_cursor_current_node(&cursor), module_qn);
+            } while (ts_tree_cursor_goto_next_sibling(&cursor));
+        }
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    if (strcmp(kind, "expression_statement") == 0) {
+        TSNode child = ts_node_named_child(node, 0);
+        if (node_kind_is(child, "internal_module"))
+            ts_collect_module_callables(ctx, child, module_qn);
+        return;
+    }
+    if (strcmp(kind, "internal_module") == 0) {
+        TSNode name = ts_node_child_by_field_name(node, "name", TS_LSP_FIELD_LEN("name"));
+        TSNode body = ts_node_child_by_field_name(node, "body", TS_LSP_FIELD_LEN("body"));
+        if (!ts_node_is_null(name)) {
+            const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", module_qn, node_text(ctx, name));
+            ts_collect_module_callables(ctx, body, qn);
+        }
+        return;
+    }
+    if (strcmp(kind, "variable_declarator") == 0) {
+        TSNode value = ts_node_child_by_field_name(node, "value", TS_LSP_FIELD_LEN("value"));
+        if (!ts_is_function_value(value))
+            return;
+    } else if (!ts_is_function_declaration(node) &&
+               strcmp(kind, "function_signature") != 0) {
+        return;
+    }
+    TSNode name = ts_node_child_by_field_name(node, "name", TS_LSP_FIELD_LEN("name"));
+    if (node_kind_is(name, "identifier")) {
+        const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", module_qn, node_text(ctx, name));
+        cbm_scope_bind(ctx->module_callables, qn, cbm_type_unknown());
+    }
+}
+
+static void ts_prepare_module_callables(TSLSPContext *ctx, TSNode root) {
+    if (!ctx->module_callables) {
+        ctx->module_callables = cbm_scope_push(ctx->arena, NULL);
+        ts_collect_module_callables(ctx, root, ctx->module_qn);
+    }
+}
+
+static bool ts_is_module_callable(TSLSPContext *ctx, const char *name) {
+    if (!ctx->module_qn || !ctx->module_callables || !name)
+        return false;
+    const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name);
+    return cbm_scope_lookup_local(ctx->module_callables, qn) != NULL;
+}
+
 /* Resolve the named class at the actual expression, rather than the class
  * whose body the walker entered. In particular a class expression inside a
  * method has its own `this`, even during early return-type inference. */
@@ -1631,7 +1706,7 @@ static const char *ts_import_symbol_qn(TSLSPContext *ctx, const char *module_qn,
  * suffix, overload-arity, or project-wide uniqueness fallback is admissible. */
 static const CBMRegisteredFunc *ts_exact_same_module_function(TSLSPContext *ctx, const char *name) {
     if (!ctx || !ctx->registry || !ctx->module_qn || !name ||
-        ts_scope_has_binding(ctx->current_scope, name)) {
+        ts_scope_has_binding(ctx->current_scope, name) || !ts_is_module_callable(ctx, name)) {
         return NULL;
     }
     const char *full_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name);
@@ -1732,7 +1807,7 @@ static const CBMType *type_of_identifier(TSLSPContext *ctx, const char *name) {
         if (rt)
             return cbm_type_named(ctx->arena, candidate);
         const CBMRegisteredFunc *f = ts_lookup_func(ctx, ctx->registry, candidate);
-        if (f && f->signature)
+        if (f && f->signature && ts_is_module_callable(ctx, name))
             return f->signature;
     }
 
@@ -2256,6 +2331,8 @@ static const char *ts_import_module_for_local(const TSLSPContext *ctx, const cha
  * cross-file edge was lost while the same code in the class's own file
  * resolved. One hashed type lookup; the registry is only read. */
 static const CBMType *ts_new_bare_class_type(TSLSPContext *ctx, const char *cname) {
+    if (ts_scope_has_binding(ctx->current_scope, cname))
+        return cbm_type_unknown();
     if (!ctx->module_qn)
         return cbm_type_named(ctx->arena, cname);
     const char *local_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, cname);
@@ -2380,17 +2457,21 @@ static const CBMType *ts_signature_for_call(TSLSPContext *ctx, TSNode function, 
         if (name && ts_scope_has_binding(ctx->current_scope, name))
             return type_of_identifier(ctx, name);
         if (name) {
-            const CBMRegisteredFunc *registered = NULL;
-            if (ctx->module_qn)
-                registered = ts_lookup_symbol_for_call(ctx, ctx->module_qn, name, args);
-            if (!registered) {
-                const char *module_qn = ts_import_module_for_local(ctx, name, NULL);
-                if (module_qn)
-                    registered = ts_lookup_symbol_for_call(ctx, module_qn,
-                                                           ts_import_export_name(ctx, name), args);
+            /* An explicit import binding wins over a flattened same-file
+             * member name, in return typing just as in call resolution. */
+            bool imported = false;
+            const char *module_qn = ts_import_module_for_local(ctx, name, &imported);
+            if (imported) {
+                const CBMRegisteredFunc *registered = module_qn
+                    ? ts_lookup_symbol_for_call(ctx, module_qn, ts_import_export_name(ctx, name), args)
+                    : NULL;
+                return registered ? registered->signature : NULL;
             }
-            if (registered)
-                return registered->signature;
+            if (!ts_is_module_callable(ctx, name))
+                return ts_eval_expr_type(ctx, function);
+            const CBMRegisteredFunc *registered =
+                ts_lookup_symbol_for_call(ctx, ctx->module_qn, name, args);
+            return registered ? registered->signature : NULL;
         }
     }
 
@@ -2792,6 +2873,63 @@ const CBMType *ts_parse_type_node(TSLSPContext *ctx, TSNode node) {
 // ── Statement processing ──────────────────────────────────────────────────────
 
 // Bind a variable_declarator: `let x: T = init` / `const x = init` / `var x = ...`.
+/* Reserve local names before visiting their initializers or nested callables.
+ * A not-yet-inferred local must shadow an outer typed receiver, not borrow it. */
+static void bind_unknown_pattern(TSLSPContext *ctx, TSNode pattern) {
+    if (ts_node_is_null(pattern))
+        return;
+    const char *kind = ts_node_type(pattern);
+    if (strcmp(kind, "identifier") == 0 ||
+        strcmp(kind, "shorthand_property_identifier_pattern") == 0) {
+        char *name = node_text(ctx, pattern);
+        if (name)
+            cbm_scope_bind(ctx->current_scope, name, cbm_type_unknown());
+    } else if (strcmp(kind, "pair_pattern") == 0) {
+        TSNode value = ts_node_child_by_field_name(pattern, "value", TS_LSP_FIELD_LEN("value"));
+        bind_unknown_pattern(ctx, value);
+    } else if (strcmp(kind, "assignment_pattern") == 0 ||
+               strcmp(kind, "object_assignment_pattern") == 0) {
+        TSNode left = ts_node_child_by_field_name(pattern, "left", TS_LSP_FIELD_LEN("left"));
+        bind_unknown_pattern(ctx, left);
+    } else if (strcmp(kind, "object_pattern") == 0 || strcmp(kind, "array_pattern") == 0 ||
+               strcmp(kind, "rest_pattern") == 0) {
+        uint32_t count = ts_node_named_child_count(pattern);
+        for (uint32_t i = 0; i < count; i++)
+            bind_unknown_pattern(ctx, ts_node_named_child(pattern, i));
+    }
+}
+
+static void shadow_block_declarations(TSLSPContext *ctx, TSNode block) {
+    TSTreeCursor statements = ts_tree_cursor_new(block);
+    if (ts_tree_cursor_goto_first_child(&statements)) {
+        do {
+            TSNode stmt = ts_tree_cursor_current_node(&statements);
+            if (ts_is_function_declaration(stmt) &&
+                !node_kind_is(ts_node_parent(block), "internal_module")) {
+                TSNode name = ts_node_child_by_field_name(stmt, "name", TS_LSP_FIELD_LEN("name"));
+                bind_unknown_pattern(ctx, name);
+                continue;
+            }
+            if (!node_kind_is(stmt, "lexical_declaration") &&
+                !node_kind_is(stmt, "variable_declaration"))
+                continue;
+            TSTreeCursor declarations = ts_tree_cursor_new(stmt);
+            if (ts_tree_cursor_goto_first_child(&declarations)) {
+                do {
+                    TSNode decl = ts_tree_cursor_current_node(&declarations);
+                    if (node_kind_is(decl, "variable_declarator")) {
+                        TSNode name =
+                            ts_node_child_by_field_name(decl, "name", TS_LSP_FIELD_LEN("name"));
+                        bind_unknown_pattern(ctx, name);
+                    }
+                } while (ts_tree_cursor_goto_next_sibling(&declarations));
+            }
+            ts_tree_cursor_delete(&declarations);
+        } while (ts_tree_cursor_goto_next_sibling(&statements));
+    }
+    ts_tree_cursor_delete(&statements);
+}
+
 static void bind_variable_declarator(TSLSPContext *ctx, TSNode decl) {
     TSNode name = ts_node_child_by_field_name(decl, "name", TS_LSP_FIELD_LEN("name"));
     TSNode tann = ts_node_child_by_field_name(decl, "type", TS_LSP_FIELD_LEN("type"));
@@ -2868,6 +3006,12 @@ static void bind_variable_declarator(TSLSPContext *ctx, TSNode decl) {
 // variations: tries `pattern`, `name`, then falls back to first named child of the param.
 static void bind_parameter(TSLSPContext *ctx, TSNode param) {
     const char *pk = ts_node_type(param);
+    if (strcmp(pk, "identifier") == 0) {
+        char *name = node_text(ctx, param);
+        if (name)
+            cbm_scope_bind(ctx->current_scope, name, cbm_type_unknown());
+        return;
+    }
     if (strcmp(pk, "required_parameter") != 0 && strcmp(pk, "optional_parameter") != 0 &&
         strcmp(pk, "tuple_parameter") != 0 && strcmp(pk, "optional_tuple_parameter") != 0)
         return;
@@ -3199,14 +3343,6 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
         if (ts_scope_has_binding(ctx->current_scope, name))
             return;
 
-        // Module-local function: ordered argument types first, then arity.
-        if (ctx->module_qn) {
-            const CBMRegisteredFunc *f = ts_lookup_symbol_for_call(ctx, ctx->module_qn, name, args);
-            if (f) {
-                ts_emit_resolved_call_at(ctx, f->qualified_name, "lsp_ts_local", 0.95f, call_node);
-                return;
-            }
-        }
         // Imported default/named function.
         for (int i = 0; i < ctx->import_count; i++) {
             const char *lname = ctx->import_local_names ? ctx->import_local_names[i] : NULL;
@@ -3227,6 +3363,14 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
                 // Fall through to qualified_name fallback.
                 const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", mqn, member);
                 ts_emit_unresolved_call_at(ctx, qn, "import_symbol_not_in_registry", call_node);
+                return;
+            }
+        }
+        // Module-local function: ordered argument types first, then arity.
+        if (ts_is_module_callable(ctx, name)) {
+            const CBMRegisteredFunc *f = ts_lookup_symbol_for_call(ctx, ctx->module_qn, name, args);
+            if (f) {
+                ts_emit_resolved_call_at(ctx, f->qualified_name, "lsp_ts_local", 0.95f, call_node);
                 return;
             }
         }
@@ -3314,6 +3458,7 @@ static void process_callback_arrow(TSLSPContext *ctx, TSNode arrow, const CBMTyp
     TSNode body = ts_node_child_by_field_name(arrow, "body", TS_LSP_FIELD_LEN("body"));
     if (!ts_node_is_null(body)) {
         if (strcmp(ts_node_type(body), "statement_block") == 0) {
+            shadow_block_declarations(ctx, body);
             TSTreeCursor cursor = ts_tree_cursor_new(body);
             if (ts_tree_cursor_goto_first_child(&cursor)) {
                 do {
@@ -3600,7 +3745,7 @@ static void process_namespace_member(TSLSPContext *ctx, TSNode node) {
         return;
     }
 
-    if (strcmp(kind, "function_declaration") == 0 && ctx->module_qn) {
+    if (ts_is_function_declaration(node) && ctx->module_qn) {
         TSNode name = ts_node_child_by_field_name(node, "name", TS_LSP_FIELD_LEN("name"));
         if (!ts_node_is_null(name)) {
             char *function_name = node_text(ctx, name);
@@ -3627,6 +3772,30 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
     if (strcmp(kind, "statement_block") == 0) {
         CBMScope *saved = ctx->current_scope;
         ctx->current_scope = cbm_scope_push(ctx->arena, saved);
+        shadow_block_declarations(ctx, node);
+        TSTreeCursor cursor = ts_tree_cursor_new(node);
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            do {
+                process_node(ctx, ts_tree_cursor_current_node(&cursor));
+            } while (ts_tree_cursor_goto_next_sibling(&cursor));
+        }
+        ts_tree_cursor_delete(&cursor);
+        ctx->current_scope = saved;
+        return;
+    }
+
+    /* Loop-header and catch bindings must not replace a receiver in the
+     * surrounding module/function. Unknown catch parameters still shadow it. */
+    if (strcmp(kind, "for_statement") == 0 || strcmp(kind, "for_in_statement") == 0 ||
+        strcmp(kind, "for_of_statement") == 0 || strcmp(kind, "catch_clause") == 0) {
+        CBMScope *saved = ctx->current_scope;
+        ctx->current_scope = cbm_scope_push(ctx->arena, saved);
+        if (strcmp(kind, "catch_clause") == 0) {
+            TSNode param =
+                ts_node_child_by_field_name(node, "parameter", TS_LSP_FIELD_LEN("parameter"));
+            bind_unknown_pattern(ctx, param);
+        }
+        ts_process_statement(ctx, node);
         TSTreeCursor cursor = ts_tree_cursor_new(node);
         if (ts_tree_cursor_goto_first_child(&cursor)) {
             do {
@@ -3740,6 +3909,20 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
             }
         }
 
+        CBMScope *switch_scope = ctx->current_scope;
+        ctx->current_scope = cbm_scope_push(ctx->arena, switch_scope);
+        if (!ts_node_is_null(body)) {
+            TSTreeCursor cases = ts_tree_cursor_new(body);
+            if (ts_tree_cursor_goto_first_child(&cases)) {
+                do {
+                    shadow_block_declarations(ctx, ts_tree_cursor_current_node(&cases));
+                } while (ts_tree_cursor_goto_next_sibling(&cases));
+            }
+            ts_tree_cursor_delete(&cases);
+        }
+        if (disc_var && cbm_scope_lookup_local(ctx->current_scope, disc_var))
+            var_union = NULL;
+
         // Walk each switch_case in the body; narrow x in each case's scope.
         if (!ts_node_is_null(body)) {
             uint32_t bnc = ts_node_named_child_count(body);
@@ -3823,6 +4006,7 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
                 ctx->current_scope = saved;
             }
         }
+        ctx->current_scope = switch_scope;
         return;
     }
 
@@ -3891,9 +4075,8 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
     }
 
     // Function-introducing nodes get their own scope + enclosing_func_qn handling.
-    if (strcmp(kind, "function_declaration") == 0 || strcmp(kind, "method_definition") == 0 ||
-        strcmp(kind, "function_expression") == 0 || strcmp(kind, "arrow_function") == 0 ||
-        strcmp(kind, "method_signature") == 0) {
+    if (ts_is_function_declaration(node) || ts_is_function_value(node) ||
+        strcmp(kind, "method_definition") == 0 || strcmp(kind, "method_signature") == 0) {
         // Nested functions just get a fresh scope; top-level / class-method walks own
         // their enclosing_func_qn via process_function_body.
         CBMScope *saved = ctx->current_scope;
@@ -3905,6 +4088,10 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
             for (uint32_t i = 0; i < nc; i++)
                 bind_parameter(ctx, ts_node_named_child(params, i));
         }
+        TSNode bare_param =
+            ts_node_child_by_field_name(node, "parameter", TS_LSP_FIELD_LEN("parameter"));
+        if (!ts_node_is_null(bare_param))
+            bind_parameter(ctx, bare_param);
         TSNode body = ts_node_child_by_field_name(node, "body", TS_LSP_FIELD_LEN("body"));
         if (!ts_node_is_null(body)) {
             // Arrow functions with a single-expression body: body IS the expression
@@ -3919,6 +4106,8 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
     if (strcmp(kind, "internal_module") == 0) {
         TSNode name = ts_node_child_by_field_name(node, "name", TS_LSP_FIELD_LEN("name"));
         const char *saved_module_qn = ctx->module_qn;
+        CBMScope *saved_scope = ctx->current_scope;
+        ctx->current_scope = cbm_scope_push(ctx->arena, saved_scope);
         if (!ts_node_is_null(name) && saved_module_qn) {
             char *namespace_name = node_text(ctx, name);
             if (namespace_name && namespace_name[0]) {
@@ -3928,11 +4117,13 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
         }
         TSNode body = ts_node_child_by_field_name(node, "body", TS_LSP_FIELD_LEN("body"));
         if (!ts_node_is_null(body)) {
+            shadow_block_declarations(ctx, body);
             uint32_t count = ts_node_named_child_count(body);
             for (uint32_t i = 0; i < count; i++)
                 process_namespace_member(ctx, ts_node_named_child(body, i));
         }
         ctx->module_qn = saved_module_qn;
+        ctx->current_scope = saved_scope;
         return;
     }
 
@@ -4023,12 +4214,18 @@ static void process_function_body(TSLSPContext *ctx, TSNode func_node, const cha
         }
     }
 
+    TSNode bare_param =
+        ts_node_child_by_field_name(func_node, "parameter", TS_LSP_FIELD_LEN("parameter"));
+    if (!ts_node_is_null(bare_param))
+        bind_parameter(ctx, bare_param);
+
     TSNode body = ts_node_child_by_field_name(func_node, "body", TS_LSP_FIELD_LEN("body"));
     if (!ts_node_is_null(body)) {
         // statement_block: walk every child statement. Expression body (concise
         // arrow): walk the expression directly — process_node on that handles
         // call_expression resolution.
         if (strcmp(ts_node_type(body), "statement_block") == 0) {
+            shadow_block_declarations(ctx, body);
             TSTreeCursor cursor = ts_tree_cursor_new(body);
             if (ts_tree_cursor_goto_first_child(&cursor)) {
                 do {
@@ -4046,107 +4243,81 @@ static void process_function_body(TSLSPContext *ctx, TSNode func_node, const cha
     ctx->current_scope = saved_scope;
 }
 
-static void process_top_level_variable_arrows(TSLSPContext *ctx, TSNode declaration) {
-    if (!ctx || ts_node_is_null(declaration) || !ctx->module_qn)
-        return;
-
-    uint32_t count = ts_node_named_child_count(declaration);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode declarator = ts_node_named_child(declaration, i);
-        if (!node_kind_is(declarator, "variable_declarator"))
-            continue;
-
-        TSNode name = ts_node_child_by_field_name(declarator, "name", TS_LSP_FIELD_LEN("name"));
-        TSNode value = ts_node_child_by_field_name(declarator, "value", TS_LSP_FIELD_LEN("value"));
-        if (!node_kind_is(name, "identifier") || !node_kind_is(value, "arrow_function"))
-            continue;
-
-        char *function_name = node_text(ctx, name);
-        if (!function_name)
-            continue;
-        const char *function_qn =
-            cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, function_name);
-        process_function_body(ctx, value, function_qn, NULL);
+/* Bind exported declarations in the same module scope as unwrapped ones.
+ * This pass evaluates types only; the statement walk emits calls once. */
+static void bind_module_declaration(TSLSPContext *ctx, TSNode node) {
+    if (node_kind_is(node, "export_statement")) {
+        uint32_t count = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < count; i++)
+            bind_module_declaration(ctx, ts_node_named_child(node, i));
+    } else if (node_kind_is(node, "lexical_declaration") ||
+               node_kind_is(node, "variable_declaration")) {
+        uint32_t count = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < count; i++) {
+            TSNode decl = ts_node_named_child(node, i);
+            if (!node_kind_is(decl, "variable_declarator"))
+                continue;
+            TSNode value = ts_node_child_by_field_name(decl, "value", TS_LSP_FIELD_LEN("value"));
+            /* Module callables already have exact registry identities. Binding
+             * them as unknown locals would hide JSX tags and direct calls. */
+            if (ts_is_function_value(value))
+                continue;
+            bind_variable_declarator(ctx, decl);
+        }
     }
 }
 
+static void process_module_statement(TSLSPContext *ctx, TSNode node) {
+    if (node_kind_is(node, "export_statement")) {
+        uint32_t count = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < count; i++)
+            process_module_statement(ctx, ts_node_named_child(node, i));
+        return;
+    }
+    if (ts_is_function_declaration(node)) {
+        process_namespace_member(ctx, node);
+        return;
+    }
+    if (node_kind_is(node, "lexical_declaration") || node_kind_is(node, "variable_declaration")) {
+        uint32_t count = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < count; i++) {
+            TSNode decl = ts_node_named_child(node, i);
+            if (!node_kind_is(decl, "variable_declarator"))
+                continue;
+            TSNode value = ts_node_child_by_field_name(decl, "value", TS_LSP_FIELD_LEN("value"));
+            TSNode name = ts_node_child_by_field_name(decl, "name", TS_LSP_FIELD_LEN("name"));
+            if (node_kind_is(name, "identifier") && ts_is_function_value(value)) {
+                const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn,
+                                                 node_text(ctx, name));
+                process_function_body(ctx, value, qn, NULL);
+            } else {
+                process_node(ctx, value);
+            }
+        }
+        return;
+    }
+    process_node(ctx, node);
+}
+
 void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
-    if (!ctx || ts_node_is_null(root))
-        return;
-    if (ctx->dts_mode)
+    if (!ctx || ts_node_is_null(root) || ctx->dts_mode)
         return;
 
-    // Collect top-level children once (O(n)); both passes reuse the array.
-    // See collect_children: indexing ts_node_child(root,i) here would be O(n²).
-    uint32_t kn = 0;
-    TSNode *kids = collect_children(ctx->arena, root, &kn);
+    ts_prepare_module_callables(ctx, root);
+    uint32_t count = 0;
+    TSNode *children = collect_children(ctx->arena, root, &count);
+    for (uint32_t i = 0; i < count; i++)
+        bind_module_declaration(ctx, children[i]);
 
-    // Pass 1: bind module-level declarations into root scope.
-    for (uint32_t i = 0; i < kn; i++) {
-        TSNode child = kids[i];
-        const char *kind = ts_node_type(child);
-        if (strcmp(kind, "lexical_declaration") == 0 || strcmp(kind, "variable_declaration") == 0) {
-            ts_process_statement(ctx, child);
-        }
-    }
-
-    // Pass 2: process functions, methods, and class bodies.
-    for (uint32_t i = 0; i < kn; i++) {
-        TSNode child = kids[i];
-        const char *kind = ts_node_type(child);
-
-        if (strcmp(kind, "lexical_declaration") == 0 || strcmp(kind, "variable_declaration") == 0) {
-            process_top_level_variable_arrows(ctx, child);
-        } else if (strcmp(kind, "function_declaration") == 0) {
-            TSNode name = ts_node_child_by_field_name(child, "name", TS_LSP_FIELD_LEN("name"));
-            if (ts_node_is_null(name) || !ctx->module_qn)
-                continue;
-            char *fn = node_text(ctx, name);
-            if (!fn)
-                continue;
-            const char *fqn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, fn);
-            process_function_body(ctx, child, fqn, NULL);
-        } else if (strcmp(kind, "class_declaration") == 0 || strcmp(kind, "internal_module") == 0) {
-            process_node(ctx, child);
-        } else if (strcmp(kind, "expression_statement") == 0) {
-            /* tree-sitter-typescript wraps a namespace declaration in an
-             * expression_statement. Unwrap only that declaration shape;
-             * ordinary top-level expressions are not owned by a function. */
-            uint32_t count = ts_node_named_child_count(child);
-            for (uint32_t j = 0; j < count; j++) {
-                TSNode inner = ts_node_named_child(child, j);
-                if (node_kind_is(inner, "internal_module"))
-                    process_node(ctx, inner);
-            }
-        } else if (strcmp(kind, "export_statement") == 0) {
-            // Walk the wrapped declaration.
-            uint32_t enc = ts_node_named_child_count(child);
-            for (uint32_t j = 0; j < enc; j++) {
-                TSNode inner = ts_node_named_child(child, j);
-                if (ts_node_is_null(inner))
-                    continue;
-                const char *ik = ts_node_type(inner);
-                if (strcmp(ik, "function_declaration") == 0) {
-                    TSNode name =
-                        ts_node_child_by_field_name(inner, "name", TS_LSP_FIELD_LEN("name"));
-                    if (ts_node_is_null(name) || !ctx->module_qn)
-                        continue;
-                    char *fn = node_text(ctx, name);
-                    if (!fn)
-                        continue;
-                    const char *fqn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, fn);
-                    process_function_body(ctx, inner, fqn, NULL);
-                } else if (strcmp(ik, "lexical_declaration") == 0 ||
-                           strcmp(ik, "variable_declaration") == 0) {
-                    process_top_level_variable_arrows(ctx, inner);
-                } else if (strcmp(ik, "class_declaration") == 0 ||
-                           strcmp(ik, "internal_module") == 0) {
-                    process_node(ctx, inner);
-                }
-            }
-        }
-        // Other top-level expression_statement bodies are not graphed as functions.
-    }
+    /* A callback without a named ancestor belongs to the module. The exact
+     * call-site rebind gives nested named callables their extracted identity.
+     * Every statement is visited here once, including initializers and test
+     * registration callbacks; there is no second generic root walk. */
+    const char *saved_func = ctx->enclosing_func_qn;
+    ctx->enclosing_func_qn = ctx->module_qn;
+    for (uint32_t i = 0; i < count; i++)
+        process_module_statement(ctx, children[i]);
+    ctx->enclosing_func_qn = saved_func;
 }
 
 // ── Initialization ────────────────────────────────────────────────────────────
@@ -6217,6 +6388,7 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
         }
     }
     ts_lsp_collect_import_aliases(&ctx, root);
+    ts_prepare_module_callables(&ctx, root);
 
     ast_sweep_shapes(&ctx, root, &reg);
     refine_ast_signatures(&ctx, root, &reg);
@@ -6471,6 +6643,7 @@ void cbm_run_ts_lsp_cross_with_registry(CBMArena *arena, const char *source, int
         }
     }
     ts_lsp_collect_import_aliases(&ctx, root);
+    ts_prepare_module_callables(&ctx, root);
 
     ast_sweep_shapes(&ctx, root, &overlay);
     refine_ast_signatures(&ctx, root, &overlay);
@@ -6687,6 +6860,7 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
         }
     }
     ts_lsp_collect_import_aliases(&ctx, root);
+    ts_prepare_module_callables(&ctx, root);
 
     ast_sweep_shapes(&ctx, root, &reg);
     refine_ast_signatures(&ctx, root, &reg);

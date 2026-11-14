@@ -26,6 +26,9 @@ typedef struct {
     int source_len;
     const CBMTypeRegistry *registry;
     CBMScope *current_scope;
+    // Exact module/namespace callable bindings from syntax. A flat registry
+    // entry alone does not prove that an object member is a free function.
+    CBMScope *module_callables;
 
     // Import map: local_name -> module QN (resolved or opaque).
     // Parallel arrays of length import_count.
