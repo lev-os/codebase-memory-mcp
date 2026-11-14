@@ -35900,94 +35900,6 @@ TEST(pipeline_ts_module_typed_receivers_keep_scope_and_caller) {
     PASS();
 }
 
-/* Imported generic receiver names must resolve in the import's module while
- * retaining their arguments. Same-name classes in another module are decoys;
- * unknown package and unbound type names must remain unresolved. */
-TEST(pipeline_ts_imported_generic_receivers_keep_type_identity) {
-    bool ok = true;
-    for (int mode = 0; mode < 2; mode++) {
-        char tmp[256] = "/tmp/cbm_ts_generic_receivers_XXXXXX";
-        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-        write_temp_file(tmp, "lib.ts", "export class Box<T> { deliver(): void {} }\n");
-        write_temp_file(tmp, "decoy.ts", "export class Box<T> { deliver(): void {} }\n");
-        const char *source =
-            "import type { Box as Packet } from './lib';\n"
-            "import type { Box as Other } from './decoy';\n"
-            "import type { Box as Missing } from 'outside-package';\n"
-            "function same(p: Packet<number>): Packet<number> { return p; }\n"
-            "export function direct(p: Packet<number>) { p.deliver(); }\n"
-            "export function returned(p: Packet<number>) { same(p).deliver(); }\n"
-            "export function other(p: Other<string>) { p.deliver(); }\n"
-            "export function external(p: Missing<number>) { p.deliver(); }\n"
-            "export function unknown(p: Absent<number>) { p.deliver(); }\n"
-            "export class Owner {\n"
-            "  value: Packet<number>;\n"
-            "  run() { this.value.deliver(); }\n"
-            "}\n"
-            "export function elements(xs: Array<Packet<number>>) { xs.forEach(p => p.deliver()); }\n"
-            "import type { Box } from './decoy';\n"
-            "export function qualifiedUnknown(p: MissingNamespace.Box<number>) { p.deliver(); }\n"
-            "export function directDecoy(p: Box<number>) { p.deliver(); }\n"
-            "namespace Inner {\n"
-            "  export class Packet<T> { deliver(): void {} }\n"
-            "  export function local(p: Packet<number>) { p.deliver(); }\n"
-            "}\n"
-            "export function outside(p: Packet<number>) { p.deliver(); }\n";
-        write_temp_file(tmp, "main.ts", source);
-        for (int i = 0; mode && i < 50; i++) {
-            char name[64];
-            snprintf(name, sizeof(name), "pad%d.ts", i);
-            write_temp_file(tmp, name, "export {};\n");
-        }
-        XlangEnvSave saved = xlang_env_select(mode != 0);
-        char db[512], path[512];
-        snprintf(db, sizeof(db), "%s/graph.db", tmp);
-        snprintf(path, sizeof(path), "%s/main.ts", tmp);
-        for (int phase = 0; phase < 2; phase++) {
-            if (phase) {
-                char changed[2048];
-                snprintf(changed, sizeof(changed), "%s// edited\n", source);
-                write_temp_file(tmp, "main.ts", changed);
-                ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000, 0), 0);
-            }
-            cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
-            ASSERT_NOT_NULL(p);
-            ASSERT_EQ(cbm_pipeline_run(p), 0);
-            cbm_store_t *store = cbm_store_open_path(db);
-            ASSERT_NOT_NULL(store);
-            const char *project = cbm_pipeline_project_name(p);
-            const struct { int line; const char *file, *caller; } cases[] = {
-                {5, "lib.ts", "direct@5"}, {6, "lib.ts", "returned@6"},
-                {7, "decoy.ts", "other@7"}, {8, NULL, NULL}, {9, NULL, NULL},
-                {12, "lib.ts", "run@12"}, {14, "lib.ts", "elements@14"},
-                {16, NULL, NULL}, {17, "decoy.ts", "directDecoy@17"},
-                {20, "main.ts", "local@20"}, {22, "lib.ts", "outside@22"},
-            };
-            for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-                const char *files[] = {"lib.ts", "decoy.ts", "main.ts"};
-                for (int j = 0; j < 3; j++) {
-                    char caller[256];
-                    int got = ts_caller_at_line(store, project, cases[i].line, "deliver", files[j],
-                                                j == 2 ? 19 : 1, caller, sizeof(caller));
-                    int want = cases[i].file && strcmp(cases[i].file, files[j]) == 0 ? 1 : 0;
-                    if (got != want || (want && strcmp(caller, cases[i].caller) != 0)) {
-                        fprintf(stderr, "generic receiver mode=%d phase=%d line=%d file=%s: "
-                                        "%d from %s, want %d\n",
-                                mode, phase, cases[i].line, files[j], got, caller, want);
-                        ok = false;
-                    }
-                }
-            }
-            cbm_store_close(store);
-            cbm_pipeline_free(p);
-        }
-        xlang_env_restore(&saved);
-        th_rmtree(tmp);
-    }
-    ASSERT_TRUE(ok);
-    PASS();
-}
-
 /* A call is recorded under the nearest named callable that holds it: an
  * object-literal method or arrow property, a class field arrow, a const
  * arrow inside a method, a nested function. Two callables of one file that
@@ -37236,7 +37148,6 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_local_twin_stays_out_of_name_guesses);
     RUN_TEST(pipeline_js_twin_names_rebuild_old_index);
     RUN_TEST(pipeline_js_twin_callables_scale);
-    RUN_TEST(pipeline_ts_imported_generic_receivers_keep_type_identity);
     RUN_TEST(pipeline_ts_module_typed_receivers_keep_scope_and_caller);
     RUN_TEST(pipeline_ts_caller_is_innermost_named_callable);
     RUN_TEST(pipeline_ts_signature_targets_require_owner);

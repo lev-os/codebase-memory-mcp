@@ -1803,11 +1803,8 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      Unchanged files rebuild once to gain their type-resolved call edges.
  *  19: TS/JS module statements and callbacks gain scoped typed-receiver calls.
  *      Unchanged files rebuild once to recover those edges.
- *  20: TS type imports preserve qualification and local type shadowing;
- *      generic instances use the exact receiver method index. Unchanged
- *      files rebuild once to gain their typed-receiver call edges.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 20 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 19 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
