@@ -2429,6 +2429,21 @@ static bool ts_lookup_visit_named(CBMArena *arena, TSLookupState *state, const c
     return true;
 }
 
+/* null, undefined, void and never hold no object, so a call never reaches
+ * them through a union. */
+static bool ts_type_is_empty_value(const CBMType *t) {
+    if (!t || t->kind != CBM_TYPE_BUILTIN || !t->data.builtin.name)
+        return false;
+    const char *name = t->data.builtin.name;
+    return strcmp(name, "null") == 0 || strcmp(name, "undefined") == 0 ||
+           strcmp(name, "void") == 0 || strcmp(name, "never") == 0;
+}
+
+static bool ts_same_func(const CBMRegisteredFunc *a, const CBMRegisteredFunc *b) {
+    return a == b || (a->qualified_name && b->qualified_name &&
+                      strcmp(a->qualified_name, b->qualified_name) == 0);
+}
+
 static const CBMType *lookup_member_type_at(TSLSPContext *ctx, const CBMType *recv,
                                             const char *name, int depth, TSLookupState *state);
 
@@ -2513,20 +2528,33 @@ static const CBMType *lookup_member_type_at(TSLSPContext *ctx, const CBMType *re
         return cbm_type_unknown();
     }
 
+    /* The member of a union is the union of each branch's member: one type
+     * when the branches agree, and unknown when a branch does not prove one.
+     * A call on it then needs one target from every branch. */
     if (base->kind == CBM_TYPE_UNION) {
-        // Try each branch; if any has the member, return that. (Pragmatic v1 — returns
-        // first hit instead of building a union of results.)
-        if (base->data.union_type.members) {
-            for (int i = 0; i < base->data.union_type.count; i++) {
-                if (depth + 1 >= TS_LSP_MAX_MEMBER_DEPTH)
-                    break;
-                const CBMType *m = lookup_member_type_at(ctx, base->data.union_type.members[i],
-                                                         name, depth + 1, state);
-                if (!cbm_type_is_unknown(m))
-                    return m;
-            }
+        int count = base->data.union_type.count;
+        if (!base->data.union_type.members || count <= 0 ||
+            depth + 1 >= TS_LSP_MAX_MEMBER_DEPTH)
+            return cbm_type_unknown();
+        const CBMType **found =
+            (const CBMType **)cbm_arena_alloc(ctx->arena, (size_t)count * sizeof(*found));
+        if (!found)
+            return cbm_type_unknown();
+        int n = 0;
+        int visited_mark = state->visited_count;
+        for (int i = 0; i < count; i++) {
+            const CBMType *member = base->data.union_type.members[i];
+            if (ts_type_is_empty_value(member))
+                continue;
+            state->visited_count = visited_mark;
+            const CBMType *m = lookup_member_type_at(ctx, member, name, depth + 1, state);
+            if (!m || cbm_type_is_unknown(m))
+                return cbm_type_unknown();
+            found[n++] = m;
         }
-        return cbm_type_unknown();
+        if (n == 0)
+            return cbm_type_unknown();
+        return n == 1 ? found[0] : cbm_type_union(ctx->arena, found, n);
     }
 
     if (base->kind == CBM_TYPE_INTERSECTION) {
@@ -2741,18 +2769,34 @@ static const CBMRegisteredFunc *lookup_method_at(TSLSPContext *ctx, const CBMTyp
         return lookup_method_at(ctx, named, method_name, depth + 1, state);
     }
 
+    /* A union proves a target only when every member that can hold a value
+     * resolves the method to the same declaration. An intersection needs
+     * the members that hold the method to agree. */
     if (base->kind == CBM_TYPE_UNION || base->kind == CBM_TYPE_INTERSECTION) {
-        if (base->data.union_type.members) {
-            for (int i = 0; i < base->data.union_type.count; i++) {
-                if (depth + 1 >= TS_LSP_MAX_MEMBER_DEPTH)
-                    break;
-                const CBMRegisteredFunc *f = lookup_method_at(ctx, base->data.union_type.members[i],
-                                                              method_name, depth + 1, state);
-                if (f)
-                    return f;
+        bool every = base->kind == CBM_TYPE_UNION;
+        const CBMRegisteredFunc *agreed = NULL;
+        if (!base->data.union_type.members || depth + 1 >= TS_LSP_MAX_MEMBER_DEPTH)
+            return NULL;
+        /* Each member walks from the same visited types (the ancestors), so a
+         * base two members share is not refused to the second one. */
+        int visited_mark = state->visited_count;
+        for (int i = 0; i < base->data.union_type.count; i++) {
+            const CBMType *member = base->data.union_type.members[i];
+            state->visited_count = visited_mark;
+            if (every && ts_type_is_empty_value(member))
+                continue;
+            const CBMRegisteredFunc *f =
+                lookup_method_at(ctx, member, method_name, depth + 1, state);
+            if (!f) {
+                if (every)
+                    return NULL;
+                continue;
             }
+            if (agreed && !ts_same_func(agreed, f))
+                return NULL;
+            agreed = f;
         }
-        return NULL;
+        return agreed;
     }
 
     if (base->kind != CBM_TYPE_NAMED)
@@ -4335,6 +4379,52 @@ static bool extract_narrowing(TSLSPContext *ctx, TSNode condition, const char **
     return false;
 }
 
+/* The type of name where a narrowing test failed: its union without the
+ * members the test proves (`x instanceof A` removes A, `typeof x ===
+ * 'string'` removes string). NULL when the test removes no member, or all. */
+static const CBMType *ts_narrow_excluding(TSLSPContext *ctx, const char *name,
+                                          const CBMType *matched) {
+    const CBMType *current = ts_lookup_binding_type(ctx, name);
+    const CBMType *u = current ? simplify_type(ctx, current) : NULL;
+    if (!u || u->kind != CBM_TYPE_UNION || !u->data.union_type.members || !matched)
+        return NULL;
+    int count = u->data.union_type.count;
+    if (count <= 0)
+        return NULL;
+    const CBMType *want = simplify_type(ctx, matched);
+    const CBMType **rest =
+        (const CBMType **)cbm_arena_alloc(ctx->arena, (size_t)count * sizeof(*rest));
+    if (!rest)
+        return NULL;
+    int n = 0;
+    for (int i = 0; i < count; i++) {
+        const CBMType *member = u->data.union_type.members[i];
+        const CBMType *simple = simplify_type(ctx, member);
+        if (cbm_type_equal(member, matched) || (simple && want && cbm_type_equal(simple, want)))
+            continue;
+        rest[n++] = member;
+    }
+    if (n == 0 || n == count)
+        return NULL;
+    return n == 1 ? rest[0] : cbm_type_union(ctx->arena, rest, n);
+}
+
+/* Walk one branch of an if statement, with name bound to type when known. */
+static void ts_walk_narrowed(TSLSPContext *ctx, TSNode branch, const char *name,
+                             const CBMType *type) {
+    if (ts_node_is_null(branch))
+        return;
+    if (!name || !type) {
+        process_node(ctx, branch);
+        return;
+    }
+    CBMScope *saved = ctx->current_scope;
+    ctx->current_scope = cbm_scope_push(ctx->arena, saved);
+    cbm_scope_bind(ctx->current_scope, name, type);
+    process_node(ctx, branch);
+    ctx->current_scope = saved;
+}
+
 // Look up a union member that satisfies a discriminant: when narrowed via `x.kind ===
 // 'foo'`, find the member of x's type whose `kind` property is the literal 'foo'.
 // Returns NULL if no match. Pragmatic v1: only handles `member_expression === string`.
@@ -4848,33 +4938,12 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
             }
         }
 
-        // Walk consequence with narrowed binding (for the truthy branch unless inverted).
-        if (!ts_node_is_null(consequence)) {
-            if (ok && nv && nt && !inverted) {
-                CBMScope *saved = ctx->current_scope;
-                ctx->current_scope = cbm_scope_push(ctx->arena, saved);
-                cbm_scope_bind(ctx->current_scope, nv, nt);
-                process_node(ctx, consequence);
-                ctx->current_scope = saved;
-            } else {
-                process_node(ctx, consequence);
-            }
-        }
-
-        // Walk alternative with negated narrowing for typeof case (instanceof+union
-        // narrowing inverse is harder — skip).
-        if (!ts_node_is_null(alt)) {
-            if (ok && nv && nt && inverted) {
-                CBMScope *saved = ctx->current_scope;
-                ctx->current_scope = cbm_scope_push(ctx->arena, saved);
-                cbm_scope_bind(ctx->current_scope, nv, nt);
-                process_node(ctx, alt);
-                ctx->current_scope = saved;
-            } else {
-                process_node(ctx, alt);
-            }
-        }
-
+        /* The branch where the test holds gets the narrowed type; the other
+         * branch gets the union without the members the test proves. */
+        bool narrowed = ok && nv && nt;
+        const CBMType *rest = narrowed ? ts_narrow_excluding(ctx, nv, nt) : NULL;
+        ts_walk_narrowed(ctx, consequence, nv, narrowed ? (inverted ? rest : nt) : NULL);
+        ts_walk_narrowed(ctx, alt, nv, narrowed ? (inverted ? nt : rest) : NULL);
         return; // Skip default recurse.
     }
 

@@ -35932,7 +35932,9 @@ TEST(pipeline_ts_imported_generic_receivers_keep_type_identity) {
             "  export class Packet<T> { deliver(): void {} }\n"
             "  export function local(p: Packet<number>) { p.deliver(); }\n"
             "}\n"
-            "export function outside(p: Packet<number>) { p.deliver(); }\n";
+            "export function outside(p: Packet<number>) { p.deliver(); }\n"
+            "export function both(p: Packet<number> | Other<number>) { p.deliver(); }\n"
+            "export function nullable(p: Packet<number> | null) { p.deliver(); }\n";
         write_temp_file(tmp, "main.ts", source);
         for (int i = 0; mode && i < 50; i++) {
             char name[64];
@@ -35962,6 +35964,7 @@ TEST(pipeline_ts_imported_generic_receivers_keep_type_identity) {
                 {12, "lib.ts", "run@12"}, {14, "lib.ts", "elements@14"},
                 {16, NULL, NULL}, {17, "decoy.ts", "directDecoy@17"},
                 {20, "main.ts", "local@20"}, {22, "lib.ts", "outside@22"},
+                {23, NULL, NULL}, {24, "lib.ts", "nullable@24"},
             };
             for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
                 const char *files[] = {"lib.ts", "decoy.ts", "main.ts"};

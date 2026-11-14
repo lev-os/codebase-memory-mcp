@@ -875,11 +875,19 @@ TEST(tslsp_literal_string_union) {
 /* ── Category 16: union deeper ─────────────────────────────────────────────── */
 
 TEST(tslsp_union_common_method) {
+    /* A.run and B.run are two declarations, so a call on A | B proves
+     * neither. A method both members inherit from one declaration is the
+     * target. */
     CBMFileResult *r = extract_ts("interface A { run(): void; }\n"
                                   "interface B { run(): void; }\n"
-                                  "function go(x: A | B) { x.run(); }\n");
+                                  "function go(x: A | B) { x.run(); }\n"
+                                  "class Base { stop(): void {} }\n"
+                                  "class C extends Base {}\n"
+                                  "class D extends Base {}\n"
+                                  "function halt(x: C | D) { x.stop(); }\n");
     ASSERT_NOT_NULL(r);
-    ASSERT_GTE(require_resolved(r, ".go", "run"), 0);
+    ASSERT_LT(find_resolved(r, ".go", "run"), 0);
+    ASSERT_GTE(require_resolved(r, ".halt", "Base.stop"), 0);
     cbm_free_result(r);
     PASS();
 }
@@ -1749,9 +1757,13 @@ TEST(tslsp_discriminated_union_method) {
     CBMFileResult *r =
         extract_ts("interface Circle { kind: 'circle'; radius: number; render(): void; }\n"
                    "interface Square { kind: 'square'; side: number; render(): void; }\n"
-                   "function go(s: Circle | Square) { s.render(); }\n");
+                   "function go(s: Circle | Square) { s.render(); }\n"
+                   "function draw(s: Circle | Square) { if (s.kind === 'circle') s.render(); }\n");
     ASSERT_NOT_NULL(r);
-    ASSERT_GTE(require_resolved(r, ".go", "render"), 0);
+    /* Circle.render and Square.render are two declarations: the whole union
+     * proves neither, and the discriminant proves Circle's. */
+    ASSERT_LT(find_resolved(r, ".go", "render"), 0);
+    ASSERT_GTE(require_resolved(r, ".draw", "Circle.render"), 0);
     cbm_free_result(r);
     PASS();
 }
@@ -4963,7 +4975,8 @@ TEST(tslsp_relater_union_member_dispatch) {
                    "function go(x: FileLogger | ConsoleLogger) { emit(x); x.log(); }\n");
     ASSERT_NOT_NULL(r);
     ASSERT_GTE(require_resolved(r, ".go", "emit"), 0);
-    ASSERT_GTE(require_resolved(r, ".go", "log"), 0);
+    /* FileLogger.log and ConsoleLogger.log are two declarations. */
+    ASSERT_LT(find_resolved(r, ".go", ".log"), 0);
     cbm_free_result(r);
     PASS();
 }
@@ -5619,7 +5632,56 @@ TEST(tslsp_var_hoists_to_function_scope) {
     PASS();
 }
 
+/* A call on a union or intersection receiver has a target only when every
+ * member that can hold the method proves the same declaration. */
+TEST(tslsp_union_receiver_needs_one_target) {
+    const char *source =
+        "class Port { send() {} }\n"
+        "class Decoy { send() {} }\n"
+        "class Base { send() {} }\n"
+        "class A extends Base {}\n"
+        "class B extends Base {}\n"
+        "function u1(p: Port | Decoy) { p.send(); }\n"
+        "function u2(p: A | B) { p.send(); }\n"
+        "function u3(p: Port | null) { p.send(); }\n"
+        "function u4(p?: Port) { p.send(); }\n"
+        "function u5(p: Port & { extra: number }) { p.send(); }\n"
+        "function u6(p: Port | undefined | Decoy) { p.send(); }\n"
+        "function u7(p: Port & Decoy) { p.send(); }\n"
+        "function u8(p: Port | Missing) { p.send(); }\n"
+        "class Packet<T> { send() {} }\n"
+        "class Other<T> { send() {} }\n"
+        "function g1(p: Packet<number> | Other<number>) { p.send(); }\n"
+        "function g2(p: Packet<number> | null) { p.send(); }\n"
+        "function g3(p: Packet<number> | Packet<string>) { p.send(); }\n"
+        "class HasPort { port: Port; }\n"
+        "class HasDecoy { port: Decoy; }\n"
+        "class AlsoPort { port: Port; }\n"
+        "function m1(h: HasPort | HasDecoy) { h.port.send(); }\n"
+        "function m2(h: HasPort | null) { h.port.send(); }\n"
+        "function m3(h: HasPort | AlsoPort) { h.port.send(); }\n";
+    const TsLineTarget cases[] = {
+        {6, NULL},
+        {7, "test.main.Base.send"},
+        {8, "test.main.Port.send"},
+        {9, "test.main.Port.send"},
+        {10, "test.main.Port.send"},
+        {11, NULL},
+        {12, NULL},
+        {13, NULL},
+        {16, NULL},
+        {17, "test.main.Packet.send"},
+        {18, "test.main.Packet.send"},
+        {22, NULL},
+        {23, "test.main.Port.send"},
+        {24, "test.main.Port.send"},
+    };
+    ASSERT_TRUE(ts_check_line_targets("union", source, cases, sizeof(cases) / sizeof(cases[0])));
+    PASS();
+}
+
 SUITE(ts_lsp) {
+    RUN_TEST(tslsp_union_receiver_needs_one_target);
     RUN_TEST(tslsp_var_hoists_to_function_scope);
     RUN_TEST(tslsp_destructured_names_shadow_outer_receiver);
     RUN_TEST(tslsp_reassignment_replaces_receiver_type);
