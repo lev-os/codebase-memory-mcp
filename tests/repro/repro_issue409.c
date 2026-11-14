@@ -1,59 +1,9 @@
 /*
- * repro_issue409.c — Reproduce-first case for OPEN bug #409.
- *
- * Issue #409: "v0.7.0 install/update wires the legacy blocking PreToolUse
- * gate, not hook_augment (regresses #214)"
- *
- * Root cause (as filed):
- *   cbm_install_hook_gate_script wrote the legacy blocking shell gate
- *   (keyed on $PPID, emitting `exit 2` to block tool calls) instead of the
- *   non-blocking augmenter shim that delegates to `<binary> hook-augment`.
- *   On an upgrade from a pre-v0.7.0 install the old gate script remained on
- *   disk (or was rewritten with blocking content), so every Grep/Glob call
- *   was blocked rather than being non-blocking augmented — the exact symptom
- *   of #214 which was supposed to be fixed.
- *
- * Expected (correct) behaviour after cbm_upsert_claude_hooks +
- * cbm_install_hook_gate_script:
- *   1. The gate script written to
- *      <home>/.claude/hooks/cbm-code-discovery-gate
- *      MUST contain "hook-augment" (delegating to the compiled augmenter).
- *   2. The gate script MUST NOT contain "PPID" (the $PPID-keyed blocking
- *      logic) or "exit 2" (the blocking exit code).
- *   3. The settings.json PreToolUse command must reference
- *      "cbm-code-discovery-gate" (the shim), not an inline blocking script.
- *
- * Actual (buggy) behaviour (if bug is present):
- *   The gate script still contains $PPID and exit 2; the assertions below
- *   that check for absence of "PPID" and "exit 2" FAIL -> RED.
- *
- * Upgrade scenario tested here (NOT covered by existing tests):
- *   This test simulates an upgrade from a pre-v0.7.0 install by:
- *     a) Pre-seeding the gate-script path with the OLD blocking content
- *        (containing $PPID and exit 2) — as would be present on disk after
- *        a pre-v0.7.0 install.
- *     b) Pre-seeding settings.json with a stale CMM hook entry using the
- *        old "Grep|Glob|Read" matcher and an old command string.
- *   Then running both cbm_upsert_claude_hooks + cbm_install_hook_gate_script
- *   (the actual install/update code path) and asserting the CORRECT result.
- *
- *   This is the critical gap: existing tests call cbm_install_hook_gate_script
- *   into an EMPTY directory (no pre-existing script).  The upgrade path
- *   (old script on disk) was not verified to be overwritten correctly.
- *
- * Relationship to existing tests:
- *   cli_hook_gate_script_no_predictable_tmp_issue384 (test_cli.c:2196):
- *     Tests cbm_install_hook_gate_script in isolation on a fresh dir.
- *     Does NOT test the upgrade/overwrite scenario.
- *   cli_upsert_claude_hook_fresh (test_cli.c:2167):
- *     Tests cbm_upsert_claude_hooks in isolation on fresh settings.json.
- *     Does NOT test the integrated (both calls) upgrade path.
- *
- * NOTE (2026-06-26): Code review of the current codebase shows that
- * cbm_install_hook_gate_script already uses fopen(path, "w") (truncate)
- * and writes the non-blocking shim. If this test is GREEN it means the bug
- * is fixed on main and the issue can be closed (the test then acts as a
- * permanent regression guard for this upgrade scenario).
+ * Regression guard for #409: an upgraded installer-owned hook must use the
+ * non-blocking augmenter. The installer now recognizes owned bytes instead
+ * of overwriting any file at the reserved path (#1387). First prove that the
+ * old synthetic blocking script is preserved as unowned; then migrate the
+ * released augmenter script and check the current search-hook wiring.
  */
 
 #include <foundation/compat.h>
@@ -134,8 +84,27 @@ static int rp409_mkdirp(const char *path) {
  *              cbm_install_hook_gate_script(home, binary_path)
  * (the same two calls made by install_claude_code_config in cli.c).
  */
+/* Keep an inherited CLAUDE_CONFIG_DIR from redirecting this fixture. */
+static bool rp409_install_gate(const char *home, const char *binary) {
+    const char *prior = getenv("CLAUDE_CONFIG_DIR");
+    char *saved = prior ? cbm_strdup(prior) : NULL;
+    if (prior && !saved)
+        return false;
+    char config[512];
+    snprintf(config, sizeof(config), "%s/.claude", home);
+    cbm_setenv("CLAUDE_CONFIG_DIR", config, 1);
+    bool ok = cbm_install_hook_gate_script(home, binary);
+    if (saved) {
+        cbm_setenv("CLAUDE_CONFIG_DIR", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CLAUDE_CONFIG_DIR");
+    }
+    return ok;
+}
+
 TEST(repro_issue409_install_wires_hook_augment_not_blocking_gate) {
-    /* Create a temp HOME directory tree that simulates a pre-v0.7.0 install. */
+    /* Create a private installation directory. */
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/rp409-XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
@@ -147,22 +116,32 @@ TEST(repro_issue409_install_wires_hook_augment_not_blocking_gate) {
     if (rp409_mkdirp(hooks_dir) != 0)
         FAIL("mkdirp hooks_dir failed");
 
-    /* Pre-seed the gate script with the OLD blocking content that the issue
-     * reporter observed on v0.7.0.  This is the content that must be
-     * overwritten (truncated) by cbm_install_hook_gate_script. */
     char script_path[512];
-    snprintf(script_path, sizeof(script_path),
-             "%s/cbm-code-discovery-gate", hooks_dir);
-    rp409_write_file(script_path,
+    snprintf(script_path, sizeof(script_path), "%s/cbm-code-discovery-gate", hooks_dir);
+    const char *binary = "/usr/local/bin/codebase-memory-mcp";
+    static const char unowned[] =
         "#!/bin/bash\n"
-        "# Gate hook: nudges Claude toward codebase-memory-mcp for code discovery.\n"
-        "# First Grep/Glob/Read per session -> block. Subsequent -> allow.\n"
-        "# PPID = Claude Code process PID, unique per session.\n"
         "GATE=/tmp/cbm-code-discovery-gate-$PPID\n"
         "if [ -f \"$GATE\" ]; then exit 0; fi\n"
         "touch \"$GATE\"\n"
-        "echo 'BLOCKED: use codebase-memory-mcp' >&2\n"
-        "exit 2\n");
+        "exit 2\n";
+    ASSERT_EQ(rp409_write_file(script_path, unowned), 0);
+    ASSERT_FALSE(rp409_install_gate(tmpdir, binary));
+    ASSERT_STR_EQ(rp409_read_file(script_path), unowned);
+
+    /* Exact released installer bytes, also covered by the CLI upgrade tests.
+     * A hand-written approximation is deliberately not an owned document. */
+    static const char released[] =
+        "#!/usr/bin/env bash\n"
+        "# codebase-memory-mcp search augmenter (Claude Code PreToolUse).\n"
+        "# NOTE: the legacy filename is kept for zero-migration upgrades.\n"
+        "# Despite the name this NEVER blocks a tool call - it only adds\n"
+        "# graph context. Any failure is silent (exit 0, no output).\n"
+        "BIN=\"/usr/local/bin/codebase-memory-mcp\"\n"
+        "[ -x \"$BIN\" ] || exit 0\n"
+        "\"$BIN\" hook-augment 2>/dev/null\n"
+        "exit 0\n";
+    ASSERT_EQ(rp409_write_file(script_path, released), 0);
 
     /* Pre-seed settings.json with a stale CMM hook entry (old matcher). */
     char settings_path[512];
@@ -178,11 +157,15 @@ TEST(repro_issue409_install_wires_hook_augment_not_blocking_gate) {
      * install_claude_code_config in src/cli/cli.c lines 3045-3046). */
     int rc = cbm_upsert_claude_hooks(settings_path);
     ASSERT_EQ(rc, 0);
-    cbm_install_hook_gate_script(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    ASSERT_TRUE(rp409_install_gate(tmpdir, binary));
+#ifdef _WIN32
+    snprintf(script_path, sizeof(script_path), "%s/cbm-code-discovery-gate.cmd", hooks_dir);
+#endif
 
     /* ── Assert the gate script was OVERWRITTEN with the non-blocking shim ── */
     const char *script_data = rp409_read_file(script_path);
     ASSERT_NOT_NULL(script_data);
+    ASSERT_STR_NEQ(script_data, released);
 
     /* MUST NOT contain $PPID: the old blocking gate used
      * /tmp/cbm-code-discovery-gate-$PPID as a per-invocation state file.
@@ -208,8 +191,8 @@ TEST(repro_issue409_install_wires_hook_augment_not_blocking_gate) {
 
     /* The old "Grep|Glob|Read" matcher (which gated Read calls, breaking
      * the read-before-edit invariant per issue #362) must have been replaced
-     * with the current "Grep|Glob" matcher. */
-    ASSERT(strstr(settings_data, "\"Grep|Glob\"") != NULL);
+     * with the current "Grep|Glob|Bash" search matcher. */
+    ASSERT(strstr(settings_data, "\"Grep|Glob|Bash\"") != NULL);
     ASSERT(strstr(settings_data, "Glob|Read") == NULL);
 
     th_rmtree(tmpdir);
