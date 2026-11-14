@@ -723,6 +723,88 @@ TEST(ei_alias_target_keeps_its_extension) {
     PASS();
 }
 
+/* CALLS edges from the function `caller` to the definition `callee` in
+ * `callee_file`; -1 when the caller is missing. */
+static int ei_calls_into(cbm_store_t *store, const char *project, const char *caller,
+                         const char *callee, const char *callee_file) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_name(store, project, caller, &nodes, &count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int64_t source_id = 0;
+    for (int i = 0; i < count; i++) {
+        if (nodes[i].label && strcmp(nodes[i].label, "Function") == 0) {
+            source_id = nodes[i].id;
+        }
+    }
+    cbm_store_free_nodes(nodes, count);
+    cbm_edge_t *edges = NULL;
+    int n = 0;
+    if (source_id == 0 ||
+        cbm_store_find_edges_by_source_type(store, source_id, "CALLS", &edges, &n) !=
+            CBM_STORE_OK) {
+        return -1;
+    }
+    int hits = 0;
+    for (int i = 0; i < n; i++) {
+        cbm_node_t target;
+        memset(&target, 0, sizeof(target));
+        if (cbm_store_find_node_by_id(store, edges[i].target_id, &target) != CBM_STORE_OK) {
+            continue;
+        }
+        if (target.name && strcmp(target.name, callee) == 0 && target.file_path &&
+            strcmp(target.file_path, callee_file) == 0) {
+            hits++;
+        }
+        cbm_node_free_fields(&target);
+    }
+    cbm_store_free_edges(edges, n);
+    return hits;
+}
+
+/* service.js owns the module name that service.ts shares, so an import of
+ * './service.ts' targets the File. A call through a namespace import or a
+ * require() binding must still reach the definition in that file, and never
+ * the same-named function elsewhere. The locals do not spell the file name,
+ * so only the binding can lead to `run`. */
+static int ei_file_target_namespace_case(int pad) {
+    EILangFile files[80] = {
+        {"src/service.js", "export function idle() { return 0; }\n"},
+        {"src/service.ts", "export function run() { return 1; }\n"},
+        {"decoy/run.ts", "export function run() { return 99; }\n"},
+        {"src/namespace.ts", "import * as api from './service.ts';\n"
+                             "export function viaNamespace() { return api.run(); }\n"},
+        {"src/required.ts", "const svc = require('./service.ts');\n"
+                            "export function viaRequire() { return svc.run(); }\n"},
+    };
+    static const char *const callers[] = {"viaNamespace", "viaRequire"};
+    char names[60][32];
+    int count = ei_pad_files(files, ei_count_files(files), names, pad);
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, files, count);
+    int ok = store != NULL;
+    for (size_t i = 0; store && i < sizeof(callers) / sizeof(callers[0]); i++) {
+        int hit = ei_calls_into(store, lp.project, callers[i], "run", "src/service.ts");
+        int decoy = ei_calls_into(store, lp.project, callers[i], "run", "decoy/run.ts");
+        if (hit != 1 || decoy != 0) {
+            fprintf(stderr, "  [CALLS pad=%d] %s -> run: service.ts=%d decoy=%d (want 1/0)\n",
+                    pad, callers[i], hit, decoy);
+            ok = 0;
+        }
+    }
+    ei_cleanup(&lp, store);
+    return ok;
+}
+
+TEST(ei_file_target_namespace_calls_reach_its_definitions) {
+    int sequential_ok = ei_file_target_namespace_case(0);
+    int parallel_ok = ei_file_target_namespace_case(60);
+    ASSERT_TRUE(sequential_ok);
+    ASSERT_TRUE(parallel_ok);
+    PASS();
+}
+
 /* #1682: extensionless dotted basenames are part of the module name.  The
  * resolver used to strip `.engine`, miss the module, and bind both imports to
  * the same-named fixture Function in the sibling spec file. */
@@ -3159,6 +3241,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_dynamic_imports_resolve_exact_modules);
     RUN_TEST(ei_hidden_directory_imports_resolve_exact_modules);
     RUN_TEST(ei_alias_target_keeps_its_extension);
+    RUN_TEST(ei_file_target_namespace_calls_reach_its_definitions);
     RUN_TEST(ei_relative_astro_css_imports_issue2558);
     RUN_TEST(ei_nix_parent_relative_import_issue2797);
     RUN_TEST(ei_thrift_parent_relative_import_issue2797);
