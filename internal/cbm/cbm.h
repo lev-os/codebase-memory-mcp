@@ -431,8 +431,9 @@ typedef struct {
                                      // rooted in an imported name. Read by the weak-member
                                      // guard and by the pxc synthetic-carrier dedup key in
                                      // pass_lsp_cross.c. Default false.
-    bool requires_lsp_resolution;    // synthetic semantic candidate (for example an implicit
-                                     // C++ operator). Never fall back to textual resolution.
+    bool requires_lsp_resolution;    // requires a type-aware answer (for example an implicit
+                                     // C++ operator or static `this` with an instance-only
+                                     // member). Never fall back to textual resolution.
     bool callee_is_locally_bound;    // bare call foo() whose callee identifier is bound as a
                                      // parameter of an enclosing function, so it cannot be the
                                      // module-level foo. Python: read by the weak-local-binding

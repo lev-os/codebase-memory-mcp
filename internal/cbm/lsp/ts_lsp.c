@@ -29,6 +29,7 @@
 #include "ts_lsp.h"
 #include "../../../src/foundation/platform.h"
 #include "../helpers.h"
+#include "../js_this.h"
 #include "../../../src/foundation/log.h"
 #include "../../../src/foundation/mem_core.h"
 #include <limits.h>
@@ -253,6 +254,35 @@ static bool node_kind_is(TSNode node, const char *kind) {
     if (ts_node_is_null(node))
         return false;
     return strcmp(ts_node_type(node), kind) == 0;
+}
+
+/* Resolve the named class at the actual expression, rather than the class
+ * whose body the walker entered. In particular a class expression inside a
+ * method has its own `this`, even during early return-type inference. */
+static const char *ts_class_qn(TSLSPContext *ctx, TSNode cls) {
+    if (!ctx->module_qn || ts_node_is_null(cls) ||
+        ts_node_is_null(ts_node_child_by_field_name(cls, "name", TS_LSP_FIELD_LEN("name"))))
+        return NULL;
+    const char *chain = NULL;
+    for (TSNode cur = cls; !ts_node_is_null(cur); cur = ts_node_parent(cur)) {
+        if (!node_kind_is(cur, "class_declaration") && !node_kind_is(cur, "class") &&
+            !node_kind_is(cur, "abstract_class_declaration"))
+            continue;
+        TSNode name = ts_node_child_by_field_name(cur, "name", TS_LSP_FIELD_LEN("name"));
+        char *text = ts_node_is_null(name) ? NULL : node_text(ctx, name);
+        if (text && text[0])
+            chain = chain ? cbm_arena_sprintf(ctx->arena, "%s.%s", text, chain) : text;
+    }
+    return chain ? cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, chain) : NULL;
+}
+
+static const CBMType *ts_this_type(TSLSPContext *ctx, TSNode node) {
+    TSNode cls;
+    CBMJsThis binding = cbm_js_this_binding(node, &cls);
+    if (binding != CBM_JS_THIS_INSTANCE)
+        return cbm_type_unknown();
+    const char *qn = ts_class_qn(ctx, cls);
+    return qn ? cbm_type_named(ctx->arena, qn) : cbm_type_unknown();
 }
 
 // Find the first named child of `node` whose kind matches one of the listed kinds.
@@ -2435,9 +2465,9 @@ const CBMType *ts_eval_expr_type(TSLSPContext *ctx, TSNode node) {
         if (name)
             result = type_of_identifier(ctx, name);
     } else if (strcmp(kind, "this") == 0) {
-        if (ctx->enclosing_class_qn) {
-            result = cbm_type_named(ctx->arena, ctx->enclosing_class_qn);
-        }
+        /* The registry resolves static `this` from the same binding facts.
+         * A class value must never be typed as an instance here. */
+        result = ts_this_type(ctx, node);
     } else if (strcmp(kind, "super") == 0) {
         if (ctx->enclosing_class_qn) {
             const CBMRegisteredType *rt =
@@ -3908,15 +3938,9 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
 
     // Class / interface declarations are walked by the registry pass; here we just dive
     // into method_definition bodies for inner call resolution.
-    if (strcmp(kind, "class_declaration") == 0) {
-        // Find the class name to set enclosing_class_qn for methods.
-        TSNode name = ts_node_child_by_field_name(node, "name", TS_LSP_FIELD_LEN("name"));
-        const char *class_qn = NULL;
-        if (!ts_node_is_null(name) && ctx->module_qn) {
-            char *cn = node_text(ctx, name);
-            if (cn)
-                class_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, cn);
-        }
+    if (strcmp(kind, "class_declaration") == 0 || strcmp(kind, "class") == 0 ||
+        strcmp(kind, "abstract_class_declaration") == 0) {
+        const char *class_qn = ts_class_qn(ctx, node);
         TSNode body = ts_node_child_by_field_name(node, "body", TS_LSP_FIELD_LEN("body"));
         if (!ts_node_is_null(body) && class_qn) {
             uint32_t nc = ts_node_named_child_count(body);

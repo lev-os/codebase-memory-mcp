@@ -1,5 +1,6 @@
 #include "callable_overload.h"
 #include "cbm.h"
+#include "js_this.h"
 #include "arena.h" // CBMArena, cbm_arena_sprintf
 #include "helpers.h"
 #include "lang_specs.h"
@@ -5359,21 +5360,6 @@ static TSNode js_receiver_root(TSNode obj) {
     return obj;
 }
 
-/* Whether a class member node (a method, a field, a static block) carries
- * the `static` keyword. */
-static bool js_member_is_static(TSNode member) {
-    if (strcmp(ts_node_type(member), "class_static_block") == 0) {
-        return true;
-    }
-    uint32_t n = ts_node_child_count(member);
-    for (uint32_t i = 0; i < n; i++) {
-        if (strcmp(ts_node_type(ts_node_child(member, i)), "static") == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
 /* The QN of the named class node `cls`, as the class node and its members
  * have it: the names of the classes and namespaces around it, outermost
  * first (cbm_enclosing_func_qn's rule). NULL for an unnamed class. */
@@ -5416,52 +5402,50 @@ static const char *js_class_extends(CBMExtractCtx *ctx, TSNode cls) {
     return ts_node_is_null(value) ? NULL : cbm_node_text(ctx->arena, value, ctx->source);
 }
 
-static bool js_this_binder_function(const char *k) {
-    return strcmp(k, "function_declaration") == 0 ||
-           strcmp(k, "generator_function_declaration") == 0 ||
-           strcmp(k, "function_expression") == 0 || strcmp(k, "function") == 0 ||
-           strcmp(k, "generator_function") == 0;
-}
-
-static bool js_this_binder_member(const char *k) {
-    return strcmp(k, "method_definition") == 0 || strcmp(k, "public_field_definition") == 0 ||
-           strcmp(k, "field_definition") == 0 || strcmp(k, "class_static_block") == 0;
-}
-
-/* What `this` is at the JS/TS call `call_node` (CBMJsThis): the nearest
- * enclosing code that binds `this`, arrows being transparent. A method,
- * field or static block of a class binds the instance or the class; a
- * non-arrow function or an object-literal method binds something else,
- * which inside a class is never that class (CBM_JS_THIS_OTHER). */
-static void js_this_binding(CBMExtractCtx *ctx, TSNode call_node, CBMCall *call) {
-    for (TSNode cur = ts_node_parent(call_node); !ts_node_is_null(cur); cur = ts_node_parent(cur)) {
-        const char *k = ts_node_type(cur);
-        bool member = js_this_binder_member(k);
-        if (!member && !js_this_binder_function(k)) {
-            if (strcmp(k, "program") == 0 || strcmp(k, "class_body") == 0) {
-                return; /* the module's `this`, or a computed key: no class binds it */
-            }
+/* A static receiver cannot call an instance-only member of its own class.
+ * The textual registry has no declaration-side static flag, so require a
+ * type-aware answer for this case instead of letting its plain-name fallback
+ * select the instance. An inherited static member may remain unresolved. */
+static bool js_static_this_instance_only(CBMExtractCtx *ctx, TSNode cls, const char *callee) {
+    if (!callee || strncmp(callee, "this.", 5) != 0)
+        return false;
+    const char *name = callee + 5;
+    size_t len = strlen(name);
+    TSNode body = ts_node_child_by_field_name(cls, TS_FIELD("body"));
+    bool instance = false;
+    uint32_t count = ts_node_named_child_count(body);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode member = ts_node_named_child(body, i);
+        if (strcmp(ts_node_type(member), "method_definition") != 0)
             continue;
+        TSNode mn = ts_node_child_by_field_name(member, TS_FIELD("name"));
+        if (ts_node_is_null(mn) || ts_node_end_byte(mn) - ts_node_start_byte(mn) != len ||
+            memcmp(ctx->source + ts_node_start_byte(mn), name, len) != 0)
+            continue;
+        if (cbm_js_member_is_static(member))
+            return false;
+        instance = true;
+    }
+    return instance;
+}
+
+/* Keep the class identity and extends text on each call for the registry.
+ * The shared helper owns the lexical binding rule used by the TS resolver. */
+static void js_this_binding(CBMExtractCtx *ctx, TSNode call_node, CBMCall *call) {
+    TSNode cls;
+    CBMJsThis binding = cbm_js_this_binding(call_node, &cls);
+    if (binding == CBM_JS_THIS_INSTANCE || binding == CBM_JS_THIS_STATIC) {
+        const char *qn = ts_node_is_null(cls) ? NULL : js_class_qn(ctx, cls);
+        if (qn) {
+            call->js_this = binding;
+            call->js_this_class_qn = qn;
+            call->js_this_base = js_class_extends(ctx, cls);
+            if (binding == CBM_JS_THIS_STATIC &&
+                js_static_this_instance_only(ctx, cls, call->callee_name))
+                call->requires_lsp_resolution = true;
         }
-        TSNode parent = ts_node_parent(cur);
-        if (member && !ts_node_is_null(parent) && strcmp(ts_node_type(parent), "class_body") == 0) {
-            TSNode cls = ts_node_parent(parent);
-            const char *qn = ts_node_is_null(cls) ? NULL : js_class_qn(ctx, cls);
-            if (qn) {
-                call->js_this =
-                    js_member_is_static(cur) ? CBM_JS_THIS_STATIC : CBM_JS_THIS_INSTANCE;
-                call->js_this_class_qn = qn;
-                call->js_this_base = js_class_extends(ctx, cls);
-            }
-            return;
-        }
-        for (TSNode up = parent; !ts_node_is_null(up); up = ts_node_parent(up)) {
-            if (strcmp(ts_node_type(up), "class_body") == 0) {
-                call->js_this = CBM_JS_THIS_OTHER;
-                return;
-            }
-        }
-        return;
+    } else {
+        call->js_this = binding;
     }
 }
 

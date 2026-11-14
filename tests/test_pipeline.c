@@ -36532,11 +36532,12 @@ static bool js_this_calls_are(const char *db, const char *project, const char *f
 /* `this` in a non-arrow function, or in a method of an object literal, is
  * not the instance of the class around it: `this.stop()` there names no
  * member of that class, and gets no edge. In an arrow it stays the method's
- * `this`. Index files, where the type-aware resolver gives no answer. */
+ * `this`. Check both index files and ordinary modules. */
 TEST(pipeline_js_this_in_nested_function_is_not_the_class) {
-    static const char *const files[] = {"pkg/index.ts", "pkg/index.js"};
+    static const char *const files[] = {"pkg/index.ts", "pkg/index.js", "main.ts", "main.js"};
+    static const char *const mods[] = {"pkg", "pkg", "main", "main"};
     bool ok = true;
-    for (int x = 0; x < 2; x++) {
+    for (int x = 0; x < 4; x++) {
         char tmp[256] = "/tmp/cbm_js_this_fn_XXXXXX";
         ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
         write_temp_file(tmp, files[x],
@@ -36556,8 +36557,107 @@ TEST(pipeline_js_this_in_nested_function_is_not_the_class) {
         const char *project = cbm_pipeline_project_name(p);
         ok = js_this_calls_are(db, project, files[x], 4, "") && ok;
         ok = js_this_calls_are(db, project, files[x], 5, "") && ok;
-        ok = js_this_calls_are(db, project, files[x], 8, "pkg.Adapter.halt -> pkg.Adapter.stop") &&
-             ok;
+        char want[128];
+        snprintf(want, sizeof(want), "%s.Adapter.halt -> %s.Adapter.stop", mods[x], mods[x]);
+        ok = js_this_calls_are(db, project, files[x], 8, want) && ok;
+        cbm_pipeline_free(p);
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* Each non-arrow callable binds its own `this`; an arrow preserves that
+ * binding, including an inner class and the static side of a class. Each
+ * source line below has exactly the expected target, or no CALLS edge. */
+TEST(pipeline_js_this_boundaries_and_arrows_are_exact) {
+    static const char *const files[] = {"pkg/index.ts", "pkg/index.js", "main.ts", "main.js"};
+    static const char *const mods[] = {"pkg", "pkg", "main", "main"};
+    static const char source[] =
+        "export class Adapter {\n"                                           // 1
+        "  stop() {}\n"                                                      // 2
+        "  make() {} build() {}\n"                                           // 3
+        "  static make() {} static build() {}\n"                             // 4
+        "  run() {\n"                                                        // 5
+        "    function inner() {\n"                                           // 6
+        "      this.stop();\n"                                               // 7
+        "      return () => this.stop();\n"                                  // 8
+        "    }\n"                                                            // 9
+        "    const expr = function() {\n"                                    // 10
+        "      this.stop();\n"                                               // 11
+        "      return () => this.stop();\n"                                  // 12
+        "    };\n"                                                           // 13
+        "    const box = {\n"                                                // 14
+        "      go() {\n"                                                     // 15
+        "        this.stop();\n"                                             // 16
+        "        return () => this.stop();\n"                                // 17
+        "      },\n"                                                         // 18
+        "      get value() {\n"                                              // 19
+        "        this.stop();\n"                                             // 20
+        "        return () => this.stop();\n"                                // 21
+        "      },\n"                                                         // 22
+        "      set value(v) {\n"                                             // 23
+        "        this.stop();\n"                                             // 24
+        "        (() => this.stop())();\n"                                   // 25
+        "      }\n"                                                          // 26
+        "    };\n"                                                           // 27
+        "    const C = class Inner {\n"                                      // 28
+        "      stop() {} ping() {}\n"                                        // 29
+        "      go() {\n"                                                     // 30
+        "        this.stop();\n"                                             // 31
+        "        return () => this.ping();\n"                                // 32
+        "      }\n"                                                          // 33
+        "    };\n"                                                           // 34
+        "    return () => this.stop();\n"                                    // 35
+        "  }\n"                                                              // 36
+        "  static reset() {\n"                                               // 37
+        "    this.make();\n"                                                 // 38
+        "    this.stop();\n"                                                 // 39
+        "    return () => this.build();\n"                                   // 40
+        "  }\n"                                                              // 41
+        "  static {\n"                                                       // 42
+        "    this.make();\n"                                                 // 43
+        "    const arrow = () => this.build();\n"                            // 44
+        "    this.stop();\n"                                                 // 45
+        "    const noInstance = () => this.stop();\n"                        // 46
+        "  }\n"                                                              // 47
+        "}\n";
+    static const struct {
+        int line;
+        const char *caller;
+        const char *callee;
+    } expected[] = {
+        {7, NULL, NULL}, {8, NULL, NULL}, {11, NULL, NULL}, {12, NULL, NULL},
+        {16, NULL, NULL}, {17, NULL, NULL}, {20, NULL, NULL}, {21, NULL, NULL},
+        {24, NULL, NULL}, {25, NULL, NULL},
+        {31, "Adapter.Inner.go", "Adapter.Inner.stop"},
+        {32, "Adapter.Inner.go", "Adapter.Inner.ping"},
+        {35, "Adapter.run", "Adapter.stop"},
+        {38, "Adapter.reset", "Adapter.static.make"},
+        {39, NULL, NULL},
+        {40, "Adapter.reset", "Adapter.static.build"},
+        {43, "Adapter", "Adapter.static.make"},
+        {44, "Adapter.arrow", "Adapter.static.build"},
+        {45, NULL, NULL}, {46, NULL, NULL},
+    };
+    bool ok = true;
+    for (int x = 0; x < 4; x++) {
+        char tmp[256] = "/tmp/cbm_js_this_bounds_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        write_temp_file(tmp, files[x], source);
+        char db[512];
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        cbm_pipeline_t *p = js_twin_index(tmp, db);
+        ASSERT_NOT_NULL(p);
+        const char *project = cbm_pipeline_project_name(p);
+        for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+            char want[256] = "";
+            if (expected[i].caller) {
+                snprintf(want, sizeof(want), "%s.%s -> %s.%s", mods[x], expected[i].caller,
+                         mods[x], expected[i].callee);
+            }
+            ok = js_this_calls_are(db, project, files[x], expected[i].line, want) && ok;
+        }
         cbm_pipeline_free(p);
         th_rmtree(tmp);
     }
@@ -36941,6 +37041,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_this_call_in_arrow_reaches_class_method);
     RUN_TEST(pipeline_ts_index_file_resolver_matches_main);
     RUN_TEST(pipeline_js_this_in_nested_function_is_not_the_class);
+    RUN_TEST(pipeline_js_this_boundaries_and_arrows_are_exact);
     RUN_TEST(pipeline_js_static_and_instance_member_keep_their_names);
     RUN_TEST(pipeline_js_this_member_follows_extends);
     RUN_TEST(pipeline_js_local_twin_stays_out_of_name_guesses);
