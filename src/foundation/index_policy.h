@@ -9,9 +9,14 @@
 #define CBM_INDEX_CONFIG_MAX_SOURCE_MB "index_max_source_mb"
 /* true = also index secret-bearing files (.env, private keys, credential files). */
 #define CBM_INDEX_CONFIG_SECRET_FILES "index_secret_files"
+#define CBM_INDEX_CONFIG_MAX_RSS_MB "index_max_rss_mb"
+#define CBM_INDEX_CONFIG_MAX_DURATION_SECONDS "index_max_duration_seconds"
 
 #define CBM_INDEX_MAX_FILES_VALUE UINT64_C(10000000)
 #define CBM_INDEX_MAX_SOURCE_MB_VALUE UINT64_C(1048576)
+#define CBM_INDEX_MIN_RSS_MB_VALUE UINT64_C(64)
+#define CBM_INDEX_MAX_RSS_MB_VALUE UINT64_C(1048576)
+#define CBM_INDEX_MAX_DURATION_SECONDS_VALUE UINT64_C(86400)
 #define CBM_INDEX_MIB_BYTES UINT64_C(1048576)
 
 typedef struct {
@@ -23,12 +28,16 @@ typedef struct {
     cbm_index_limit_u64_t max_files;
     cbm_index_limit_u64_t max_source_bytes;
     bool index_secret_files; /* false (zero value): secret-bearing files are skipped */
+    cbm_index_limit_u64_t max_rss_bytes;
+    cbm_index_limit_u64_t max_duration_ms;
 } cbm_index_resource_policy_t;
 
 typedef enum {
     CBM_INDEX_RESOURCE_NONE = 0,
     CBM_INDEX_RESOURCE_FILES,
     CBM_INDEX_RESOURCE_SOURCE_BYTES,
+    CBM_INDEX_RESOURCE_RSS_BYTES,
+    CBM_INDEX_RESOURCE_DURATION_MS,
 } cbm_index_resource_t;
 
 typedef struct {
@@ -39,6 +48,8 @@ typedef struct {
 
 void cbm_index_policy_init(cbm_index_resource_policy_t *policy);
 bool cbm_index_policy_enabled(const cbm_index_resource_policy_t *policy);
+bool cbm_index_policy_discovery_enabled(const cbm_index_resource_policy_t *policy);
+bool cbm_index_policy_worker_enabled(const cbm_index_resource_policy_t *policy);
 
 size_t cbm_index_policy_key_count(void);
 const char *cbm_index_policy_key_at(size_t index);

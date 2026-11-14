@@ -624,34 +624,6 @@ static char *delta_with_prop(const char *props, const char *key, const char *val
     return out;
 }
 
-/* `props` (a JSON object) with the member `key` = `array` added verbatim, or
- * NULL when `array` is not a non-empty JSON array (CBM_MEM_CLASS_OTHER; the
- * caller frees). `array` is SQLite json_extract output, so it is already
- * valid, minified JSON; `key` is a fixed identifier. */
-static char *delta_with_json_array(const char *props, const char *key, const char *array) {
-    size_t al = array ? strlen(array) : 0;
-    if (al <= PAIR_LEN || array[0] != '[' || array[al - SKIP_ONE] != ']') {
-        return NULL;
-    }
-    size_t pl = props ? strlen(props) : 0;
-    bool has_members = pl > PAIR_LEN && props[0] == '{' && props[pl - SKIP_ONE] == '}';
-    size_t cap = pl + strlen(key) + al + CBM_SZ_32;
-    char *out = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, cap);
-    if (!out) {
-        return NULL;
-    }
-    size_t k = 0;
-    if (has_members) {
-        memcpy(out, props, pl - SKIP_ONE);
-        k = pl - SKIP_ONE;
-        out[k++] = ',';
-    } else {
-        out[k++] = '{';
-    }
-    snprintf(out + k, cap - k, "\"%s\":%s}", key, array);
-    return out;
-}
-
 /* Load the stored JS/TS re-export IMPORTS edges (`export { a as b } from`,
  * `export * from`) between proxies into the delta gbuf. A re-resolved caller
  * that imports through a barrel follows the BARREL's edges to the defining
@@ -689,6 +661,28 @@ static int64_t delta_preseed_reexports(sqlite3 *db, const char *project, cbm_gbu
     return step_rc == SQLITE_DONE ? loaded : -1;
 }
 
+/* `props` (a JSON object) with the extractor's test verdict added as
+ * `"is_test":true` (CBM_MEM_CLASS_OTHER; the caller frees), NULL on allocation
+ * failure. The incremental registry seed reads the verdict back
+ * (cbm_node_is_test) so a re-resolved caller ranks a test definition below
+ * real code exactly as the full build does; an absent key reads as false. */
+static char *delta_test_props(const char *props) {
+    static const char member[] = "\"is_test\":true";
+    size_t pl = props ? strlen(props) : 0;
+    bool has_members = pl > PAIR_LEN && props[0] == '{' && props[pl - SKIP_ONE] == '}';
+    size_t cap = pl + sizeof(member) + CBM_SZ_4;
+    char *out = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, cap);
+    if (!out) {
+        return NULL;
+    }
+    if (has_members) {
+        snprintf(out, cap, "%.*s,%s}", (int)(pl - SKIP_ONE), props, member);
+    } else {
+        snprintf(out, cap, "{%s}", member);
+    }
+    return out;
+}
+
 int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf) {
     sqlite3 *db = cbm_store_get_db(store);
     if (!db) {
@@ -722,12 +716,13 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
      * UNIQUE violation the pre-remap patch would have raised. A resolver that
      * only LOOKS UP still needs its target resident, which is why the list
      * mirrors the registry's own membership rule instead of guessing. */
-    /* The one property a resolver READS off a proxy: an axios instance
-     * binding's client + baseURL (#1916). A caller re-resolved alone must
+    /* Preserve the resolver-visible HTTP and Swift signature properties on
+     * proxies: an axios instance binding's client + baseURL (#1916).
+     * A caller re-resolved alone must
      * compose `api.get('/p')` against its unchanged wrapper exactly as a full
      * build does. Only the two keys, only on the rare Module/Variable rows
-     * that carry them; every other proxy stays "{}". Proxies are never
-     * written back (cbm_delta_patch skips id <= max_db_id).
+     * that carry them; Swift callables retain defaults and parameter counts.
+     * Proxies are never written back (cbm_delta_patch skips id <= max_db_id).
      *
      * The other: a node's parent_class where it changes the name the node
      * goes by -- a Go method's QN has no receiver, a class-body variable's QN
@@ -748,13 +743,11 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
      * (cbm_node_is_split_overload). Without it an incremental run bound
      * every call to the group's first member.
      *
-     * And a type's declared supertypes (the stored "base_classes" array, on
-     * type-like rows): the registry seed reads them back into the supertype
-     * table (registry_seed_supertypes, the same reader the full-graph
-     * incremental route uses), which the inherited-member fallback climbs.
-     * Without them a re-resolved call to a member a type inherits from an
-     * unchanged type found no edge. Spliced as the stored JSON array, so the
-     * seed parses exactly what a full-graph load would hand it. */
+     * And the extractor's test verdict: the registry seed reads it back
+     * (cbm_node_is_test) to rank a test definition below real code, as the
+     * full build does with CBMDefinition.is_test; without it every proxy
+     * scored as production and a re-resolved caller could bind a test helper
+     * the full build ranks last. */
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(
             db,
@@ -762,7 +755,21 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
             " CASE WHEN label IN ('Module','Variable')"
             " AND instr(properties, '\"http_client\"') > 0"
             " THEN json_object('http_client', json_extract(properties, '$.http_client'),"
-            " 'http_base_url', json_extract(properties, '$.http_base_url')) END,"
+            " 'http_base_url', json_extract(properties, '$.http_base_url'))"
+            " WHEN instr(properties, '\"param_default_mask\"') > 0"
+            " THEN json_object('param_default_mask', json_extract(properties, "
+            "'$.param_default_mask'),"
+            " 'selector_param_count', json_extract(properties, '$.selector_param_count'),"
+            " 'call_selector', json_extract(properties, '$.call_selector'),"
+            " 'return_type', json_extract(properties, '$.return_type'))"
+            " WHEN instr(properties, '\"swift_type_path\"') > 0"
+            " OR instr(properties, '\"swift_extension\"') > 0"
+            " THEN json_object('base_classes', json_extract(properties, '$.base_classes'),"
+            " 'swift_type_path', json_extract(properties, '$.swift_type_path'),"
+            " 'swift_extension', json_extract(properties, '$.swift_extension'),"
+            " 'swift_imports', json_extract(properties, '$.swift_imports'))"
+            " WHEN instr(properties, '\"base_classes\"') > 0"
+            " THEN json_object('base_classes', json_extract(properties, '$.base_classes')) END,"
             " start_line, end_line,"
             " CASE WHEN label IN ('Method','Variable')"
             " AND instr(properties, '\"parent_class\"') > 0"
@@ -773,9 +780,7 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
             " CASE WHEN label IN ('Function','Method')"
             " AND instr(properties, '\"" CBM_OVERLOAD_PARAMS_PROP "\"') > 0"
             " THEN json_extract(properties, '$." CBM_OVERLOAD_PARAMS_PROP "') END,"
-            " CASE WHEN label IN (" CBM_SQL_TYPE_LIKE_LABELS ")"
-            " AND instr(properties, '\"base_classes\"') > 0"
-            " THEN json_extract(properties, '$.base_classes') END"
+            " instr(properties, '\"is_test\":true') > 0"
             " FROM nodes"
             " WHERE project = ?1 AND label NOT IN"
             " ('Macro','Comment','Section','Branch','Commit','Tag')"
@@ -801,7 +806,7 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
         const char *parent = (const char *)sqlite3_column_text(stmt, 8);
         const char *generated = (const char *)sqlite3_column_text(stmt, 9);
         const char *overload = (const char *)sqlite3_column_text(stmt, 10);
-        const char *bases = (const char *)sqlite3_column_text(stmt, 11);
+        bool is_test = sqlite3_column_int(stmt, 11) != 0;
         char *owner_props =
             parent ? delta_owner_props(project, name, qn, parent, client_props) : NULL;
         const char *props = owner_props ? owner_props : (client_props ? client_props : "{}");
@@ -813,15 +818,20 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
         if (overload_props) {
             props = overload_props;
         }
-        char *bases_props = delta_with_json_array(props, "base_classes", bases);
-        if (bases_props) {
-            props = bases_props;
+        char *test_props = is_test ? delta_test_props(props) : NULL;
+        if (is_test && !test_props) {
+            cbm_log_error("delta.preseed_verdict_alloc_failed", "qn", qn ? qn : "");
+            cbm_free(CBM_MEM_CLASS_OTHER, overload_props);
+            cbm_free(CBM_MEM_CLASS_OTHER, generated_props);
+            cbm_free(CBM_MEM_CLASS_OTHER, owner_props);
+            sqlite3_finalize(stmt);
+            return -1;
         }
         /* Pin the gbuf id to the database id: proxies ARE their rows. */
         cbm_gbuf_set_next_id(gbuf, id);
-        int64_t got =
-            cbm_gbuf_upsert_node(gbuf, label, name, qn, fp ? fp : "", start_line, end_line, props);
-        cbm_free(CBM_MEM_CLASS_OTHER, bases_props);
+        int64_t got = cbm_gbuf_upsert_node(gbuf, label, name, qn, fp ? fp : "", start_line,
+                                           end_line, test_props ? test_props : props);
+        cbm_free(CBM_MEM_CLASS_OTHER, test_props);
         cbm_free(CBM_MEM_CLASS_OTHER, overload_props);
         cbm_free(CBM_MEM_CLASS_OTHER, generated_props);
         cbm_free(CBM_MEM_CLASS_OTHER, owner_props);

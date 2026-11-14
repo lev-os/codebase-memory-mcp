@@ -19,7 +19,7 @@ enum {
 static const char OVL_UNKNOWN[] = "?";
 
 bool cbm_overload_lang(CBMLanguage lang) {
-    return lang == CBM_LANG_JAVA || lang == CBM_LANG_KOTLIN || lang == CBM_LANG_SWIFT;
+    return lang == CBM_LANG_JAVA || lang == CBM_LANG_KOTLIN;
 }
 
 /* ── Shape buffer ──────────────────────────────────────────────── */
@@ -159,47 +159,6 @@ static void kotlin_params_shape(ovl_shape_t *s, TSNode func, const char *source)
     }
 }
 
-static void swift_param_entry(ovl_shape_t *s, TSNode p, const char *source) {
-    TSNode external =
-        ts_node_child_by_field_name(p, "external_name", (uint32_t)strlen("external_name"));
-    TSNode label = external;
-    bool variadic = false;
-    uint32_t count = ts_node_child_count(p);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode ch = ts_node_child(p, i);
-        const char *field = ts_node_field_name_for_child(p, i);
-        if (ts_node_is_null(label) && field && strcmp(field, "name") == 0 &&
-            kind_is(ch, "simple_identifier")) {
-            label = ch; /* one name is both the label and the internal name */
-        }
-        if (!ts_node_is_named(ch) && node_text_is(ch, source, "...")) {
-            variadic = true;
-        }
-    }
-    shape_node_entry(s, label, source);
-    if (variadic) {
-        shape_raw(s, "~", 1);
-    }
-}
-
-static void swift_params_shape(ovl_shape_t *s, TSNode func, const char *source) {
-    uint32_t count = ts_node_child_count(func);
-    bool open = false;
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode ch = ts_node_child(func, i);
-        const char *field = ts_node_field_name_for_child(func, i);
-        if (kind_is(ch, "parameter")) {
-            swift_param_entry(s, ch, source);
-            open = true;
-        } else if (field && strcmp(field, "default_value") == 0 && open) {
-            shape_raw(s, "=", 1); /* `to b: String = "x"`: sibling of its parameter */
-            open = false;
-        } else if (!ts_node_is_named(ch) && node_text_is(ch, source, ",")) {
-            open = false;
-        }
-    }
-}
-
 static const char *params_shape(CBMArena *a, TSNode func, const char *source, CBMLanguage lang) {
     ovl_shape_t s;
     memset(&s, 0, sizeof(s));
@@ -209,9 +168,6 @@ static const char *params_shape(CBMArena *a, TSNode func, const char *source, CB
         break;
     case CBM_LANG_KOTLIN:
         kotlin_params_shape(&s, func, source);
-        break;
-    case CBM_LANG_SWIFT:
-        swift_params_shape(&s, func, source);
         break;
     default:
         return NULL;
@@ -225,8 +181,7 @@ void cbm_overload_describe_def(CBMArena *a, CBMDefinition *def, TSNode func_node
         !def->label || (strcmp(def->label, "Function") != 0 && strcmp(def->label, "Method") != 0)) {
         return;
     }
-    CBMCallableIdentity mode =
-        lang == CBM_LANG_SWIFT ? CBM_CALLABLE_ID_LABELED_TYPED : CBM_CALLABLE_ID_TYPED;
+    CBMCallableIdentity mode = CBM_CALLABLE_ID_TYPED;
     def->callable_sig = cbm_callable_sig_mode(a, func_node, source, lang, mode);
     def->callable_params = params_shape(a, func_node, source, lang);
 }
@@ -243,9 +198,8 @@ static void java_args_shape(ovl_shape_t *s, TSNode call) {
     }
 }
 
-/* Kotlin and Swift: call_expression -> call_suffix -> value_arguments, and a
- * trailing lambda/closure beside the value_arguments in the call_suffix. */
-static void suffix_args_shape(ovl_shape_t *s, TSNode suffix, const char *source, CBMLanguage lang) {
+/* Kotlin: call_suffix holds the arguments and an optional trailing lambda. */
+static void suffix_args_shape(ovl_shape_t *s, TSNode suffix, const char *source) {
     uint32_t count = ts_node_named_child_count(suffix);
     for (uint32_t i = 0; i < count; i++) {
         TSNode ch = ts_node_named_child(suffix, i);
@@ -257,13 +211,7 @@ static void suffix_args_shape(ovl_shape_t *s, TSNode suffix, const char *source,
                     continue;
                 }
                 TSNode label = {0};
-                if (lang == CBM_LANG_SWIFT) {
-                    TSNode name =
-                        ts_node_child_by_field_name(arg, "name", (uint32_t)strlen("name"));
-                    if (!ts_node_is_null(name) && kind_is(name, "value_argument_label")) {
-                        label = name;
-                    }
-                } else if (ts_node_child_count(arg) >= 3 &&
+                if (ts_node_child_count(arg) >= 3 &&
                            kind_is(ts_node_child(arg, 0), "simple_identifier") &&
                            node_text_is(ts_node_child(arg, 1), source, "=")) {
                     label = ts_node_child(arg, 0); /* Kotlin named argument `name = value` */
@@ -301,7 +249,7 @@ const char *cbm_call_args_shape(CBMArena *a, TSNode call_node, const char *sourc
     if (ts_node_is_null(suffix)) {
         return NULL;
     }
-    suffix_args_shape(&s, suffix, source, lang);
+    suffix_args_shape(&s, suffix, source);
     return shape_done(a, &s);
 }
 
@@ -357,30 +305,6 @@ static bool unlabeled(const ovl_entry_t *e) {
     return e->label_len == 1 && e->label[0] == '_';
 }
 
-/* Swift: arguments bind to parameters in order; a parameter with a default
- * (or a variadic one) may be skipped, every other parameter needs an argument
- * with its label; a variadic parameter also takes the unlabeled arguments
- * that follow; a trailing closure fills any parameter. */
-static bool swift_matches(const ovl_entry_t *params, int np, const ovl_entry_t *args, int na) {
-    int j = 0;
-    for (int i = 0; i < np; i++) {
-        if (j < na && (args[j].trailing || label_eq(&params[i], &args[j]))) {
-            j++;
-            if (params[i].variadic) {
-                while (j < na && unlabeled(&args[j]) && !args[j].trailing) {
-                    j++;
-                }
-            }
-            continue;
-        }
-        if (params[i].has_default || params[i].variadic) {
-            continue;
-        }
-        return false;
-    }
-    return j == na;
-}
-
 /* Kotlin: positional arguments fill the parameters in order (a vararg takes
  * every positional argument after it), a named argument fills the parameter
  * of that name, a trailing lambda fills the last parameter; every parameter
@@ -431,9 +355,6 @@ bool cbm_callable_shape_matches(const char *params, const char *args, CBMLanguag
     int na = shape_parse(args, ae, OVL_MAX_ENTRIES);
     if (np < 0 || na < 0) {
         return true;
-    }
-    if (lang == CBM_LANG_SWIFT) {
-        return swift_matches(pe, np, ae, na);
     }
     if (lang == CBM_LANG_KOTLIN) {
         return kotlin_matches(pe, np, ae, na);

@@ -16,6 +16,7 @@ enum { PD_RING = 4, PD_RING_MASK = 3, PD_JSON_MARGIN = 10, PD_ESC_MARGIN = 3, PD
 /* Fixed bytes around a serialized JSON field: ,"key":"value" / ,"key":[...]
  * -> comma + 2 key quotes + colon + 2 value quotes (resp. brackets). */
 enum { PD_JSON_FIELD_OVERHEAD = 6 };
+enum { PD_SWIFT_PROPS_MARGIN = 80 };
 #include "pipeline/pipeline.h"
 #include <stdint.h>
 #include <ctype.h>
@@ -30,6 +31,7 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include "foundation/mem_core.h"
 #include "foundation/str_util.h"
 #include "cbm.h"
+#include "helpers.h" /* cbm_is_test_file */
 #include "arena.h"
 #include "iris_export_xml.h"
 #include "simhash/minhash.h"
@@ -269,7 +271,7 @@ static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const 
 }
 
 /* Build properties JSON for a definition node. */
-static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def) {
+static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def, CBMLanguage lang) {
     /* The complexity/loop/recursion metrics are only meaningful for executable
      * units (Function/Method). Emitting them on the millions of Macro/Field/
      * Variable/Class/Enum nodes — where they are always zero — bloats every
@@ -309,6 +311,13 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
         return;
     }
     size_t pos = (size_t)n;
+    if (lang == CBM_LANG_SWIFT && def->qn_sig_off && bufsize - pos > PD_SWIFT_PROPS_MARGIN) {
+        pos += (size_t)snprintf(buf + pos, bufsize - pos,
+                                ",\"param_default_mask\":\"%016llx\",\"selector_param_count\":%u",
+                                (unsigned long long)def->param_default_mask,
+                                (unsigned)def->selector_param_count);
+    }
+    append_json_string(buf, bufsize, &pos, "call_selector", def->call_selector);
     append_json_string(buf, bufsize, &pos, "docstring", def->docstring);
     /* The buffer is sized for every field below (pd_props_buf), so none can be
      * squeezed out. */
@@ -323,6 +332,7 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     append_json_str_array(buf, bufsize, &pos, "param_types", def->param_types);
     append_json_string(buf, bufsize, &pos, "route_path", def->route_path);
     append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
+    append_json_string(buf, bufsize, &pos, "client_route_path", def->client_route_path);
     append_json_string(buf, bufsize, &pos, "http_client", def->http_client);
     append_json_string(buf, bufsize, &pos, "http_base_url", def->http_base_url);
     /* A document definition's facts (an ADR's id, status, date, ...): key, value pairs. */
@@ -390,6 +400,7 @@ static size_t pd_arr_field_len(const char *key, const char **arr) {
  * allocated. Twin of pass_parallel.c -- keep both in sync. */
 static char *pd_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
     size_t need = PD_PROPS_PREFIX_MAX + pd_str_field_len("docstring", def->docstring);
+    need += pd_str_field_len("call_selector", def->call_selector);
     if (def->variants && def->variants[0]) {
         need += strlen("variants") + strlen(def->variants) + PD_JSON_FIELD_OVERHEAD;
     }
@@ -403,6 +414,7 @@ static char *pd_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
             pd_arr_field_len("param_types", def->param_types) +
             pd_str_field_len("route_path", def->route_path) +
             pd_str_field_len("route_method", def->route_method) +
+            pd_str_field_len("client_route_path", def->client_route_path) +
             pd_str_field_len("http_client", def->http_client) +
             pd_str_field_len("http_base_url", def->http_base_url);
     for (const char **kv = def->extra_props; kv && kv[0] && kv[SKIP_ONE]; kv += PAIR_LEN) {
@@ -488,7 +500,7 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
     char stack[CBM_SZ_2K];
     size_t props_size = sizeof(stack);
     char *props = pd_props_buf(def, stack, &props_size);
-    build_def_props(props, props_size, def);
+    build_def_props(props, props_size, def, lang);
     const char *def_rel = def->file_path ? def->file_path : rel;
     char marked[CBM_SZ_4K];
     const char *qn = def->label && strcmp(def->label, "Module") == 0
@@ -511,19 +523,32 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
      * field resolution), Variable/Field (READS/WRITES resolution), and Table/View
      * (SQL FROM/JOIN lineage). pass_parallel.c and pipeline_incremental.c seed
      * through the same predicate, so the three registries cannot diverge.
-     * A generated member is registered by qualified name only, at all three. */
+     * A generated member is registered by qualified name only, at all three.
+     * The registry's test verdict is the extractor's, OR the extractor's own
+     * file rule (cbm_is_test_file) on the node's file and language, OR the
+     * test-double path rule (cbm_registry_test_double_path), at all three.
+     * The file rule is needed because the extractor gives a definition the
+     * file's verdict only for functions, methods and the module: a variable,
+     * field or class in a test file keeps is_test=false, and ranked as real
+     * code it beat production candidates on proximity. Ranking only: the
+     * stored is_test property is untouched. */
     if (node_id > 0 && cbm_label_is_registry_symbol(def->label)) {
         /* A split overload member 2..n (callable_overload.h) too: resolution
          * keeps landing on the group's base QN, and the overload choice
          * happens once the target is known (cbm_pipeline_overload_targets). */
-        if (cbm_def_props_generated(def->extra_props) || def->qn_sig_off > 0) {
+        if (cbm_def_props_generated(def->extra_props) ||
+            (lang != CBM_LANG_SWIFT && def->qn_sig_off > 0)) {
             cbm_registry_add_qn_only(ctx->registry, def->qualified_name, def->label);
         } else {
+            bool is_test = def->is_test || cbm_is_test_file(def_rel, lang) ||
+                           cbm_registry_test_double_path(def_rel);
             cbm_registry_add_lang_in_module(ctx->registry, def->name, def->qualified_name,
-                                            def->label, lang, module_prefix_len);
+                                            def->label, lang, module_prefix_len, is_test);
         }
-        if (def->base_classes && cbm_label_is_type_like(def->label)) {
-            cbm_registry_add_supertypes(ctx->registry, def->name, def->base_classes, lang);
+        if (lang == CBM_LANG_SWIFT && def->qn_sig_off) {
+            cbm_registry_set_swift_signature(ctx->registry, def->qualified_name,
+                                             def->param_default_mask, def->selector_param_count,
+                                             def->call_selector);
         }
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
@@ -1242,6 +1267,9 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             cbm_free(CBM_MEM_CLASS_EXTRACT, local_cache);
         }
     }
+
+    cbm_registry_build_swift_owners(ctx->registry, ctx->gbuf, ctx->repo_path, ctx->excluded_dirs,
+                                    ctx->excluded_count);
 
     cbm_log_info("pass.done", "pass", "definitions", "defs", itoa_log(total_defs), "calls",
                  itoa_log(total_calls), "imports", itoa_log(total_imports), "errors",

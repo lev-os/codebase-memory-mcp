@@ -24,25 +24,6 @@
 
 /* ── The matcher ───────────────────────────────────────────────── */
 
-TEST(overload_shape_swift_labels) {
-    /* func action(_ id: Int), action(named: String), action(_ id: Int, to: String = "") */
-    ASSERT_TRUE(cbm_callable_shape_matches("_", "_", CBM_LANG_SWIFT));
-    ASSERT_FALSE(cbm_callable_shape_matches("_", "named", CBM_LANG_SWIFT));
-    ASSERT_TRUE(cbm_callable_shape_matches("named", "named", CBM_LANG_SWIFT));
-    ASSERT_FALSE(cbm_callable_shape_matches("named", "_", CBM_LANG_SWIFT));
-    ASSERT_TRUE(cbm_callable_shape_matches("_,to=", "_", CBM_LANG_SWIFT));
-    ASSERT_TRUE(cbm_callable_shape_matches("_,to=", "_,to", CBM_LANG_SWIFT));
-    ASSERT_FALSE(cbm_callable_shape_matches("_,to", "_", CBM_LANG_SWIFT));
-    ASSERT_FALSE(cbm_callable_shape_matches("_,to", "_,from", CBM_LANG_SWIFT));
-    /* variadic takes the unlabeled arguments that follow it */
-    ASSERT_TRUE(cbm_callable_shape_matches("_~", "_,_,_", CBM_LANG_SWIFT));
-    ASSERT_TRUE(cbm_callable_shape_matches("_~", "", CBM_LANG_SWIFT));
-    /* a trailing closure fills the closure parameter */
-    ASSERT_TRUE(cbm_callable_shape_matches("named,completion", "named,*", CBM_LANG_SWIFT));
-    ASSERT_FALSE(cbm_callable_shape_matches("named", "named,*", CBM_LANG_SWIFT));
-    PASS();
-}
-
 TEST(overload_shape_counts) {
     ASSERT_TRUE(cbm_callable_shape_matches("_,_", "_,_", CBM_LANG_JAVA));
     ASSERT_FALSE(cbm_callable_shape_matches("_,_", "_", CBM_LANG_JAVA));
@@ -149,7 +130,10 @@ TEST(overload_extract_swift_same_signature_stays_one_qn) {
     ASSERT_NOT_NULL(p3);
     ASSERT_STR_EQ(p1->qualified_name, p2->qualified_name);
     ASSERT_STR_EQ(p3->qualified_name + p3->qn_sig_off, "(named:String,to:String)");
-    ASSERT_STR_EQ(ovl_prop(p3, CBM_OVERLOAD_PARAMS_PROP), "named,to=");
+    ASSERT_NULL(ovl_prop(p3, CBM_OVERLOAD_PARAMS_PROP));
+    ASSERT_EQ(p3->selector_param_count, 2);
+    ASSERT_EQ(p3->param_default_mask, 2);
+    ASSERT_NOT_NULL(p3->call_selector);
     cbm_free_result(r);
     PASS();
 }
@@ -319,7 +303,9 @@ static int ovl_run(const ovl_case_t *c, bool parallel) {
             ok = ok && got[k][o] == (k == o ? 1 : 0);
         }
     }
-    ok = ok && rc == 0 && action_nodes == 3 && plain_action == 1 && plain_solo == 1;
+    int expected_plain = strcmp(c->lang, "swift") == 0 ? 0 : 1;
+    ok = ok && rc == 0 && action_nodes == 3 && plain_action == expected_plain &&
+         plain_solo == expected_plain;
     if (!ok) {
         fprintf(stderr,
                 "  [%s %s] rc=%d nodes=%d plain=%d solo=%d calls a:%d/%d/%d b:%d/%d/%d "
@@ -681,14 +667,13 @@ TEST(overload_incremental_swift_matches_full) {
                                  "    func run() { f.m(1); f.m(1, to: 2); f.m(named: \"x\") }\n"
                                  "}\n";
     ASSERT_EQ(ovl_incremental_matches_full(files, edited,
-                                           "CALLS Sources.Demo.Caller.Caller.run -> "
+                                           "CALLS Sources.Demo.Caller.Caller.run() -> "
                                            "Sources.Demo.Foo.Foo.m(named:String)\n"),
               0);
     PASS();
 }
 
 SUITE(overloads) {
-    RUN_TEST(overload_shape_swift_labels);
     RUN_TEST(overload_shape_counts);
     RUN_TEST(overload_extract_java_split_keeps_plain_qns);
     RUN_TEST(overload_extract_swift_same_signature_stays_one_qn);

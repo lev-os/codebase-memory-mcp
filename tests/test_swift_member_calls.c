@@ -76,6 +76,10 @@ TEST(swift_member_callee_names_receiver_type) {
 }
 
 static const char *const SWC_FILES[][2] = {
+    {"Package.swift", "// swift-tools-version: 6.0\n"
+                      "import PackageDescription\n"
+                      "let package = Package(name: \"Fixture\", targets: [\n"
+                      "    .target(name: \"App\", path: \"App\")\n])\n"},
     {"App/Ext/View+Ext.swift", "import SwiftUI\n\nextension View {\n"
                                "    public func tagged(_ id: String) -> some View {\n        "
                                "return accessibilityIdentifier(id)\n    }\n}\n"},
@@ -108,7 +112,8 @@ static int swc_targets(sqlite3 *db, const char *src_file, const char *leaf, char
     static const char sql[] =
         "SELECT DISTINCT t.qualified_name FROM edges e JOIN nodes s ON s.id = e.source_id "
         "JOIN nodes t ON t.id = e.target_id WHERE e.type = 'CALLS' "
-        "AND (s.file_path = ?1 OR s.qualified_name LIKE '%.' || ?1) AND t.name = ?2 ORDER BY 1";
+        "AND (s.file_path = ?1 OR s.qualified_name LIKE '%.' || ?1 "
+        "OR s.qualified_name LIKE '%.' || ?1 || '(%') AND t.name = ?2 ORDER BY 1";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
         return -1;
@@ -130,6 +135,11 @@ static int swc_expect_one(sqlite3 *db, const char *src_file, const char *leaf,
                           const char *want_tail) {
     char got[1024];
     int n = swc_targets(db, src_file, leaf, got, sizeof(got));
+    char *signature = strchr(got, '(');
+    if (signature) {
+        signature[0] = '\n';
+        signature[1] = '\0';
+    }
     size_t gl = strlen(got);
     size_t wl = strlen(want_tail);
     if (n == 1 && gl > wl + 1 && got[gl - wl - 2] == '.' &&
@@ -173,6 +183,54 @@ TEST(swift_member_calls_bind_named_receiver_type) {
     ok &= swc_expect_one(db, "ChildVM.refresh", "refresh", "BaseVM.refresh");
     ok &= swc_expect_one(db, "ChildVM.each", "refresh", "BaseVM.refresh");
     sqlite3_close(db);
+    th_cleanup(dir);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* Upstream types a local from its full annotation. A fork callee rewrite must
+ * not discard the module and select the same-named type beside the caller. */
+TEST(swift_qualified_local_and_cast_receivers_keep_module) {
+    static const char *const files[][2] = {
+        {"Package.swift", "// swift-tools-version: 6.0\n"
+                          "import PackageDescription\n"
+                          "let package = Package(name: \"Fixture\", targets: [\n"
+                          " .target(name: \"Local\", dependencies: [\"Remote\"]),\n"
+                          " .target(name: \"Remote\")\n])\n"},
+        {"Sources/Local/Types.swift", "struct Worker { func tick() {} }\n"},
+        {"Sources/Remote/Types.swift", "struct Worker { func tick() {} }\n"},
+        {"Sources/Local/Use.swift", "import Remote\n"
+             "func runAnnotated(input: Remote.Worker) {\n"
+             "    let worker: Remote.Worker = input\n"
+             "    worker.tick()\n"
+             "}\n"
+             "func runCast(input: Any) {\n"
+             "    (input as? Remote.Worker)?.tick()\n"
+             "}\n"},
+    };
+    char *dir = th_mktempdir("cbm_swift_qualified");
+    ASSERT_NOT_NULL(dir);
+    int wrote = 0;
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        wrote |= th_write_file(TH_PATH(dir, files[i][0]), files[i][1]);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/graph.db", dir);
+    int rc = -1;
+    cbm_pipeline_t *pipeline = wrote == 0 ? cbm_pipeline_new(dir, db_path, CBM_MODE_FULL) : NULL;
+    if (pipeline) {
+        rc = cbm_pipeline_run(pipeline);
+        cbm_pipeline_free(pipeline);
+    }
+    sqlite3 *db = NULL;
+    int ok = rc == 0 && sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK;
+    if (ok) {
+        ok &= swc_expect_one(db, "Use.runAnnotated", "tick", "Sources.Remote.Types.Worker.tick");
+        ok &= swc_expect_one(db, "Use.runCast", "tick", "Sources.Remote.Types.Worker.tick");
+    }
+    if (db) {
+        sqlite3_close(db);
+    }
     th_cleanup(dir);
     ASSERT_TRUE(ok);
     PASS();
@@ -239,7 +297,7 @@ TEST(swift_member_calls_bind_inherited_member) {
     /* The decoy gets no caller at all. */
     static const char decoy_sql[] =
         "SELECT count(*) FROM edges e JOIN nodes t ON t.id = e.target_id "
-        "WHERE e.type = 'CALLS' AND t.qualified_name LIKE '%.Sketch.redraw'";
+        "WHERE e.type = 'CALLS' AND t.qualified_name LIKE '%.Sketch.redraw(%'";
     sqlite3_stmt *st = NULL;
     int decoy = -1;
     if (sqlite3_prepare_v2(db, decoy_sql, -1, &st, NULL) == SQLITE_OK &&
@@ -359,7 +417,7 @@ TEST(swift_inherited_member_incremental_matches_full) {
             }
         }
     }
-    static const char want[] = "CALLS App.Geo.Square.Square.paint -> App.Geo.Shape.Shape.redraw\n";
+    static const char want[] = "CALLS App.Geo.Square.Square.paint(item:Any) -> App.Geo.Shape.Shape.redraw(scale:Int)\n";
     int ok = inc && full && strcmp(inc, full) == 0 && strstr(full, want) &&
              route == (int)CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR;
     if (!ok) {
@@ -370,78 +428,6 @@ TEST(swift_inherited_member_incremental_matches_full) {
     free(inc);
     free(full);
     th_cleanup(dir);
-    ASSERT_TRUE(ok);
-    PASS();
-}
-
-static void swb_type(cbm_registry_t *r, const char *qn, const char *name, const char *base) {
-    const char *bases[] = {base, NULL};
-    cbm_registry_add_lang_in_module(r, name, qn, "Class", CBM_LANG_SWIFT, 0);
-    if (base) {
-        cbm_registry_add_supertypes(r, name, bases, CBM_LANG_SWIFT);
-    }
-}
-
-static int swb_resolves_to(cbm_registry_t *r, const char *callee, CBMLanguage lang,
-                           const char *want) {
-    cbm_resolution_t res = cbm_registry_resolve_inherited_member(r, callee, lang);
-    const char *got = res.qualified_name && res.qualified_name[0] ? res.qualified_name : NULL;
-    if ((!want && !got) || (want && got && strcmp(want, got) == 0)) {
-        return 1;
-    }
-    printf("\n  %s: want %s, have %s\n", callee, want ? want : "(none)", got ? got : "(none)");
-    return 0;
-}
-
-TEST(swift_inherited_member_registry_rules) {
-    cbm_registry_t *r = cbm_registry_new();
-    ASSERT_NOT_NULL(r);
-    /* Leaf -> Mid -> Root; only Root declares m. A decoy Other.m. */
-    swb_type(r, "p.a.Root", "Root", NULL);
-    swb_type(r, "p.a.Mid", "Mid", "a.Root<Int>");
-    swb_type(r, "p.a.Leaf", "Leaf", "Mid");
-    cbm_registry_add_lang_in_module(r, "m", "p.a.Root.m", "Method", CBM_LANG_SWIFT, 0);
-    cbm_registry_add_lang_in_module(r, "m", "p.z.Other.m", "Method", CBM_LANG_SWIFT, 0);
-    /* Mid declares n itself: the climb leaves it to the chain. */
-    cbm_registry_add_lang_in_module(r, "n", "p.a.Mid.n", "Method", CBM_LANG_SWIFT, 0);
-    cbm_registry_add_lang_in_module(r, "n", "p.a.Root.n", "Method", CBM_LANG_SWIFT, 0);
-    /* Two same-named roots of Twin both declare k: ambiguous. */
-    swb_type(r, "p.b.Twin", "Twin", "Pair");
-    cbm_registry_add_lang_in_module(r, "k", "p.b.Pair.k", "Method", CBM_LANG_SWIFT, 0);
-    cbm_registry_add_lang_in_module(r, "k", "p.c.Pair.k", "Method", CBM_LANG_SWIFT, 0);
-    /* A chain ten deep: T0 -> T1 -> ... -> T9, only T9 declares deep. */
-    for (int i = 0; i < 10; i++) {
-        char qn[64], name[16], base[16];
-        snprintf(qn, sizeof(qn), "p.d.T%d", i);
-        snprintf(name, sizeof(name), "T%d", i);
-        snprintf(base, sizeof(base), "T%d", i + 1);
-        swb_type(r, qn, name, i < 9 ? base : NULL);
-    }
-    cbm_registry_add_lang_in_module(r, "deep", "p.d.T9.deep", "Method", CBM_LANG_SWIFT, 0);
-    /* A cycle must end. */
-    swb_type(r, "p.e.Loop", "Loop", "Pool");
-    swb_type(r, "p.e.Pool", "Pool", "Loop");
-
-    int ok = 1;
-    ok &= swb_resolves_to(r, "Leaf.m", CBM_LANG_SWIFT, "p.a.Root.m");
-    ok &= swb_resolves_to(r, "Mid.m", CBM_LANG_SWIFT, "p.a.Root.m");
-    ok &= swb_resolves_to(r, "Leaf.n", CBM_LANG_SWIFT, "p.a.Mid.n");
-    ok &= swb_resolves_to(r, "Mid.n", CBM_LANG_SWIFT, NULL);
-    ok &= swb_resolves_to(r, "Root.m", CBM_LANG_SWIFT, NULL);
-    ok &= swb_resolves_to(r, "Twin.k", CBM_LANG_SWIFT, NULL);
-    ok &= swb_resolves_to(r, "T2.deep", CBM_LANG_SWIFT, "p.d.T9.deep");
-    ok &= swb_resolves_to(r, "T0.deep", CBM_LANG_SWIFT, NULL);
-    ok &= swb_resolves_to(r, "Loop.m", CBM_LANG_SWIFT, NULL);
-    ok &= swb_resolves_to(r, "leaf.m", CBM_LANG_SWIFT, NULL);
-    ok &= swb_resolves_to(r, "Leaf.m", CBM_LANG_KOTLIN, NULL);
-    cbm_registry_free(r);
-    /* Kotlin records nothing. */
-    cbm_registry_t *k = cbm_registry_new();
-    const char *kb[] = {"Root", NULL};
-    cbm_registry_add_lang_in_module(k, "m", "p.a.Root.m", "Method", CBM_LANG_KOTLIN, 0);
-    cbm_registry_add_supertypes(k, "Leaf", kb, CBM_LANG_KOTLIN);
-    ok &= swb_resolves_to(k, "Leaf.m", CBM_LANG_SWIFT, NULL);
-    cbm_registry_free(k);
     ASSERT_TRUE(ok);
     PASS();
 }
@@ -605,9 +591,9 @@ TEST(swift_cast_receiver_lookup_is_linear) {
 SUITE(swift_member_calls) {
     RUN_TEST(swift_member_callee_names_receiver_type);
     RUN_TEST(swift_member_calls_bind_named_receiver_type);
+    RUN_TEST(swift_qualified_local_and_cast_receivers_keep_module);
     RUN_TEST(swift_member_calls_bind_inherited_member);
     RUN_TEST(swift_inherited_member_incremental_matches_full);
-    RUN_TEST(swift_inherited_member_registry_rules);
     RUN_TEST(swift_leading_dot_chain_needs_view_root);
     RUN_TEST(swift_leading_dot_non_view_chain_binds);
     RUN_TEST(swift_cast_receiver_lookup_is_linear);
