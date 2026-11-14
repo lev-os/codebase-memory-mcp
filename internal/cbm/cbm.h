@@ -1475,10 +1475,14 @@ void cbm_extract_definitions_without_module(CBMExtractCtx *ctx);
  * so two callables of one file that share a QN -- `first` in two object
  * literals, `setup` in two test callbacks, a getter and its setter -- became
  * one node holding the calls of both. Run once the def list of the walk is
- * final and before the call-scope walk: in each group of two or more bodied
- * Function/Method defs with one QN, the outermost (then the first) keeps the
- * QN and every other takes QN + "#<n>", n = its 2-based rank in the group.
- * Signatures stay out of the groups. */
+ * final and before the call-scope walk. In each group of two or more bodied
+ * Function/Method defs with one QN, the module-level binding of the name (an
+ * exported one, then a top-level declaration) keeps the QN, so an import of
+ * the name reaches it; a member or nested callable with a named owner takes
+ * the owner's path (`file.box.run`, `file.outer.run`); the rest ask for the
+ * QN. Where two ask for one QN, the first (the module binding, then by
+ * source position) keeps it and each other takes QN + "#<n>", n from 2 in
+ * that order. Signatures stay out of the groups. */
 void cbm_js_split_twin_callables(CBMExtractCtx *ctx);
 /* The QN the split gave the callable whose syntax node starts at `start_byte`
  * and whose unsplit QN is `base_qn` (`base_qn` itself for the member that kept

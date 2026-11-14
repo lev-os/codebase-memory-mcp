@@ -35903,7 +35903,296 @@ TEST(pipeline_ts_caller_is_innermost_named_callable) {
     PASS();
 }
 
+/* ── JS/TS same-name callables: who keeps the plain name ─────────────── */
+
+/* A qualified name without the project prefix. */
+static const char *js_twin_short_qn(const char *project, const char *qn) {
+    size_t n = strlen(project);
+    return qn && strncmp(qn, project, n) == 0 && qn[n] == '.' ? qn + n + 1 : qn;
+}
+
+/* Rows of `sql` (two text columns, ?1 project, ?2 line, ?3 file suffix, ?4
+ * name) as "<a> -> <b>" or "<a>" when `pair` is false, QNs without the
+ * project prefix, joined by "; " in query order. */
+static void js_twin_rows(const char *db_path, const char *project, const char *sql, int line,
+                         const char *file, const char *name, bool pair, char *out, size_t cap) {
+    snprintf(out, cap, "%s", "");
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        snprintf(out, cap, "%s", "(no db)");
+        return;
+    }
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+        snprintf(out, cap, "(sql: %s)", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return;
+    }
+    sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 2, line);
+    sqlite3_bind_text(st, 3, file, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, name ? name : "", -1, SQLITE_TRANSIENT);
+    size_t len = 0;
+    while (sqlite3_step(st) == SQLITE_ROW && len < cap) {
+        const char *a = js_twin_short_qn(project, (const char *)sqlite3_column_text(st, 0));
+        const char *b = js_twin_short_qn(project, (const char *)sqlite3_column_text(st, 1));
+        int w = pair ? snprintf(out + len, cap - len, "%s%s -> %s", len ? "; " : "", a, b)
+                     : snprintf(out + len, cap - len, "%s%s", len ? "; " : "", a);
+        len += w > 0 ? (size_t)w : 0;
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+}
+
+/* The CALLS edges recorded at `line` of the file ending in `file`. */
+static void js_twin_calls_at(const char *db, const char *project, const char *file, int line,
+                             char *out, size_t cap) {
+    js_twin_rows(db, project,
+                 "SELECT s.qualified_name, t.qualified_name FROM edges e "
+                 "JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id "
+                 "WHERE e.project = ?1 AND e.type = 'CALLS' "
+                 "AND json_extract(e.properties, '$.line') = ?2 "
+                 "AND substr(s.file_path, -length(?3)) = ?3 AND ?4 = ?4 ORDER BY 1, 2",
+                 line, file, NULL, true, out, cap);
+}
+
+/* The QNs of the nodes named `name` that start at `line` of the file ending
+ * in `file`. */
+static void js_twin_qn_at(const char *db, const char *project, const char *file,
+                          const char *name, int line, char *out, size_t cap) {
+    js_twin_rows(db, project,
+                 "SELECT qualified_name, '' FROM nodes WHERE project = ?1 AND start_line = ?2 "
+                 "AND substr(file_path, -length(?3)) = ?3 AND name = ?4 "
+                 "AND label IN ('Function', 'Method') ORDER BY 1",
+                 line, file, name, false, out, cap);
+}
+
+static bool js_twin_expect(const char *what, const char *got, const char *want) {
+    if (strcmp(got, want) == 0) {
+        return true;
+    }
+    fprintf(stderr, "  %s: got [%s], want [%s]\n", what, got, want);
+    return false;
+}
+
+static cbm_pipeline_t *js_twin_index(const char *repo, const char *db) {
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db, CBM_MODE_FULL);
+    if (p && cbm_pipeline_run(p) != 0) {
+        cbm_pipeline_free(p);
+        return NULL;
+    }
+    return p;
+}
+
+/* The plain name of a JS/TS callable belongs to the module-level binding of
+ * that name. An import of it reaches the export, never a same-name object
+ * method. The others take their owner's name (box.run), and a same-name
+ * callable added earlier in the file renames none of them. */
+TEST(pipeline_js_module_binding_keeps_plain_name) {
+    static const char *const exts[] = {"js", "tsx"};
+    bool ok = true;
+    for (int x = 0; x < 2; x++) {
+        char tmp[256] = "/tmp/cbm_js_plain_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        char lib[32];
+        char consumer[32];
+        snprintf(lib, sizeof(lib), "lib.%s", exts[x]);
+        snprintf(consumer, sizeof(consumer), "consumer.%s", exts[x]);
+        write_temp_file(tmp, consumer,
+                        "import { run } from \"./lib\";\n"
+                        "export function use() { run(); }\n");
+        for (int phase = 0; phase < 2; phase++) {
+            /* Phase 1: a same-name callable earlier in the file. */
+            write_temp_file(tmp, lib,
+                            phase == 0 ? "const box = { run() { return 1; } };\n"
+                                         "export function run() { return 2; }\n"
+                                       : "function early() { function run() { return 0; } "
+                                         "return run(); }\n"
+                                         "const box = { run() { return 1; } };\n"
+                                         "export function run() { return 2; }\n");
+            char db[512];
+            snprintf(db, sizeof(db), "%s/g%d.db", tmp, phase);
+            cbm_pipeline_t *p = js_twin_index(tmp, db);
+            ASSERT_NOT_NULL(p);
+            const char *project = cbm_pipeline_project_name(p);
+            char got[1024];
+            char what[64];
+            snprintf(what, sizeof(what), "%s phase %d", exts[x], phase);
+            js_twin_qn_at(db, project, lib, "run", 2 + phase, got, sizeof(got));
+            ok = js_twin_expect(what, got, "lib.run") && ok;
+            js_twin_qn_at(db, project, lib, "run", 1 + phase, got, sizeof(got));
+            ok = js_twin_expect(what, got, "lib.box.run") && ok;
+            js_twin_calls_at(db, project, consumer, 2, got, sizeof(got));
+            ok = js_twin_expect(what, got, "consumer.use -> lib.run") && ok;
+            if (phase == 1) {
+                js_twin_qn_at(db, project, lib, "run", 1, got, sizeof(got));
+                ok = js_twin_expect(what, got, "lib.early.run") && ok;
+                js_twin_calls_at(db, project, lib, 1, got, sizeof(got));
+                ok = js_twin_expect(what, got, "lib.early -> lib.early.run") && ok;
+            }
+            cbm_pipeline_free(p);
+        }
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* A getter and its setter share a name: the first keeps it, the second takes
+ * "#2". In an object literal they take the object's name first, as the
+ * module-level function of that name keeps the plain one. */
+TEST(pipeline_js_accessor_pairs_keep_their_calls) {
+    static const char *const exts[] = {"js", "tsx"};
+    bool ok = true;
+    for (int x = 0; x < 2; x++) {
+        char tmp[256] = "/tmp/cbm_js_accessor_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        char io[32];
+        char main_file[32];
+        snprintf(io, sizeof(io), "io.%s", exts[x]);
+        snprintf(main_file, sizeof(main_file), "main.%s", exts[x]);
+        write_temp_file(tmp, io,
+                        "export function read() { return 0; }\n"
+                        "export function write(v) { return v; }\n");
+        write_temp_file(tmp, main_file,
+                        "import { read, write } from \"./io\";\n"
+                        "class Box {\n"
+                        "  get value() { return read(); }\n"
+                        "  set value(v) { write(v); }\n"
+                        "}\n"
+                        "const store = {\n"
+                        "  get level() { return read(); },\n"
+                        "  set level(v) { write(v); },\n"
+                        "};\n"
+                        "export function level() { return store.level; }\n");
+        char db[512];
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        cbm_pipeline_t *p = js_twin_index(tmp, db);
+        ASSERT_NOT_NULL(p);
+        const char *project = cbm_pipeline_project_name(p);
+        const struct {
+            int line;
+            const char *want;
+        } cases[] = {
+            {3, "main.Box.value -> io.read"},
+            {4, "main.Box.value#2 -> io.write"},
+            {7, "main.store.level -> io.read"},
+            {8, "main.store.level#2 -> io.write"},
+        };
+        char got[1024];
+        char what[64];
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            snprintf(what, sizeof(what), "%s line %d", exts[x], cases[i].line);
+            js_twin_calls_at(db, project, main_file, cases[i].line, got, sizeof(got));
+            ok = js_twin_expect(what, got, cases[i].want) && ok;
+        }
+        snprintf(what, sizeof(what), "%s line 10", exts[x]);
+        js_twin_qn_at(db, project, main_file, "level", 10, got, sizeof(got));
+        ok = js_twin_expect(what, got, "main.level") && ok;
+        cbm_pipeline_free(p);
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* The callables, their calls and imports of an index, one sorted line each. */
+static char *js_twin_listing(const char *db_path, const char *project) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return NULL;
+    }
+    char *buf = calloc(1, 1);
+    size_t len = 0;
+    graph_listing_append(db,
+                         "SELECT label||'|'||qualified_name||'|'||start_line||'|'||end_line "
+                         "FROM nodes WHERE project=?1 AND label IN "
+                         "('Function','Method','Class','Variable','Module') ORDER BY 1",
+                         project, &buf, &len);
+    graph_listing_append(db,
+                         "SELECT e.type||'|'||s.qualified_name||'|'||t.qualified_name||'|'||"
+                         "ifnull(json_extract(e.properties,'$.line'),'') FROM edges e "
+                         "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+                         "WHERE e.project=?1 AND e.type IN ('CALLS','IMPORTS','USAGE',"
+                         "'DEFINES','DEFINES_METHOD') ORDER BY 1",
+                         project, &buf, &len);
+    sqlite3_close(db);
+    return buf;
+}
+
+/* A same-name callable inserted earlier in a file, indexed incrementally,
+ * gives the graph a fresh full index gives; the export keeps its name, so
+ * the unchanged importer's call still reaches it. */
+TEST(pipeline_js_twin_insert_incremental_equals_full) {
+    char tmp[256] = "/tmp/cbm_js_twin_inc_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    XlangEnvSave saved = xlang_env_select(false);
+    write_temp_file(tmp, "consumer.js",
+                    "import { run } from \"./lib\";\n"
+                    "export function use() { run(); }\n");
+    write_temp_file(tmp, "lib.js",
+                    "function early() { return 0; }\n"
+                    "const box = { run() { return 1; } };\n"
+                    "export function run() { return 2; }\n");
+    for (int i = 0; i < 4; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "pad%d.js", i);
+        write_temp_file(tmp, name, "export const pad = 1;\n");
+    }
+    char inc_db[512];
+    char full_db[512];
+    char lib_path[512];
+    snprintf(inc_db, sizeof(inc_db), "%s/inc.db", tmp);
+    snprintf(full_db, sizeof(full_db), "%s/full.db", tmp);
+    snprintf(lib_path, sizeof(lib_path), "%s/lib.js", tmp);
+    cbm_pipeline_t *first = js_twin_index(tmp, inc_db);
+    ASSERT_NOT_NULL(first);
+    cbm_pipeline_free(first);
+
+    write_temp_file(tmp, "lib.js",
+                    "function early() { function run() { return 0; } return run(); }\n"
+                    "const box = { run() { return 1; } };\n"
+                    "export function run() { return 2; }\n");
+    ASSERT_EQ(pipeline_test_set_mtime(lib_path, 2000000000, 0), 0);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *inc = js_twin_index(tmp, inc_db);
+    ASSERT_NOT_NULL(inc);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(inc));
+    cbm_pipeline_free(inc);
+    cbm_pipeline_t *full = js_twin_index(tmp, full_db);
+    ASSERT_NOT_NULL(full);
+    cbm_pipeline_free(full);
+    xlang_env_restore(&saved);
+
+    char *inc_list = js_twin_listing(inc_db, project);
+    char *full_list = js_twin_listing(full_db, project);
+    char got[1024];
+    js_twin_calls_at(inc_db, project, "consumer.js", 2, got, sizeof(got));
+    bool ok = js_twin_expect("incremental import", got, "consumer.use -> lib.run");
+    js_twin_calls_at(inc_db, project, "lib.js", 1, got, sizeof(got));
+    ok = js_twin_expect("incremental early", got, "lib.early -> lib.early.run") && ok;
+    bool same = inc_list && full_list && strcmp(inc_list, full_list) == 0;
+    if (!same) {
+        fprintf(stderr, "--- incremental (route %d)\n%s--- full\n%s", (int)route,
+                inc_list ? inc_list : "(null)", full_list ? full_list : "(null)");
+    }
+    free(inc_list);
+    free(full_list);
+    th_rmtree(tmp);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_TRUE(same);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_js_module_binding_keeps_plain_name);
+    RUN_TEST(pipeline_js_accessor_pairs_keep_their_calls);
+    RUN_TEST(pipeline_js_twin_insert_incremental_equals_full);
     RUN_TEST(pipeline_ts_caller_is_innermost_named_callable);
     RUN_TEST(pipeline_ts_signature_targets_require_owner);
     RUN_TEST(pipeline_inc_c_family_fragments);
