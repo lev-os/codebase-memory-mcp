@@ -723,6 +723,98 @@ TEST(ei_alias_target_keeps_its_extension) {
     PASS();
 }
 
+/* Match the complete outgoing set, including target identity and cardinality. */
+static int ei_calls_match(cbm_store_t *store, const char *project, const char *caller,
+                          const char *callee, const char *callee_file, int expected) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_name(store, project, caller, &nodes, &count) != CBM_STORE_OK) {
+        return 0;
+    }
+    int64_t source_id = 0;
+    int sources = 0;
+    for (int i = 0; i < count; i++) {
+        if (nodes[i].label && strcmp(nodes[i].label, "Function") == 0) {
+            source_id = nodes[i].id;
+            sources++;
+        }
+    }
+    cbm_store_free_nodes(nodes, count);
+    cbm_edge_t *edges = NULL;
+    int n = 0;
+    if (sources != 1 ||
+        cbm_store_find_edges_by_source_type(store, source_id, "CALLS", &edges, &n) != CBM_STORE_OK) {
+        return 0;
+    }
+    int ok = n == expected;
+    for (int i = 0; i < n; i++) {
+        cbm_node_t target = {0};
+        int rc = cbm_store_find_node_by_id(store, edges[i].target_id, &target);
+        if (rc != CBM_STORE_OK || !target.name || strcmp(target.name, callee) != 0 ||
+            !target.file_path || strcmp(target.file_path, callee_file) != 0 ||
+            !target.label || strcmp(target.label, "Function") != 0) {
+            fprintf(stderr, "  [CALLS] %s -> %s in %s (want %s in %s)\n", caller,
+                    target.name ? target.name : "?", target.file_path ? target.file_path : "?",
+                    callee, callee_file);
+            ok = 0;
+        }
+        cbm_node_free_fields(&target);
+    }
+    if (n != expected) {
+        fprintf(stderr, "  [CALLS] %s: %d outgoing edges (want %d)\n", caller, n, expected);
+    }
+    cbm_store_free_edges(edges, n);
+    return ok;
+}
+
+/* Sibling exports currently share a QN. Whichever definition survives, a
+ * missing edge is preferable to a call into the other file. An explicit
+ * alias also selects the JS file without relative .js -> .ts substitution. */
+static int ei_sibling_export_case(int pad) {
+    EILangFile files[80] = {
+        {"tsconfig.json", "{\"compilerOptions\":{\"paths\":{\"@js\":[\"src/service.js\"]}}}\n"},
+        {"src/service.js", "export function run() { return 0; }\n"},
+        {"src/service.ts", "export function run() { return 1; }\n"},
+        {"src/typed.ts", "import * as api from './service.ts';\n"
+                         "export function viaTyped() { return api.run(); }\n"},
+        {"src/script.ts", "import * as api from '@js';\n"
+                          "export function viaScript() { return api.run(); }\n"},
+        {"src/relative.ts", "import * as api from './service.js';\n"
+                            "export function viaRelative() { return api.run(); }\n"},
+    };
+    char names[60][32];
+    int count = ei_pad_files(files, ei_count_files(files), names, pad);
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, files, count);
+    int ok = store != NULL;
+    static const char *const callers[] = {"viaTyped", "viaScript", "viaRelative"};
+    static const char *const targets[] = {"src/service.ts", "src/service.js", "src/service.ts"};
+    for (size_t i = 0; store && i < sizeof(callers) / sizeof(callers[0]); i++) {
+        cbm_node_t *nodes = NULL;
+        int n = 0, definitions = 0;
+        int rc = cbm_store_find_nodes_by_file(store, lp.project, targets[i], &nodes, &n);
+        for (int j = 0; j < n; j++) {
+            if (nodes[j].name && strcmp(nodes[j].name, "run") == 0 && nodes[j].label &&
+                strcmp(nodes[j].label, "Function") == 0) {
+                definitions++;
+            }
+        }
+        cbm_store_free_nodes(nodes, n);
+        ok &= rc == CBM_STORE_OK && definitions <= 1 &&
+              ei_calls_match(store, lp.project, callers[i], "run", targets[i], definitions);
+    }
+    ei_cleanup(&lp, store);
+    return ok;
+}
+
+TEST(ei_sibling_exports_never_bind_another_file) {
+    int sequential_ok = ei_sibling_export_case(0);
+    int parallel_ok = ei_sibling_export_case(60);
+    ASSERT_TRUE(sequential_ok);
+    ASSERT_TRUE(parallel_ok);
+    PASS();
+}
+
 /* CALLS edges from the function `caller` to the definition `callee` in
  * `callee_file`; -1 when the caller is missing. */
 static int ei_calls_into(cbm_store_t *store, const char *project, const char *caller,
@@ -3297,6 +3389,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_dynamic_imports_resolve_exact_modules);
     RUN_TEST(ei_hidden_directory_imports_resolve_exact_modules);
     RUN_TEST(ei_alias_target_keeps_its_extension);
+    RUN_TEST(ei_sibling_exports_never_bind_another_file);
     RUN_TEST(ei_file_target_namespace_calls_reach_its_definitions);
     RUN_TEST(ei_reincluded_folder_keeps_its_aliases);
     RUN_TEST(ei_module_extension_is_not_a_member);

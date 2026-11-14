@@ -1479,7 +1479,10 @@ static const cbm_gbuf_node_t *pxc_defined_symbol(const cbm_gbuf_t *gbuf, const c
         return NULL;
     }
     const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(gbuf, qn);
-    if (node && node->qualified_name && node->label && !pxc_label_is_container(node->label)) {
+    /* Sibling extensions share a symbol prefix. A QN hit alone can name a
+     * definition from the other file after the graph deduplicates it. */
+    if (node && node->qualified_name && node->label && !pxc_label_is_container(node->label) &&
+        node->file_path && strcmp(node->file_path, rel_path) == 0) {
         return node;
     }
     return NULL;
