@@ -2008,11 +2008,9 @@ static void walk_es_imports(CBMExtractCtx *ctx, TSNode root) {
         } else if (strcmp(kind, "export_statement") == 0) {
             process_es_export_statement(ctx, node);
         } else if (strcmp(kind, "call_expression") == 0) {
-            /* CommonJS require() — only consume the node if we recognized
-             * it as a require call; otherwise keep traversing the children. */
-            if (process_commonjs_require(ctx, node)) {
-                push_children = false;
-            } else {
+            /* A call's arguments can contain more dependencies, including
+             * a literal import() passed to require(). Keep walking them. */
+            if (!process_commonjs_require(ctx, node)) {
                 process_es_dynamic_import(ctx, node);
             }
         }

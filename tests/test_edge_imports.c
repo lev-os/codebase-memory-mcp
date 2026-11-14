@@ -275,7 +275,7 @@ typedef struct {
 static int ei_file_edges_match_properties(const EILangFile *files, int nfiles,
                                          const EIFileEdgeExpect *want, int nwant,
                                          int expected_count, const char *target_label,
-                                         const bool *dynamic) {
+                                         const bool *dynamic, bool containers_only) {
     EILangProj lp;
     cbm_store_t *store = ei_index_files(&lp, files, nfiles);
     int ok = store && cbm_store_count_edges_by_type(store, lp.project, "IMPORTS") == expected_count;
@@ -298,6 +298,10 @@ static int ei_file_edges_match_properties(const EILangFile *files, int nfiles,
                     found = target.file_path && strcmp(target.file_path, want[i].target) == 0 &&
                             (!target_label ||
                              (target.label && strcmp(target.label, target_label) == 0));
+                    if (found && containers_only) {
+                        found = target.label && (strcmp(target.label, "File") == 0 ||
+                                                 strcmp(target.label, "Module") == 0);
+                    }
                     if (found) {
                         bool is_dynamic = edges[j].properties_json &&
                                           strstr(edges[j].properties_json, "\"dynamic\":true");
@@ -328,7 +332,7 @@ static int ei_file_edges_match_properties(const EILangFile *files, int nfiles,
 static int ei_file_edges_match(const EILangFile *files, int nfiles, const EIFileEdgeExpect *want,
                                int nwant, int expected_count, const char *target_label) {
     return ei_file_edges_match_properties(files, nfiles, want, nwant, expected_count, target_label,
-                                          NULL);
+                                          NULL, false);
 }
 
 TEST(ei_relative_astro_css_imports_issue2558) {
@@ -535,6 +539,11 @@ static int ei_dynamic_import_case(int pad) {
         {"package.json", "{\"private\":true,\"workspaces\":[\"packages/*\"]}\n"},
         {"tsconfig.json", "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"~/*\":[\"src/*\"]}}}\n"},
         {"src/lazy.ts", "export function run() { return 1; }\n"},
+        {"src/lazy.js", "export function run() { return 99; }\n"},
+        {"src/lazy.tsx", "export const jsxValue = 42;\n"},
+        {"src/library.d.ts", "export declare function declaredRun(): number;\n"},
+        {"src/library.js", "export function declaredRun() { return 99; }\n"},
+        {"src/shim.js", "module.exports = 1;\n"},
         {"src/Page.tsx", "export default function Page() { return null; }\n"},
         {"src/views/home/index.ts", "export const value = 1;\n"},
         {"packages/shared/package.json",
@@ -546,6 +555,10 @@ static int ei_dynamic_import_case(int pad) {
         {"decoy/home.ts", "export const value = 99;\n"},
         {"decoy/shared.ts", "export const value = 99;\n"},
         {"src/awaited.ts", "export async function load() { const m = await import('./lazy'); return m.run(); }\n"},
+        {"src/explicit-ts.ts", "const load = () => import('./lazy.ts');\n"},
+        {"src/explicit-tsx.ts", "const load = () => import('./lazy.tsx');\n"},
+        {"src/declaration.ts", "const load = () => import('./library.js');\n"},
+        {"src/nested-require.js", "require('./shim.js', import('./Page'));\n"},
         {"src/promise.js", "import('./lazy').then(m => m.run());\n"},
         {"src/nested.tsx", "const Page = lazy(() => import('./Page'));\n"},
         {"src/routes.ts", "const routes = [{ load: () => import('~/views/home') }];\n"},
@@ -567,6 +580,11 @@ static int ei_dynamic_import_case(int pad) {
         {"src/workspace.ts", "packages/shared/src/index.ts"},
         {"src/subpath.ts", "packages/shared/src/feature.ts"},
         {"src/options.ts", "src/lazy.ts"},
+        {"src/explicit-ts.ts", "src/lazy.ts"},
+        {"src/explicit-tsx.ts", "src/lazy.tsx"},
+        {"src/declaration.ts", "src/library.d.ts"},
+        {"src/nested-require.js", "src/shim.js"},
+        {"src/nested-require.js", "src/Page.tsx"},
         {"src/static.ts", "src/lazy.ts"},
         {"src/static.ts", "src/views/home/index.ts"},
         {"src/static.ts", "packages/shared/src/index.ts"},
@@ -580,9 +598,10 @@ static int ei_dynamic_import_case(int pad) {
         snprintf(names[i], sizeof(names[i]), "padding/file_%02d.ts", i);
         files[count++] = (EILangFile){names[i], "export const padding = 0;\n"};
     }
-    static const bool dynamic[] = {true, true, true, true, true, true, true, false, false, false};
+    static const bool dynamic[] = {true, true, true, true, true, true, true, true, true, true,
+                                    false, true, false, false, false};
     return ei_file_edges_match_properties(files, count, want, sizeof(want) / sizeof(want[0]),
-                                          sizeof(want) / sizeof(want[0]), "Module", dynamic);
+                                          sizeof(want) / sizeof(want[0]), NULL, dynamic, true);
 }
 
 TEST(ei_dynamic_imports_resolve_exact_modules) {
@@ -594,10 +613,11 @@ TEST(ei_dynamic_imports_resolve_exact_modules) {
 }
 
 /* Extraction removes the hidden-directory marker from module names. Imports
- * must reach those modules without losing dotted basenames or taking a decoy. */
+ * must reach those modules without losing dotted basenames or taking a decoy.
+ * A hidden project must also load the aliases from its own tsconfig. */
 static int ei_hidden_directory_import_case(int pad) {
     EILangFile files[80] = {
-        {"tsconfig.json", "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@hidden/*\":[\"fixtures/.sandbox/src/*\"]}}}\n"},
+        {"fixtures/.sandbox/tsconfig.json", "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@hidden/*\":[\"./src/*\"]}}}\n"},
         {"fixtures/.sandbox/src/widget.service.ts", "export const value = 1;\n"},
         {"fixtures/.sandbox/src/index.ts", "export const value = 2;\n"},
         {"decoy/widget.service.ts", "export const value = 99;\n"},
@@ -606,18 +626,18 @@ static int ei_hidden_directory_import_case(int pad) {
         {"app/missing.ts", "import { value } from '../.missing/src/widget.service';\n"},
         {"fixtures/.sandbox/src/static.ts", "import { value } from './widget.service';\n"},
         {"app/relative.ts", "import { value } from '../fixtures/.sandbox/src/widget.service';\n"},
-        {"app/alias.ts", "import { value } from '@hidden/widget.service';\n"},
+        {"fixtures/.sandbox/app/alias.ts", "import { value } from '@hidden/widget.service';\n"},
         {"app/index.ts", "import { value } from '../fixtures/.sandbox/src';\n"},
         {"app/explicit.ts", "import { value } from '../fixtures/.sandbox/src/widget.service.ts';\n"},
-        {"app/alias-explicit.ts", "import { value } from '@hidden/widget.service.ts';\n"},
+        {"fixtures/.sandbox/app/alias-explicit.ts", "import { value } from '@hidden/widget.service.ts';\n"},
     };
     static const EIFileEdgeExpect want[] = {
         {"fixtures/.sandbox/src/static.ts", "fixtures/.sandbox/src/widget.service.ts"},
         {"app/relative.ts", "fixtures/.sandbox/src/widget.service.ts"},
-        {"app/alias.ts", "fixtures/.sandbox/src/widget.service.ts"},
+        {"fixtures/.sandbox/app/alias.ts", "fixtures/.sandbox/src/widget.service.ts"},
         {"app/index.ts", "fixtures/.sandbox/src/index.ts"},
         {"app/explicit.ts", "fixtures/.sandbox/src/widget.service.ts"},
-        {"app/alias-explicit.ts", "fixtures/.sandbox/src/widget.service.ts"},
+        {"fixtures/.sandbox/app/alias-explicit.ts", "fixtures/.sandbox/src/widget.service.ts"},
     };
     int count = 0;
     while (files[count].name) {

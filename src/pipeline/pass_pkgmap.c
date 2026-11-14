@@ -1726,36 +1726,74 @@ static char *alias_module_qn(const cbm_pipeline_ctx_t *ctx, const char *module_p
  * (hidden directory markers are removed during extraction), or no Module at
  * all. Find the exact indexed file before using its extraction-owned name.
  * A same-named file elsewhere must never satisfy this lookup. */
-static char *js_indexed_file_qn(const cbm_pipeline_ctx_t *ctx, const char *path) {
-    static const char *const suffixes[] = {
-        "", ".ts", ".tsx", ".d.ts", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs", ".json",
-        "/index.ts", "/index.tsx", "/index.d.ts", "/index.js", "/index.jsx", "/index.mts",
-        "/index.cts", "/index.mjs", "/index.cjs", "/index.json",
+static char *js_indexed_file_qn(const cbm_pipeline_ctx_t *ctx, const char *path,
+                                const char *module_path) {
+    static const char *const implicit_exts[] = {
+        ".ts", ".tsx", ".d.ts", ".js", ".jsx", ".mts", ".cts", ".d.mts", ".d.cts", ".mjs",
+        ".cjs", ".json",
     };
+    static const char *const js_exts[] = {".ts", ".tsx", ".d.ts", ".js", ".jsx"};
+    static const char *const jsx_exts[] = {".tsx", ".d.ts", ".jsx"};
+    static const char *const mjs_exts[] = {".mts", ".d.mts", ".mjs"};
+    static const char *const cjs_exts[] = {".cts", ".d.cts", ".cjs"};
     if (!ctx->gbuf || !path || !path[0]) {
         return NULL;
     }
-    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
-        char candidate[PKGMAP_PATH_BUF];
-        int n = snprintf(candidate, sizeof(candidate), "%s%s", path, suffixes[i]);
-        if (n < 0 || (size_t)n >= sizeof(candidate)) {
-            continue;
+    /* The path resolver already removed an explicit module extension. Honor
+     * that spelling: x.css.ts must not bind x.css, and x.mjs substitutes an
+     * .mts source rather than an unrelated .ts file with the same stem. */
+    const char *ext = module_path ? strrchr(module_path, '.') : NULL;
+    const char *single_ext[] = {ext};
+    const char *const *extensions = implicit_exts;
+    size_t extension_count = sizeof(implicit_exts) / sizeof(implicit_exts[0]);
+    bool spelled = true;
+    if (ext && strcmp(ext, ".js") == 0) {
+        extensions = js_exts;
+        extension_count = sizeof(js_exts) / sizeof(js_exts[0]);
+    } else if (ext && strcmp(ext, ".jsx") == 0) {
+        extensions = jsx_exts;
+        extension_count = sizeof(jsx_exts) / sizeof(jsx_exts[0]);
+    } else if (ext && strcmp(ext, ".mjs") == 0) {
+        extensions = mjs_exts;
+        extension_count = sizeof(mjs_exts) / sizeof(mjs_exts[0]);
+    } else if (ext && strcmp(ext, ".cjs") == 0) {
+        extensions = cjs_exts;
+        extension_count = sizeof(cjs_exts) / sizeof(cjs_exts[0]);
+    } else if (ext && (strcmp(ext, ".ts") == 0 || strcmp(ext, ".tsx") == 0 ||
+                       strcmp(ext, ".mts") == 0 || strcmp(ext, ".cts") == 0 ||
+                       strcmp(ext, ".json") == 0)) {
+        extensions = single_ext;
+        extension_count = 1;
+    } else {
+        spelled = false;
+    }
+    for (int pass = 0; pass < (spelled ? 1 : 3); pass++) {
+        bool direct = !spelled && pass == 0;
+        const char *entry = !spelled && pass == 2 ? "/index" : "";
+        size_t count = direct ? 1 : extension_count;
+        for (size_t i = 0; i < count; i++) {
+            char candidate[PKGMAP_PATH_BUF];
+            int n = snprintf(candidate, sizeof(candidate), "%s%s%s", path, entry,
+                             direct ? "" : extensions[i]);
+            if (n < 0 || (size_t)n >= sizeof(candidate)) {
+                continue;
+            }
+            const cbm_gbuf_node_t *file =
+                cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, candidate);
+            if (!file || !file->file_path || strcmp(file->file_path, candidate) != 0) {
+                continue;
+            }
+            CBMArena arena;
+            cbm_arena_init(&arena);
+            const char *module_qn = cbm_fqn_module(&arena, ctx->project_name, candidate);
+            const cbm_gbuf_node_t *module =
+                module_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, module_qn) : NULL;
+            bool exact = module && module->label && strcmp(module->label, "Module") == 0 &&
+                         module->file_path && strcmp(module->file_path, candidate) == 0;
+            char *qn = strdup(exact ? module->qualified_name : file->qualified_name);
+            cbm_arena_destroy(&arena);
+            return qn;
         }
-        const cbm_gbuf_node_t *file =
-            cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, candidate);
-        if (!file || !file->file_path || strcmp(file->file_path, candidate) != 0) {
-            continue;
-        }
-        CBMArena arena;
-        cbm_arena_init(&arena);
-        const char *module_qn = cbm_fqn_module(&arena, ctx->project_name, candidate);
-        const cbm_gbuf_node_t *module =
-            module_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, module_qn) : NULL;
-        bool exact = module && module->label && strcmp(module->label, "Module") == 0 &&
-                     module->file_path && strcmp(module->file_path, candidate) == 0;
-        char *qn = strdup(exact ? module->qualified_name : file->qualified_name);
-        cbm_arena_destroy(&arena);
-        return qn;
     }
     return NULL;
 }
@@ -1864,9 +1902,12 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
          * stripped a second time by cbm_pipeline_fqn_module. */
         char *qn = cbm_pipeline_fqn_folder(ctx->project_name, resolved);
         if (js) {
-            qn = js_module_qn(ctx, qn, false);
-            if (!qn) {
-                qn = js_indexed_file_qn(ctx, resolved);
+            char *exact_qn = js_indexed_file_qn(ctx, resolved, module_path);
+            if (exact_qn) {
+                free(qn);
+                qn = exact_qn;
+            } else {
+                qn = js_module_qn(ctx, qn, false);
             }
         }
         free(resolved);
@@ -1883,9 +1924,12 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
             if (aliased) {
                 char *qn = alias_module_qn(ctx, module_path, aliased);
                 if (js) {
-                    qn = js_module_qn(ctx, qn, false);
-                    if (!qn) {
-                        qn = js_indexed_file_qn(ctx, aliased);
+                    char *exact_qn = js_indexed_file_qn(ctx, aliased, module_path);
+                    if (exact_qn) {
+                        free(qn);
+                        qn = exact_qn;
+                    } else {
+                        qn = js_module_qn(ctx, qn, false);
                     }
                 }
                 free(aliased);
