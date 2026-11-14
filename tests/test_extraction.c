@@ -8225,6 +8225,38 @@ TEST(extract_rust_route_handler_in_verb_combinator_issue2883) {
     PASS();
 }
 
+/* #2883 review: the call-unwrapping pass runs for Go and Rust only. In
+ * Express-style JS/TS a call-shaped argument is a middleware or a wrapper and
+ * the real handler is an inline arrow function, which has no node, so the
+ * route keeps no handler name rather than naming the wrapper. A bare
+ * reference still names its handler. */
+TEST(extract_js_route_wrapper_call_is_not_handler_issue2883) {
+    static const CBMLanguage langs[] = {CBM_LANG_JAVASCRIPT, CBM_LANG_TYPESCRIPT};
+    for (size_t i = 0; i < sizeof(langs) / sizeof(langs[0]); i++) {
+        CBMFileResult *r =
+            extract("function listOrders(req, res) {}\n"
+                    "function setup(app, router) {\n"
+                    "  app.get(\"/me\", authenticate(), (req, res) => { res.send(1); });\n"
+                    "  router.get(\"/orders\", asyncHandler(async (req, res) => { res.send(2); }));\n"
+                    "  router.get(\"/plain\", listOrders);\n"
+                    "}\n",
+                    langs[i], "t", i == 0 ? "app.js" : "app.ts");
+        ASSERT_NOT_NULL(r);
+        const CBMCall *me = find_call_by_path(r, "/me");
+        const CBMCall *orders = find_call_by_path(r, "/orders");
+        const CBMCall *plain = find_call_by_path(r, "/plain");
+        ASSERT_NOT_NULL(me);
+        ASSERT_NOT_NULL(orders);
+        ASSERT_NOT_NULL(plain);
+        ASSERT_NULL(me->second_arg_name);
+        ASSERT_NULL(orders->second_arg_name);
+        ASSERT_NOT_NULL(plain->second_arg_name);
+        ASSERT_STR_EQ(plain->second_arg_name, "listOrders");
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
 /* Issue #1009 (composed builders): a builder whose template inlines an earlier
  * builder's call plus a query string: `return \`${basePath(id)}?${params}\``.
  * The known-substitution is inlined and the query string is truncated, so the
@@ -16221,6 +16253,7 @@ SUITE(extraction) {
     RUN_TEST(extract_ts_route_handler_after_inline_middleware);
     RUN_TEST(extract_go_route_handler_wrapped_in_call_issue2883);
     RUN_TEST(extract_rust_route_handler_in_verb_combinator_issue2883);
+    RUN_TEST(extract_js_route_wrapper_call_is_not_handler_issue2883);
     RUN_TEST(extract_ts_url_builder_composed_issue1009);
     RUN_TEST(extract_c_url_builder_gated_issue1009);
     RUN_TEST(extract_ts_url_builder_mixed_returns_issue1009);

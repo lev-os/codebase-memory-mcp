@@ -3930,11 +3930,15 @@ static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
             }
         }
     }
-    if (handler == NULL) {
+    if (handler == NULL && (ctx->language == CBM_LANG_GO || ctx->language == CBM_LANG_RUST)) {
         /* Nothing matched as a bare reference. Second pass: unwrap a handler
          * passed as a call (`handler(deps)`, `post(handler)`). Consulted only
          * when the plain scan found nothing, so every argument shape that
-         * resolves today keeps winning. */
+         * resolves today keeps winning. Go and Rust only, the languages it was
+         * measured on: in Express-style JS/TS a call-shaped argument is a
+         * middleware or a wrapper (`authenticate()`, `asyncHandler(async ...)`)
+         * and the real handler is an inline arrow function with no node, so
+         * no HANDLES edge stays the honest answer there. */
         for (uint32_t ai = HANDLER_START_IDX; ai < nc; ai++) {
             TSNode arg2 = ts_node_named_child(args, ai);
             if (strcmp(ts_node_type(arg2), "argument") == 0 &&

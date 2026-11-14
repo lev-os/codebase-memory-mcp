@@ -1843,6 +1843,53 @@ TEST(handles_actix_rust) {
     PASS();
 }
 
+/* #2883: a handler passed wrapped in a call keeps its HANDLES edge, end to end
+ * (extraction, then cbm_registry_resolve_handler). Go builds the handler from
+ * its dependencies: `r.GET("/accounts", adminList(deps))` names adminList. */
+TEST(handles_go_handler_wrapped_in_call_issue2883) {
+    static const EtFile f[] = {
+        {"gin/engine.go",
+         "package gin\n\n"
+         "type Engine struct{}\n\n"
+         "func Default() *Engine {\n    return &Engine{}\n}\n\n"
+         "func (e *Engine) GET(path string, handler interface{}) {}\n"},
+        {"main.go",
+         "package main\n\n"
+         "import \"gin\"\n\n"
+         "func adminList(deps string) func() { return nil }\n\n"
+         "func main() {\n"
+         "    deps := \"db\"\n"
+         "    r := gin.Default()\n"
+         "    r.GET(\"/accounts\", adminList(deps))\n"
+         "}\n"}};
+    static const EtHandles handles[] = {{"adminList", "/accounts"}, {NULL, NULL}};
+    for (int parallel = 0; parallel <= 1; parallel++) {
+        ASSERT_TRUE(et_handles_exact(f, 2, handles, parallel));
+    }
+    PASS();
+}
+
+/* #2883: an axum-style verb combinator wraps the handler,
+ * `post(api::responses::handle)`. The handler is the reference inside it, and
+ * its Rust `::` path reaches the normal resolver instead of the PHP
+ * `Class::method` branch, which found no class and returned nothing. Same-file
+ * wrapper named for the library, as in handles_actix_rust. */
+TEST(handles_rust_handler_in_verb_combinator_issue2883) {
+    static const EtFile f[] = {
+        {"axum_app.rs",
+         "mod api {\n    pub mod responses {\n        pub fn handle() {}\n    }\n}\n\n"
+         "pub fn axum_route(path: &str, handler: fn()) -> String {\n"
+         "    format!(\"{}\", path)\n}\n\n"
+         "fn post(handler: fn()) -> fn() {\n    handler\n}\n\n"
+         "fn main() {\n"
+         "    axum_route(\"/v1/responses\", post(api::responses::handle));\n}\n"}};
+    static const EtHandles handles[] = {{"responses.handle", "/v1/responses"}, {NULL, NULL}};
+    for (int parallel = 0; parallel <= 1; parallel++) {
+        ASSERT_TRUE(et_handles_exact(f, 1, handles, parallel));
+    }
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  HTTP_CALLS — outbound HTTP client calls
  *
@@ -3043,6 +3090,8 @@ SUITE(edge_types_probe) {
     RUN_TEST(routes_laravel_slashless_no_junk_issue1146);
     RUN_TEST(handles_rails_ruby);
     RUN_TEST(handles_actix_rust);
+    RUN_TEST(handles_go_handler_wrapped_in_call_issue2883);
+    RUN_TEST(handles_rust_handler_in_verb_combinator_issue2883);
 
     /* HTTP_CALLS — outbound HTTP clients (9 libraries × languages) */
     RUN_TEST(http_calls_fetch_js);
