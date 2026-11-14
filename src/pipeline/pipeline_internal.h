@@ -1765,7 +1765,11 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      / route.js under app/ or src/app/ exports, carries the route_path its
  *      directories name and HANDLES its Route (extract_nextjs.c). An index
  *      built before has none of these Routes for its unchanged route files,
- *      so it rebuilds once on upgrade.
+ *      so it rebuilds once on upgrade. A route registration also keeps its
+ *      HANDLES edge when a Go or Rust handler is passed wrapped in a call (Go
+ *      `g.GET("/x", handler(deps))`, axum
+ *      `.route("/x", post(api::responses::handle))`), and a Rust/C++ qualified
+ *      handler path is no longer sent through the PHP `::` branch (#2883).
  * The unresolved-call coverage threshold remains independent. */
 enum { CBM_SEMANTIC_INDEX_VERSION = 13 };
 
