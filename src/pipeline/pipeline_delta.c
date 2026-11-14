@@ -697,7 +697,8 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
      * And a generated member's mark (a Java record's implicit accessor, a
      * Method node): the registry seed reads it to register the member by
      * qualified name only, as the full build does (cbm_node_props_generated);
-     * without it the proxy came back into the short-name index.
+     * without it the proxy came back into the short-name index. TypeScript
+     * signatures retain is_abstract for the same exact-only registry rule.
      *
      * And a same-file overload's parameter shape (callable_overload.h
      * CBM_OVERLOAD_PARAMS_PROP, on Function/Method rows of a split group):
@@ -732,6 +733,8 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
             " 'swift_type_path', json_extract(properties, '$.swift_type_path'),"
             " 'swift_extension', json_extract(properties, '$.swift_extension'),"
             " 'swift_imports', json_extract(properties, '$.swift_imports'))"
+            " WHEN label = 'Method' AND instr(properties, '\"is_abstract\":true') > 0"
+            " THEN '{\"is_abstract\":true}'"
             " WHEN instr(properties, '\"base_classes\"') > 0"
             " THEN json_object('base_classes', json_extract(properties, '$.base_classes')) END,"
             " start_line, end_line,"

@@ -10136,6 +10136,11 @@ TEST(pipeline_semantic_version_10_index_is_rebuilt_once) {
     return pipeline_exact_inputs_migrate_metadata_and_mode(10);
 }
 
+/* Version 13 lacks the signature mark needed by incremental registry seeds. */
+TEST(pipeline_semantic_version_13_index_is_rebuilt_once) {
+    return pipeline_exact_inputs_migrate_metadata_and_mode(13);
+}
+
 typedef struct {
     bool published;
     int rename_calls;
@@ -35614,7 +35619,128 @@ TEST(pipeline_inc_c_family_fragments) {
     th_rmtree(tmp);
     PASS();
 }
+
+/* Signature targets need an owner proved by receiver type. Exercise the saved
+ * graph, including incremental reseeding, with competing same-name declarations. */
+TEST(pipeline_ts_signature_targets_require_owner) {
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        char tmp[256] = "/tmp/cbm_ts_signatures_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        write_temp_file(tmp, "contracts.ts",
+                        "export interface CrossPort { send(): void }\n"
+                        "export interface Lone { lonely(): void }\n");
+        const char *source =
+            "import { CrossPort, Lone } from './contracts';\n"
+            "interface Brake { stop(): void }\n"
+            "interface Port { send(): void }\n"
+            "interface Decoy { send(): void }\n"
+            "interface Job { execute(): void }\n"
+            "abstract class Base { abstract finish(): void; }\n"
+            "import { execute } from 'external-kit';\n"
+            "class Motor {\n"
+            "  stop() {}\n"
+            "  reset() { this.stop(); }\n"
+            "  retry = () => { this.stop(); };\n"
+            "}\n"
+            "class Concrete extends Base {\n"
+            "  finish() {}\n"
+            "  reset() { this.finish(); }\n"
+            "  retry = () => { this.finish(); };\n"
+            "}\n"
+            "function typed(p: Port) { p.send(); }\n"
+            "function crossTyped(p: CrossPort) { p.send(); }\n"
+            "function unknown(p: any) { p.lonely(); }\n"
+            "function callback(lonely: () => void) { lonely(); }\n"
+            "function abstractTyped(p: Base) { p.finish(); }\n"
+            "const actions = {\n"
+            "  first() {},\n"
+            "  second(p: Port) { p.send(); },\n"
+            "  run: () => execute()\n"
+            "};\n";
+        const char *main_file = mode ? "main.tsx" : "main.ts";
+        write_temp_file(tmp, main_file, source);
+        for (int i = 0; mode && i < 50; i++) {
+            char name[64];
+            snprintf(name, sizeof(name), "pad%d.ts", i);
+            write_temp_file(tmp, name, "export {};\n");
+        }
+        XlangEnvSave saved = xlang_env_select(mode != 0);
+        char db[512], path[512];
+        snprintf(db, sizeof(db), "%s/graph.db", tmp);
+        snprintf(path, sizeof(path), "%s/%s", tmp, main_file);
+        for (int phase = 0; phase < 2; phase++) {
+            if (phase) {
+                char changed[2048];
+                snprintf(changed, sizeof(changed), "%s// body edit\n", source);
+                write_temp_file(tmp, main_file, changed);
+                ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000, 0), 0);
+            }
+            cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+            ASSERT_NOT_NULL(p);
+            ASSERT_EQ(cbm_pipeline_run(p), 0);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+            if (phase) {
+                ASSERT_EQ(cbm_pipeline_incremental_test_last_route(),
+                          CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+            }
+#endif
+            cbm_store_t *s = cbm_store_open_path(db);
+            ASSERT_NOT_NULL(s);
+            const char *project = cbm_pipeline_project_name(p);
+            const char *signatures[] = {"main.Brake.stop", "main.Port.send", "main.Decoy.send",
+                                       "main.Job.execute", "main.Base.finish",
+                                       "contracts.Lone.lonely"};
+            for (size_t i = 0; i < sizeof(signatures) / sizeof(signatures[0]); i++) {
+                char qn[512];
+                cbm_node_t node = {0};
+                snprintf(qn, sizeof(qn), "%s.%s", project, signatures[i]);
+                ASSERT_EQ(cbm_store_find_node_by_qn(s, project, qn, &node), CBM_STORE_OK);
+                ASSERT_STR_EQ(node.label, "Method");
+                cbm_node_free_fields(&node);
+            }
+            const struct {
+                const char *from, *to;
+                int want;
+            } cases[] = {
+                {".Motor.reset", ".Motor.stop", 1},
+                {".Motor.reset", ".Brake.stop", 0},
+                {".Motor.retry", ".Motor.stop", 1},
+                {".Motor.retry", ".Brake.stop", 0},
+                {".Concrete.reset", ".Concrete.finish", 1},
+                {".Concrete.reset", ".Base.finish", 0},
+                {".Concrete.retry", ".Concrete.finish", 1},
+                {".Concrete.retry", ".Base.finish", 0},
+                {".typed", ".Port.send", 1},
+                {".typed", ".Decoy.send", 0},
+                {".crossTyped", ".CrossPort.send", 1},
+                {".unknown", "", 0},
+                {".callback", "", 0},
+                {".abstractTyped", ".Base.finish", 1},
+                {".first", "", 0},
+                {".run", "", 0},
+                {"", ".Job.execute", 0},
+            };
+            for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+                int got = count_calls_with(s, project, cases[i].from, cases[i].to, NULL);
+                if (got != cases[i].want) {
+                    fprintf(stderr, "signature mode=%d phase=%d %s -> %s: got %d want %d\n",
+                            mode, phase, cases[i].from, cases[i].to, got, cases[i].want);
+                    ok = false;
+                }
+            }
+            cbm_store_close(s);
+            cbm_pipeline_free(p);
+        }
+        xlang_env_restore(&saved);
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_ts_signature_targets_require_owner);
     RUN_TEST(pipeline_inc_c_family_fragments);
     RUN_TEST(pipeline_python_module_callers_sequential);
     RUN_TEST(pipeline_python_module_callers_parallel);
@@ -36278,6 +36404,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode);
     RUN_TEST(pipeline_semantic_version_8_index_is_rebuilt_once);
     RUN_TEST(pipeline_semantic_version_10_index_is_rebuilt_once);
+    RUN_TEST(pipeline_semantic_version_13_index_is_rebuilt_once);
     RUN_TEST(pipeline_capture_failure_preserves_general_coverage_and_rebuilds);
     RUN_TEST(pipeline_non_utf8_source_keeps_surfaces_and_unresolved_capture);
     RUN_TEST(pipeline_existing_artifact_refreshes_after_default_forced_full_reindex);
