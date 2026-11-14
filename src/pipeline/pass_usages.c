@@ -295,8 +295,7 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
                                                       usage->ref_name, res.strategy, tgt->label)) {
                 continue;
             }
-            if (usage->semantic_reference_blocked && (usage->semantic_reference_local_shadow ||
-                                                      cbm_pipeline_node_is_callable_target(tgt))) {
+            if (cbm_pipeline_blocked_usage_vetoed(usage, res.strategy, tgt)) {
                 continue;
             }
             if (property_read && cbm_pipeline_node_is_callable_target(tgt)) {
