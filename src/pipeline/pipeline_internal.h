@@ -275,19 +275,22 @@ cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const c
                                                 const char *module_qn, const char **import_map_keys,
                                                 const char **import_map_vals, int import_map_count,
                                                 CBMLanguage lang);
-/* The registry step of BOTH call resolvers once the LSP has not answered:
- * for Python, the def or class `callee_name` binds in the nearest def enclosing
- * `scope_qn` (cbm_registry_resolve_lexical, "lexical_scope"); for JS/TS,
- * `this.name` names the member `name` the class around `scope_qn` declares
- * ("this_member"); otherwise, or when there is no such def,
- * cbm_registry_resolve_call_lang. `caller_test`: the calling definition's
- * test verdict, as for cbm_registry_resolve_ref. */
-cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const char *callee_name,
+/* The registry step of BOTH call resolvers once the LSP has not answered,
+ * for the extracted `call`: for Python, the def or class its callee binds in
+ * the nearest def enclosing its caller (cbm_registry_resolve_lexical,
+ * "lexical_scope"); for JS/TS, `this.name` names the member `name` of the
+ * class `this` is at the call, or of the project class it extends
+ * ("this_member"), and no edge when `this` is not that class's or nothing
+ * else can declare `name`; otherwise cbm_registry_resolve_call_lang, which
+ * never binds a JS/TS `this.name` to a callable nested in a body.
+ * `caller_test`: the calling definition's test verdict, as for
+ * cbm_registry_resolve_ref. */
+cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const CBMCall *call,
                                                   const char *module_qn,
                                                   const char **import_map_keys,
                                                   const char **import_map_vals,
                                                   int import_map_count, CBMLanguage lang,
-                                                  const char *scope_qn, bool caller_test);
+                                                  bool caller_test);
 /* The test verdict of the code making a reference, by the same three rules the
  * registry ranks candidates with: the extractor's verdict stored on the
  * caller's node (cbm_node_is_test), the extractor's file rule

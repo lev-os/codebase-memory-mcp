@@ -14506,6 +14506,36 @@ static bool js_twin_anc_push(js_twin_anc_t *s, TSNode n) {
     return true;
 }
 
+/* The owner path of a static class member in a same-name group: beside an
+ * instance member of its name, which keeps the plain name, it is
+ * Class.static.name. The registry's this-member rule reads the same segment
+ * (JS_STATIC_SEGMENT in registry.c). */
+#define JS_TWIN_STATIC_OWNER "static"
+
+/* Whether the callable `fn` with ancestors anc[0..depth) is a static member
+ * of a class: a static method, or the value of a static field. */
+static bool js_twin_static_member(TSNode fn, const TSNode *anc, int depth) {
+    TSNode member = fn;
+    int i = depth - SKIP_ONE;
+    if (strcmp(ts_node_type(fn), "method_definition") != 0) {
+        if (i < 0 || (strcmp(ts_node_type(anc[i]), "public_field_definition") != 0 &&
+                      strcmp(ts_node_type(anc[i]), "field_definition") != 0)) {
+            return false;
+        }
+        member = anc[i--];
+    }
+    if (i < 0 || strcmp(ts_node_type(anc[i]), "class_body") != 0) {
+        return false;
+    }
+    uint32_t n = ts_node_child_count(member);
+    for (uint32_t c = 0; c < n; c++) {
+        if (strcmp(ts_node_type(ts_node_child(member, c)), "static") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 typedef struct {
     js_twin_decl_t *items;
     int count;
@@ -14734,7 +14764,9 @@ static bool js_twin_walk(js_twin_walk_t *w) {
             if (m && !m->found && ts_node_start_point(n).row + TS_LINE_OFFSET == d->start_line) {
                 m->found = true;
                 m->rank = js_twin_rank(w->ctx, n, anc.items, anc.count, d->name);
-                m->owner = js_twin_owner(w->ctx, anc.items, anc.count);
+                m->owner = js_twin_static_member(n, anc.items, anc.count)
+                               ? JS_TWIN_STATIC_OWNER
+                               : js_twin_owner(w->ctx, anc.items, anc.count);
                 m->local = js_twin_in_body(anc.items, anc.count);
             }
         }

@@ -2742,6 +2742,10 @@ static void pxc_append_synthetic_calls(CBMArena *dst_arena, CBMCallArray *dst_ca
         dst.second_arg_name =
             src->second_arg_name ? cbm_arena_strdup(dst_arena, src->second_arg_name) : NULL;
         dst.arg_shape = src->arg_shape ? cbm_arena_strdup(dst_arena, src->arg_shape) : NULL;
+        dst.js_this_class_qn =
+            src->js_this_class_qn ? cbm_arena_strdup(dst_arena, src->js_this_class_qn) : NULL;
+        dst.js_this_base =
+            src->js_this_base ? cbm_arena_strdup(dst_arena, src->js_this_base) : NULL;
         dst.args = NULL;
         if (src->args && src->arg_count > 0) {
             dst.args = cbm_arena_calloc(dst_arena, (size_t)src->arg_count * sizeof(CBMCallArg));

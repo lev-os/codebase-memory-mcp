@@ -36392,6 +36392,165 @@ TEST(pipeline_js_this_call_in_arrow_reaches_class_method) {
     PASS();
 }
 
+/* The CALLS edges at `line` of `file` are exactly `want`; on a mismatch the
+ * strategy of each edge there is printed. */
+static bool js_this_calls_are(const char *db, const char *project, const char *file, int line,
+                              const char *want) {
+    char got[1024];
+    char what[96];
+    snprintf(what, sizeof(what), "%s line %d", file, line);
+    js_twin_calls_at(db, project, file, line, got, sizeof(got));
+    if (js_twin_expect(what, got, want)) {
+        return true;
+    }
+    js_twin_rows(db, project,
+                 "SELECT t.qualified_name, json_extract(e.properties, '$.strategy') "
+                 "FROM edges e JOIN nodes s ON s.id = e.source_id "
+                 "JOIN nodes t ON t.id = e.target_id "
+                 "WHERE e.project = ?1 AND e.type = 'CALLS' "
+                 "AND json_extract(e.properties, '$.line') = ?2 "
+                 "AND substr(s.file_path, -length(?3)) = ?3 AND ?4 = ?4 ORDER BY 1",
+                 line, file, NULL, true, got, sizeof(got));
+    fprintf(stderr, "  %s strategy: [%s]\n", what, got);
+    return false;
+}
+
+/* `this` in a non-arrow function, or in a method of an object literal, is
+ * not the instance of the class around it: `this.stop()` there names no
+ * member of that class, and gets no edge. In an arrow it stays the method's
+ * `this`. Index files, where the type-aware resolver gives no answer. */
+TEST(pipeline_js_this_in_nested_function_is_not_the_class) {
+    static const char *const files[] = {"pkg/index.ts", "pkg/index.js"};
+    bool ok = true;
+    for (int x = 0; x < 2; x++) {
+        char tmp[256] = "/tmp/cbm_js_this_fn_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        write_temp_file(tmp, files[x],
+                        "export class Adapter {\n"
+                        "  stop() { return 0; }\n"
+                        "  run() {\n"
+                        "    function inner() { return this.stop(); }\n"
+                        "    const box = { go() { return this.stop(); } };\n"
+                        "    return [inner, box];\n"
+                        "  }\n"
+                        "  halt() { return [0].map(() => this.stop()); }\n"
+                        "}\n");
+        char db[512];
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        cbm_pipeline_t *p = js_twin_index(tmp, db);
+        ASSERT_NOT_NULL(p);
+        const char *project = cbm_pipeline_project_name(p);
+        ok = js_this_calls_are(db, project, files[x], 4, "") && ok;
+        ok = js_this_calls_are(db, project, files[x], 5, "") && ok;
+        ok = js_this_calls_are(db, project, files[x], 8, "pkg.Adapter.halt -> pkg.Adapter.stop") &&
+             ok;
+        cbm_pipeline_free(p);
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* A static and an instance member of one name: the instance member keeps the
+ * plain name, also once a static one is added before it, and the static one
+ * takes the owner path `static`. `this.stop()` in an instance method reaches
+ * the instance member, in a static method the static one. */
+TEST(pipeline_js_static_and_instance_member_keep_their_names) {
+    static const char *const files[] = {"pkg/index.ts", "pkg/index.js", "main.ts"};
+    static const char *const mods[] = {"pkg", "pkg", "main"};
+    bool ok = true;
+    for (int x = 0; x < 3; x++) {
+        for (int phase = 0; phase < 2; phase++) {
+            char tmp[256] = "/tmp/cbm_js_static_XXXXXX";
+            ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+            write_temp_file(tmp, files[x],
+                            phase == 0 ? "export class Timer {\n"
+                                         "  stop() { return 2; }\n"
+                                         "  pause() { return this.stop(); }\n"
+                                         "}\n"
+                                       : "export class Timer {\n"
+                                         "  static stop() { return 1; }\n"
+                                         "  stop() { return 2; }\n"
+                                         "  static reset() { return this.stop(); }\n"
+                                         "  pause() { return this.stop(); }\n"
+                                         "}\n");
+            char db[512];
+            snprintf(db, sizeof(db), "%s/g.db", tmp);
+            cbm_pipeline_t *p = js_twin_index(tmp, db);
+            ASSERT_NOT_NULL(p);
+            const char *project = cbm_pipeline_project_name(p);
+            char got[1024];
+            char want[256];
+            char what[96];
+            snprintf(what, sizeof(what), "%s phase %d", files[x], phase);
+            snprintf(want, sizeof(want), "%s.Timer.stop", mods[x]);
+            js_twin_qn_at(db, project, files[x], "stop", 2 + phase, got, sizeof(got));
+            ok = js_twin_expect(what, got, want) && ok;
+            if (phase == 1) {
+                snprintf(want, sizeof(want), "%s.Timer.static.stop", mods[x]);
+                js_twin_qn_at(db, project, files[x], "stop", 2, got, sizeof(got));
+                ok = js_twin_expect(what, got, want) && ok;
+            }
+            if (x < 2) { /* the type-aware resolver answers in main.ts */
+                ok = js_this_calls_are(db, project, files[x], 3 + 2 * phase,
+                                       "pkg.Timer.pause -> pkg.Timer.stop") &&
+                     ok;
+                if (phase == 1) {
+                    ok = js_this_calls_are(db, project, files[x], 4,
+                                           "pkg.Timer.reset -> pkg.Timer.static.stop") &&
+                         ok;
+                }
+            }
+            cbm_pipeline_free(p);
+            th_rmtree(tmp);
+        }
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* `this.stop()` where the class declares no stop names the member its parent
+ * class declares, when the parent is a class of the project. A class with no
+ * such parent gets no edge: never a same-name callable nested in one of its
+ * methods, whose name (Lone.stop) reads like a member's. */
+TEST(pipeline_js_this_member_follows_extends) {
+    static const char *const exts[] = {"ts", "js"};
+    bool ok = true;
+    for (int x = 0; x < 2; x++) {
+        char tmp[256] = "/tmp/cbm_js_this_ext_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        char base[32];
+        char index[32];
+        snprintf(base, sizeof(base), "pkg/base.%s", exts[x]);
+        snprintf(index, sizeof(index), "pkg/index.%s", exts[x]);
+        write_temp_file(tmp, base,
+                        "export class Base {\n"
+                        "  stop() { return 1; }\n"
+                        "}\n");
+        write_temp_file(tmp, index,
+                        "import { Base } from \"./base\";\n"
+                        "export class Child extends Base {\n"
+                        "  start() { const handle = { stop: () => 2 }; return handle; }\n"
+                        "  halt() { return this.stop(); }\n"
+                        "}\n"
+                        "export class Lone {\n"
+                        "  run() { const h = { stop: () => 3 }; return h; }\n"
+                        "  halt() { return this.stop(); }\n"
+                        "}\n");
+        char db[512];
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        cbm_pipeline_t *p = js_twin_index(tmp, db);
+        ASSERT_NOT_NULL(p);
+        const char *project = cbm_pipeline_project_name(p);
+        ok = js_this_calls_are(db, project, index, 4, "pkg.Child.halt -> pkg.base.Base.stop") && ok;
+        ok = js_this_calls_are(db, project, index, 8, "") && ok;
+        cbm_pipeline_free(p);
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 /* A same-name callable declared in a function body (`const iterator = {
  * next() {} }` inside observable) is a local of that function: its own file
  * reaches it by its derived name, and no name-only strategy offers it to
@@ -36646,6 +36805,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_twin_insert_incremental_equals_full);
     RUN_TEST(pipeline_js_top_level_declaration_keeps_plain_name);
     RUN_TEST(pipeline_js_this_call_in_arrow_reaches_class_method);
+    RUN_TEST(pipeline_js_this_in_nested_function_is_not_the_class);
+    RUN_TEST(pipeline_js_static_and_instance_member_keep_their_names);
+    RUN_TEST(pipeline_js_this_member_follows_extends);
     RUN_TEST(pipeline_js_local_twin_stays_out_of_name_guesses);
     RUN_TEST(pipeline_js_twin_names_rebuild_old_index);
     RUN_TEST(pipeline_js_twin_callables_scale);
