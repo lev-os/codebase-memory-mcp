@@ -134,6 +134,13 @@ void cbm_pxc_ts_barrels_publish(CBMTsBarrels *barrels);
 /* Complexity-gate telemetry: requests answered and walk steps, cumulative. */
 void cbm_pxc_ts_barrel_stats(uint64_t *requests, uint64_t *steps);
 
+/* The File node an IMPORTS target stands for: a Module's file, a Folder's
+ * index file, a File itself; NULL for a definition or an unknown target.
+ * The closure repair uses it to find the star targets whose definitions
+ * the walk reads (pipeline_delta.c). */
+const cbm_gbuf_node_t *cbm_pxc_ts_barrel_file_of(const cbm_gbuf_t *gbuf, const char *project_name,
+                                                 const cbm_gbuf_node_t *target);
+
 /* ── Per-module def index (the gopls "package summary" pattern) ──
  *
  * The hot path used to register ALL all_defs[] into a fresh registry
