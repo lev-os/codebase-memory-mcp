@@ -3349,28 +3349,53 @@ const CBMType *ts_parse_type_node(TSLSPContext *ctx, TSNode node) {
 // Bind a variable_declarator: `let x: T = init` / `const x = init` / `var x = ...`.
 /* Reserve local names before visiting their initializers or nested callables.
  * A not-yet-inferred local must shadow an outer typed receiver, not borrow it. */
+static bool ts_is_pattern_container(const char *kind) {
+    return strcmp(kind, "object_pattern") == 0 || strcmp(kind, "array_pattern") == 0 ||
+           strcmp(kind, "rest_pattern") == 0 || strcmp(kind, "pair_pattern") == 0 ||
+           strcmp(kind, "assignment_pattern") == 0 ||
+           strcmp(kind, "object_assignment_pattern") == 0;
+}
+
+/* A child of a pattern binds names unless it is a pair key or a default value. */
+static bool ts_pattern_child_binds(TSTreeCursor *cursor) {
+    if (!ts_node_is_named(ts_tree_cursor_current_node(cursor)))
+        return false;
+    const char *field = ts_tree_cursor_current_field_name(cursor);
+    return !field || strcmp(field, "value") == 0 || strcmp(field, "left") == 0;
+}
+
+/* Bind every name a pattern declares to unknown. The walk is iterative, so the
+ * depth of a pattern cannot exhaust the stack. */
 static void bind_unknown_pattern(TSLSPContext *ctx, TSNode pattern) {
     if (ts_node_is_null(pattern))
         return;
-    const char *kind = ts_node_type(pattern);
-    if (strcmp(kind, "identifier") == 0 ||
-        strcmp(kind, "shorthand_property_identifier_pattern") == 0) {
-        char *name = node_text(ctx, pattern);
-        if (name)
-            cbm_scope_bind(ctx->current_scope, name, cbm_type_unknown());
-    } else if (strcmp(kind, "pair_pattern") == 0) {
-        TSNode value = ts_node_child_by_field_name(pattern, "value", TS_LSP_FIELD_LEN("value"));
-        bind_unknown_pattern(ctx, value);
-    } else if (strcmp(kind, "assignment_pattern") == 0 ||
-               strcmp(kind, "object_assignment_pattern") == 0) {
-        TSNode left = ts_node_child_by_field_name(pattern, "left", TS_LSP_FIELD_LEN("left"));
-        bind_unknown_pattern(ctx, left);
-    } else if (strcmp(kind, "object_pattern") == 0 || strcmp(kind, "array_pattern") == 0 ||
-               strcmp(kind, "rest_pattern") == 0) {
-        uint32_t count = ts_node_named_child_count(pattern);
-        for (uint32_t i = 0; i < count; i++)
-            bind_unknown_pattern(ctx, ts_node_named_child(pattern, i));
+    TSTreeCursor cursor = ts_tree_cursor_new(pattern);
+    uint32_t depth = 0;
+    bool visit = true;
+    for (;;) {
+        if (visit) {
+            TSNode node = ts_tree_cursor_current_node(&cursor);
+            const char *kind = ts_node_type(node);
+            if (strcmp(kind, "identifier") == 0 ||
+                strcmp(kind, "shorthand_property_identifier_pattern") == 0) {
+                char *name = node_text(ctx, node);
+                if (name)
+                    cbm_scope_bind(ctx->current_scope, name, cbm_type_unknown());
+            } else if (ts_is_pattern_container(kind) && ts_tree_cursor_goto_first_child(&cursor)) {
+                depth++;
+                visit = ts_pattern_child_binds(&cursor);
+                continue;
+            }
+        }
+        while (depth > 0 && !ts_tree_cursor_goto_next_sibling(&cursor)) {
+            ts_tree_cursor_goto_parent(&cursor);
+            depth--;
+        }
+        if (depth == 0)
+            break;
+        visit = ts_pattern_child_binds(&cursor);
     }
+    ts_tree_cursor_delete(&cursor);
 }
 
 static void shadow_block_declarations(TSLSPContext *ctx, TSNode block) {
@@ -3413,6 +3438,99 @@ static bool ts_declaration_writable(TSLSPContext *ctx, TSNode declaration) {
     return text && strcmp(text, "let") == 0;
 }
 
+/* Destructuring patterns. Every name a pattern declares shadows an outer
+ * binding of that name. A name gets a type only when the container type
+ * proves it: a member of a known object type, a slot of a tuple, or the
+ * element of a one-argument template such as Array<T>. A default value, a
+ * rest element, a computed key or a pattern nested deeper than
+ * TS_PATTERN_MAX_DEPTH leaves the name unknown. */
+#define TS_PATTERN_MAX_DEPTH 64
+
+/* The element an iteration of `container` yields, if one type proves it. */
+static const CBMType *ts_iterated_type(const CBMType *container) {
+    if (container && container->kind == CBM_TYPE_TEMPLATE &&
+        container->data.template_type.template_args &&
+        container->data.template_type.arg_count == 1 &&
+        container->data.template_type.template_args[0])
+        return container->data.template_type.template_args[0];
+    return cbm_type_unknown();
+}
+
+static const CBMType *ts_pattern_slot_type(const CBMType *container, int index) {
+    if (container && container->kind == CBM_TYPE_TUPLE) {
+        if (container->data.tuple.elems && index < container->data.tuple.count &&
+            container->data.tuple.elems[index])
+            return container->data.tuple.elems[index];
+        return cbm_type_unknown();
+    }
+    return ts_iterated_type(container);
+}
+
+/* The member a pair-pattern key names; NULL for a computed or numeric key. */
+static char *ts_pattern_key_name(TSLSPContext *ctx, TSNode key) {
+    if (node_kind_is(key, "property_identifier") || node_kind_is(key, "identifier"))
+        return node_text(ctx, key);
+    if (node_kind_is(key, "string") && ts_node_named_child_count(key) == 1) {
+        TSNode fragment = ts_node_named_child(key, 0);
+        if (node_kind_is(fragment, "string_fragment"))
+            return node_text(ctx, fragment);
+    }
+    return NULL;
+}
+
+static void ts_bind_pattern(TSLSPContext *ctx, TSNode pattern, const CBMType *type,
+                            bool writable, int depth) {
+    if (ts_node_is_null(pattern))
+        return;
+    if (!type)
+        type = cbm_type_unknown();
+    const char *kind = ts_node_type(pattern);
+    if (strcmp(kind, "identifier") == 0 ||
+        strcmp(kind, "shorthand_property_identifier_pattern") == 0) {
+        char *name = node_text(ctx, pattern);
+        if (name)
+            ts_bind_local(ctx, ctx->current_scope, name, type, NULL, writable);
+        return;
+    }
+    bool object = strcmp(kind, "object_pattern") == 0;
+    if ((!object && strcmp(kind, "array_pattern") != 0) || depth >= TS_PATTERN_MAX_DEPTH) {
+        bind_unknown_pattern(ctx, pattern);
+        return;
+    }
+    int slot = 0;
+    TSTreeCursor cursor = ts_tree_cursor_new(pattern);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (!ts_node_is_named(child)) {
+                if (strcmp(ts_node_type(child), ",") == 0)
+                    slot++;
+                continue;
+            }
+            const CBMType *member = NULL;
+            TSNode target = child;
+            if (!object) {
+                member = ts_pattern_slot_type(type, slot);
+            } else if (node_kind_is(child, "shorthand_property_identifier_pattern")) {
+                char *name = node_text(ctx, child);
+                member = name ? lookup_member_type(ctx, type, name) : NULL;
+            } else if (node_kind_is(child, "pair_pattern")) {
+                TSNode key = ts_node_child_by_field_name(child, "key", TS_LSP_FIELD_LEN("key"));
+                char *name = ts_pattern_key_name(ctx, key);
+                member = name ? lookup_member_type(ctx, type, name) : NULL;
+                target = ts_node_child_by_field_name(child, "value", TS_LSP_FIELD_LEN("value"));
+            }
+            ts_bind_pattern(ctx, target, member, writable, depth + 1);
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+}
+
+static bool ts_is_binding_pattern(TSNode node) {
+    return node_kind_is(node, "object_pattern") || node_kind_is(node, "array_pattern") ||
+           node_kind_is(node, "assignment_pattern") || node_kind_is(node, "rest_pattern");
+}
+
 static void bind_variable_declarator(TSLSPContext *ctx, TSNode decl, bool writable) {
     TSNode name = ts_node_child_by_field_name(decl, "name", TS_LSP_FIELD_LEN("name"));
     TSNode tann = ts_node_child_by_field_name(decl, "type", TS_LSP_FIELD_LEN("type"));
@@ -3434,54 +3552,8 @@ static void bind_variable_declarator(TSLSPContext *ctx, TSNode decl, bool writab
     if (node_kind_is(name, "identifier")) {
         char *nm = node_text(ctx, name);
         ts_bind_local(ctx, ctx->current_scope, nm, bound, declared, writable);
-    } else if (node_kind_is(name, "object_pattern")) {
-        // Destructure object: `const { a, b } = obj` — bind a and b to obj.a and obj.b types.
-        uint32_t nc = ts_node_named_child_count(name);
-        for (uint32_t i = 0; i < nc; i++) {
-            TSNode pn = ts_node_named_child(name, i);
-            if (ts_node_is_null(pn))
-                continue;
-            const char *pk = ts_node_type(pn);
-            if (strcmp(pk, "shorthand_property_identifier_pattern") == 0) {
-                char *pnm = node_text(ctx, pn);
-                if (pnm)
-                    ts_bind_local(ctx, ctx->current_scope, pnm,
-                                  lookup_member_type(ctx, bound, pnm), NULL, writable);
-            } else if (strcmp(pk, "pair_pattern") == 0) {
-                TSNode key = ts_node_child_by_field_name(pn, "key", TS_LSP_FIELD_LEN("key"));
-                TSNode val = ts_node_child_by_field_name(pn, "value", TS_LSP_FIELD_LEN("value"));
-                if (!ts_node_is_null(key) && !ts_node_is_null(val) &&
-                    node_kind_is(val, "identifier")) {
-                    char *knm = node_text(ctx, key);
-                    char *vnm = node_text(ctx, val);
-                    if (knm && vnm) {
-                        ts_bind_local(ctx, ctx->current_scope, vnm,
-                                      lookup_member_type(ctx, bound, knm), NULL, writable);
-                    }
-                }
-            }
-        }
-    } else if (node_kind_is(name, "array_pattern")) {
-        // Destructure array / tuple: `const [a, b] = pair`.
-        uint32_t nc = ts_node_named_child_count(name);
-        for (uint32_t i = 0; i < nc; i++) {
-            TSNode pn = ts_node_named_child(name, i);
-            if (ts_node_is_null(pn) || !node_kind_is(pn, "identifier"))
-                continue;
-            char *pnm = node_text(ctx, pn);
-            if (!pnm)
-                continue;
-            const CBMType *et = cbm_type_unknown();
-            if (bound && bound->kind == CBM_TYPE_TEMPLATE &&
-                bound->data.template_type.template_args &&
-                bound->data.template_type.arg_count >= 1) {
-                et = bound->data.template_type.template_args[0];
-            } else if (bound && bound->kind == CBM_TYPE_TUPLE && bound->data.tuple.elems &&
-                       (int)i < bound->data.tuple.count) {
-                et = bound->data.tuple.elems[i];
-            }
-            ts_bind_local(ctx, ctx->current_scope, pnm, et, NULL, writable);
-        }
+    } else {
+        ts_bind_pattern(ctx, name, bound, writable, 0);
     }
 }
 
@@ -3492,6 +3564,11 @@ static void bind_parameter(TSLSPContext *ctx, TSNode param) {
     if (strcmp(pk, "identifier") == 0) {
         char *name = node_text(ctx, param);
         ts_bind_local(ctx, ctx->current_scope, name, cbm_type_unknown(), NULL, true);
+        return;
+    }
+    /* JavaScript lists parameter patterns without a parameter node. */
+    if (ts_is_binding_pattern(param)) {
+        ts_bind_pattern(ctx, param, NULL, true, 0);
         return;
     }
     if (strcmp(pk, "required_parameter") != 0 && strcmp(pk, "optional_parameter") != 0 &&
@@ -3587,47 +3664,36 @@ static void bind_parameter(TSLSPContext *ctx, TSNode param) {
         }
     }
 
+    /* `...items: T[]`: the annotation types the whole rest array. */
+    if (node_kind_is(pattern, "rest_pattern") &&
+        node_kind_is(ts_node_named_child(pattern, 0), "identifier"))
+        pattern = ts_node_named_child(pattern, 0);
     if (node_kind_is(pattern, "identifier")) {
         char *nm = node_text(ctx, pattern);
         ts_bind_local(ctx, ctx->current_scope, nm, t, t, true);
-    } else if (node_kind_is(pattern, "object_pattern")) {
-        uint32_t nc = ts_node_named_child_count(pattern);
-        for (uint32_t i = 0; i < nc; i++) {
-            TSNode p = ts_node_named_child(pattern, i);
-            if (node_kind_is(p, "shorthand_property_identifier_pattern")) {
-                char *pnm = node_text(ctx, p);
-                if (pnm)
-                    cbm_scope_bind(ctx->current_scope, pnm, lookup_member_type(ctx, t, pnm));
-            } else if (node_kind_is(p, "pair_pattern")) {
-                TSNode key = ts_node_child_by_field_name(p, "key", TS_LSP_FIELD_LEN("key"));
-                TSNode val = ts_node_child_by_field_name(p, "value", TS_LSP_FIELD_LEN("value"));
-                if (!ts_node_is_null(key) && !ts_node_is_null(val) &&
-                    node_kind_is(val, "identifier")) {
-                    char *knm = node_text(ctx, key);
-                    char *vnm = node_text(ctx, val);
-                    if (knm && vnm) {
-                        cbm_scope_bind(ctx->current_scope, vnm, lookup_member_type(ctx, t, knm));
-                    }
-                }
-            }
-        }
-    } else if (node_kind_is(pattern, "array_pattern")) {
-        uint32_t nc = ts_node_named_child_count(pattern);
-        for (uint32_t i = 0; i < nc; i++) {
-            TSNode p = ts_node_named_child(pattern, i);
-            if (!node_kind_is(p, "identifier"))
-                continue;
-            char *pnm = node_text(ctx, p);
-            if (!pnm)
-                continue;
-            const CBMType *et = cbm_type_unknown();
-            if (t && t->kind == CBM_TYPE_TEMPLATE && t->data.template_type.template_args &&
-                t->data.template_type.arg_count >= 1) {
-                et = t->data.template_type.template_args[0];
-            }
-            cbm_scope_bind(ctx->current_scope, pnm, et);
-        }
+    } else {
+        ts_bind_pattern(ctx, pattern, t, true, 0);
     }
+}
+
+/* True for `for (x of xs)`, false for `for (k in obj)`. */
+static bool ts_for_header_iterates(TSNode loop) {
+    bool of = node_kind_is(loop, "for_of_statement");
+    TSTreeCursor cursor = ts_tree_cursor_new(loop);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (ts_node_is_named(child))
+                continue;
+            const char *token = ts_node_type(child);
+            if (strcmp(token, "of") == 0 || strcmp(token, "in") == 0) {
+                of = token[0] == 'o';
+                break;
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return of;
 }
 
 void ts_process_statement(TSLSPContext *ctx, TSNode node) {
@@ -3646,31 +3712,25 @@ void ts_process_statement(TSLSPContext *ctx, TSNode node) {
     } else if (strcmp(kind, "for_in_statement") == 0 || strcmp(kind, "for_of_statement") == 0) {
         TSNode left = ts_node_child_by_field_name(node, "left", TS_LSP_FIELD_LEN("left"));
         TSNode right = ts_node_child_by_field_name(node, "right", TS_LSP_FIELD_LEN("right"));
-        if (!ts_node_is_null(left) && !ts_node_is_null(right)) {
-            const CBMType *iter = ts_eval_expr_type(ctx, right);
-            const CBMType *elem = cbm_type_unknown();
-            if (iter && iter->kind == CBM_TYPE_TEMPLATE && iter->data.template_type.template_args &&
-                iter->data.template_type.arg_count >= 1) {
-                elem = iter->data.template_type.template_args[0];
-            }
-            // left is typically `lexical_declaration` of `(let x of arr)` or bare identifier.
-            if (node_kind_is(left, "lexical_declaration") ||
-                node_kind_is(left, "variable_declaration")) {
-                TSNode v = ts_node_named_child(left, 0);
-                if (node_kind_is(v, "variable_declarator")) {
-                    TSNode nm = ts_node_child_by_field_name(v, "name", TS_LSP_FIELD_LEN("name"));
-                    if (node_kind_is(nm, "identifier")) {
-                        char *s = node_text(ctx, nm);
-                        ts_bind_local(ctx, ctx->current_scope, s, elem, NULL,
-                                      ts_declaration_writable(ctx, left));
-                    }
-                }
-            } else if (node_kind_is(left, "identifier")) {
-                char *s = node_text(ctx, left);
-                if (s)
-                    cbm_scope_bind(ctx->current_scope, s, elem);
-            }
+        if (ts_node_is_null(left) || ts_node_is_null(right))
+            return;
+        /* `for (k in obj)` yields keys; only `of` yields the elements. */
+        const CBMType *elem = ts_for_header_iterates(node)
+                                  ? ts_iterated_type(ts_eval_expr_type(ctx, right))
+                                  : cbm_type_unknown();
+        TSNode decl_kind = ts_node_child_by_field_name(node, "kind", TS_LSP_FIELD_LEN("kind"));
+        const char *decl_text = ts_node_is_null(decl_kind) ? NULL : node_text(ctx, decl_kind);
+        bool writable = !decl_text || strcmp(decl_text, "const") != 0;
+        TSNode target = left;
+        if (node_kind_is(left, "lexical_declaration") ||
+            node_kind_is(left, "variable_declaration")) {
+            writable = ts_declaration_writable(ctx, left);
+            TSNode v = ts_node_named_child(left, 0);
+            target = node_kind_is(v, "variable_declarator")
+                         ? ts_node_child_by_field_name(v, "name", TS_LSP_FIELD_LEN("name"))
+                         : (TSNode){0};
         }
+        ts_bind_pattern(ctx, target, elem, writable, 0);
     }
 }
 
@@ -3985,6 +4045,7 @@ static void process_callback_arrow(TSLSPContext *ctx, TSNode arrow, const CBMTyp
                 continue;
             const char *pk = ts_node_type(p);
             const char *pname = NULL;
+            TSNode pattern = {0};
             const CBMType *expected_pt =
                 (expected->data.func.param_types && expected->data.func.param_types[idx])
                     ? expected->data.func.param_types[idx]
@@ -3992,6 +4053,8 @@ static void process_callback_arrow(TSLSPContext *ctx, TSNode arrow, const CBMTyp
 
             if (strcmp(pk, "identifier") == 0) {
                 pname = node_text(ctx, p);
+            } else if (ts_is_binding_pattern(p)) {
+                pattern = p; /* JavaScript: a pattern without a parameter node */
             } else {
                 // required_parameter / optional_parameter — extract pattern.
                 TSNode pp = ts_node_child_by_field_name(p, "pattern", TS_LSP_FIELD_LEN("pattern"));
@@ -4000,6 +4063,8 @@ static void process_callback_arrow(TSLSPContext *ctx, TSNode arrow, const CBMTyp
                 }
                 if (!ts_node_is_null(pp) && strcmp(ts_node_type(pp), "identifier") == 0) {
                     pname = node_text(ctx, pp);
+                } else {
+                    pattern = pp;
                 }
                 // If the param has its own annotation, use that. Otherwise use expected.
                 TSNode tann = ts_node_child_by_field_name(p, "type", TS_LSP_FIELD_LEN("type"));
@@ -4018,6 +4083,10 @@ static void process_callback_arrow(TSLSPContext *ctx, TSNode arrow, const CBMTyp
             if (pname) {
                 ts_bind_local(ctx, ctx->current_scope, pname,
                               expected_pt ? expected_pt : cbm_type_unknown(), expected_pt, true);
+            } else if (!ts_node_is_null(pattern)) {
+                /* A rest element collects the remaining arguments, not this one. */
+                bool rest = node_kind_is(pattern, "rest_pattern");
+                ts_bind_pattern(ctx, pattern, rest ? NULL : expected_pt, true, 0);
             }
             idx++;
         }

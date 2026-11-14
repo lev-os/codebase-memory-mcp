@@ -5464,9 +5464,10 @@ typedef struct {
     const char *target;
 } TsLineTarget;
 
-static bool ts_check_line_targets(const char *label, const char *source,
-                                  const TsLineTarget *cases, size_t count) {
-    CBMFileResult *r = extract_ts(source);
+static bool ts_check_line_targets_in(CBMFileResult *(*extract)(const char *),
+                                     const char *label, const char *source,
+                                     const TsLineTarget *cases, size_t count) {
+    CBMFileResult *r = extract(source);
     if (!r)
         return false;
     bool ok = true;
@@ -5508,6 +5509,11 @@ static bool ts_check_line_targets(const char *label, const char *source,
     return ok;
 }
 
+static bool ts_check_line_targets(const char *label, const char *source,
+                                  const TsLineTarget *cases, size_t count) {
+    return ts_check_line_targets_in(extract_ts, label, source, cases, count);
+}
+
 /* An assignment replaces the receiver type in straight-line code. A branch,
  * a loop or a closure leaves only the declared type, or none. */
 TEST(tslsp_reassignment_replaces_receiver_type) {
@@ -5537,7 +5543,56 @@ TEST(tslsp_reassignment_replaces_receiver_type) {
     PASS();
 }
 
+/* Every name in a parameter or loop-header pattern shadows an outer
+ * binding. A name whose type the pattern cannot prove is unknown. */
+TEST(tslsp_destructured_names_shadow_outer_receiver) {
+    const char *source =
+        "class Port { send() {} }\n"
+        "class Decoy { send() {} }\n"
+        "interface Box { port: Decoy; }\n"
+        "declare const boxes: any[];\n"
+        "declare const ports: Port[];\n"
+        "const port = new Port();\n"
+        "[{ port: new Decoy() }].forEach(({ port }) => port.send());\n"
+        "boxes.forEach(({ port }) => port.send());\n"
+        "boxes.forEach(([port]) => port.send());\n"
+        "boxes.forEach(({ inner: { port } }) => port.send());\n"
+        "boxes.forEach(({ port = new Decoy() }) => port.send());\n"
+        "boxes.forEach(({ ...port }) => port.send());\n"
+        "boxes.forEach(function ({ port }) { port.send(); });\n"
+        "ports.forEach(({ port }) => port.send());\n"
+        "function viaBox({ port }: Box) { port.send(); }\n"
+        "function nested({ inner: [port] }: any) { port.send(); }\n"
+        "for (const { port } of boxes) port.send();\n"
+        "for (const [port] of boxes) port.send();\n"
+        "for (const port in ports) port.send();\n"
+        "port.send();\n"
+        "const keep = (port: Port) => port.send();\n";
+    const TsLineTarget cases[] = {
+        {7, "test.main.Decoy.send"}, {8, NULL}, {9, NULL}, {10, NULL}, {11, NULL}, {12, NULL},
+        {13, NULL}, {14, NULL}, {15, "test.main.Decoy.send"}, {16, NULL}, {17, NULL},
+        {18, NULL}, {19, NULL}, {20, "test.main.Port.send"}, {21, "test.main.Port.send"},
+    };
+    ASSERT_TRUE(ts_check_line_targets("destructured", source, cases,
+                                      sizeof(cases) / sizeof(cases[0])));
+    const char *js =
+        "class Port { send() {} }\n"
+        "class Decoy { send() {} }\n"
+        "const port = new Port();\n"
+        "[{ port: new Decoy() }].forEach(({ port }) => port.send());\n"
+        "function viaParam({ port }) { port.send(); }\n"
+        "for (const { port } of list) port.send();\n"
+        "port.send();\n";
+    const TsLineTarget js_cases[] = {
+        {4, "test.main.Decoy.send"}, {5, NULL}, {6, NULL}, {7, "test.main.Port.send"},
+    };
+    ASSERT_TRUE(ts_check_line_targets_in(extract_js, "destructured js", js, js_cases,
+                                         sizeof(js_cases) / sizeof(js_cases[0])));
+    PASS();
+}
+
 SUITE(ts_lsp) {
+    RUN_TEST(tslsp_destructured_names_shadow_outer_receiver);
     RUN_TEST(tslsp_reassignment_replaces_receiver_type);
     RUN_TEST(tslsp_unknown_generic_lookup_work_is_linear);
     RUN_TEST(tslsp_module_receiver_occurrences_and_scopes);
