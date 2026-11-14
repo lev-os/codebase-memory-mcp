@@ -5630,6 +5630,9 @@ cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const
         }
     }
     bool js = lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
+    if (js && call->callee_is_locally_bound) {
+        return empty_result(); /* a parameter, variable or catch clause holds the callee */
+    }
     if (js) {
         bool no_edge = false;
         cbm_resolution_t member = resolve_js_this_member(

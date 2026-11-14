@@ -1792,8 +1792,15 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      nested callable takes its owner's path (`file.box.run`) or "#<n>"
  *      (cbm_js_split_twin_callables). An index built before holds one node
  *      for such callables, or other names, so it rebuilds once on upgrade.
+ *  17: a JS/TS static member beside an instance member of its name is
+ *      `Class.static.name`, not "#<n>"; `this.name()` names a member of the
+ *      class `this` is, or of the project class it extends, never a callable
+ *      nested in a body; a call bound to a parameter, variable or catch
+ *      clause, or made in a parameter default, follows its scope; a TS doc
+ *      link that two same-line definitions share stays a gap. Older indexes
+ *      rebuild once to drop the old names and edges.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 16 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 17 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

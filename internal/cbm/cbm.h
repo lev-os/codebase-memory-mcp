@@ -435,8 +435,10 @@ typedef struct {
                                      // C++ operator). Never fall back to textual resolution.
     bool callee_is_locally_bound;    // bare call foo() whose callee identifier is bound as a
                                      // parameter of an enclosing function, so it cannot be the
-                                     // module-level foo. Python only today. Read by the
-                                     // weak-local-binding guard. Default false.
+                                     // module-level foo. Python: read by the weak-local-binding
+                                     // guard. JS/TS: a parameter, variable or catch clause is
+                                     // the nearest binding (cbm_js_twin_bind_local_callees), and
+                                     // the registry step gives no edge. Default false.
     bool receiver_is_amd_dependency; // JS/TS member call x.foo() whose receiver root x is a
                                      // parameter the factory of an enclosing AMD
                                      // define([...], fn) / require([...], fn) binds to a

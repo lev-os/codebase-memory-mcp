@@ -14145,6 +14145,7 @@ typedef struct {
     bool member;
     const char *qn; /* that callable's QN once named; NULL: no group member */
     int parent;     /* the nearest entry of the name whose scope holds this one */
+    bool value;     /* a parameter, a variable or a catch clause: it holds a value */
 } js_twin_decl_t;
 
 typedef struct {
@@ -14572,7 +14573,7 @@ static int js_twin_slice_cmp(const void *key, const void *elem) {
  * holds when `callable` is a member of that name. Names no member has are
  * left out: no call to them is bound. */
 static void js_twin_add_decl(js_twin_walk_t *w, TSNode name_node, uint32_t lo, uint32_t hi,
-                             TSNode callable) {
+                             TSNode callable, bool value) {
     if (ts_node_is_null(name_node) || w->oom) {
         return;
     }
@@ -14591,7 +14592,8 @@ static void js_twin_add_decl(js_twin_walk_t *w, TSNode name_node, uint32_t lo, u
     if (!hit) {
         return;
     }
-    js_twin_decl_t d = {.name = (int)(hit - w->names), .lo = lo, .hi = hi, .parent = -1};
+    js_twin_decl_t d = {
+        .name = (int)(hit - w->names), .lo = lo, .hi = hi, .parent = -1, .value = value};
     if (!ts_node_is_null(callable)) {
         uint32_t start = ts_node_start_byte(callable);
         const js_twin_member_t *m = bsearch(&start, w->members, (size_t)w->nmembers,
@@ -14624,7 +14626,7 @@ static void js_twin_pattern_decls(js_twin_walk_t *w, TSNode pat, uint32_t lo, ui
     }
     const char *k = ts_node_type(pat);
     if (strcmp(k, "identifier") == 0 || strcmp(k, "shorthand_property_identifier_pattern") == 0) {
-        js_twin_add_decl(w, pat, lo, hi, (TSNode){0});
+        js_twin_add_decl(w, pat, lo, hi, (TSNode){0}, true);
         return;
     }
     TSNode sub = {0};
@@ -14691,9 +14693,9 @@ static void js_twin_node_decls(js_twin_walk_t *w, TSNode n, const char *k, const
         js_twin_pattern_decls(w, params, ts_node_start_byte(n), ts_node_end_byte(n), 0);
         TSNode own = ts_node_child_by_field_name(n, TS_FIELD("name"));
         if (js_twin_function_value_kind(k)) {
-            js_twin_add_decl(w, own, ts_node_start_byte(n), ts_node_end_byte(n), n);
+            js_twin_add_decl(w, own, ts_node_start_byte(n), ts_node_end_byte(n), n, false);
         } else if (js_twin_declaration_kind(k) && js_twin_scope(anc, depth, false, &lo, &hi)) {
-            js_twin_add_decl(w, own, lo, hi, n);
+            js_twin_add_decl(w, own, lo, hi, n, false);
         }
     } else if (strcmp(k, "variable_declarator") == 0) {
         bool var =
@@ -14705,7 +14707,7 @@ static void js_twin_node_decls(js_twin_walk_t *w, TSNode n, const char *k, const
         TSNode value = ts_node_child_by_field_name(n, TS_FIELD("value"));
         if (!ts_node_is_null(name) && strcmp(ts_node_type(name), "identifier") == 0) {
             bool callable = !ts_node_is_null(value) && js_twin_bodied_kind(ts_node_type(value));
-            js_twin_add_decl(w, name, lo, hi, callable ? value : (TSNode){0});
+            js_twin_add_decl(w, name, lo, hi, callable ? value : (TSNode){0}, true);
         } else {
             js_twin_pattern_decls(w, name, lo, hi, 0);
         }
@@ -14713,7 +14715,7 @@ static void js_twin_node_decls(js_twin_walk_t *w, TSNode n, const char *k, const
                strcmp(k, "abstract_class_declaration") == 0) {
         if (js_twin_scope(anc, depth, false, &lo, &hi)) {
             js_twin_add_decl(w, ts_node_child_by_field_name(n, TS_FIELD("name")), lo, hi,
-                             (TSNode){0});
+                             (TSNode){0}, false);
         }
     } else if (strcmp(k, "catch_clause") == 0) {
         js_twin_pattern_decls(w, ts_node_child_by_field_name(n, TS_FIELD("parameter")),
@@ -14734,13 +14736,13 @@ static void js_twin_node_decls(js_twin_walk_t *w, TSNode n, const char *k, const
         if (ts_node_is_null(local)) {
             local = ts_node_child_by_field_name(n, TS_FIELD("name"));
         }
-        js_twin_add_decl(w, local, 0, UINT32_MAX, (TSNode){0});
+        js_twin_add_decl(w, local, 0, UINT32_MAX, (TSNode){0}, false);
     } else if (strcmp(k, "namespace_import") == 0 || strcmp(k, "import_clause") == 0) {
         uint32_t nc = ts_node_named_child_count(n);
         for (uint32_t i = 0; i < nc; i++) {
             TSNode c = ts_node_named_child(n, i);
             if (strcmp(ts_node_type(c), "identifier") == 0) {
-                js_twin_add_decl(w, c, 0, UINT32_MAX, (TSNode){0});
+                js_twin_add_decl(w, c, 0, UINT32_MAX, (TSNode){0}, false);
             }
         }
     }
@@ -14840,6 +14842,7 @@ static bool js_twin_finish_decls(CBMArena *arena, js_twin_table_t *table, js_twi
             if (!a || !d[i].qn || strcmp(a, d[i].qn) != 0) {
                 d[out - SKIP_ONE].qn = NULL;
             }
+            d[out - SKIP_ONE].value = d[out - SKIP_ONE].value || d[i].value;
             continue;
         }
         d[out++] = d[i];
@@ -15278,6 +15281,61 @@ static void js_rebind_row_callers(CBMFileResult *r) {
     free(sites);
 }
 
+/* The strategy of the TS resolver's binding of a bare name to the module's
+ * definition of that name, made when its own scope holds no binding of it. */
+#define JS_TS_MODULE_LOCAL_STRATEGY "lsp_ts_local"
+
+/* A bare call whose nearest binding is a parameter, a variable or a catch
+ * clause (callee_is_locally_bound, from cbm_js_twin_bind_local_callees)
+ * calls a value. A row the TS resolver made for it by the name alone, to the
+ * module's definition of that name, is a guess where its scope missed the
+ * binding: it goes below the confidence floor, so no join takes it. */
+static void js_drop_value_bound_rows(CBMFileResult *r) {
+    const CBMCall **sites = NULL;
+    int n = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (!c->callee_is_locally_bound || !c->enclosing_func_qn || !c->callee_name ||
+            c->site_end_byte <= c->site_start_byte) {
+            continue;
+        }
+        if (!sites) {
+            sites = malloc((size_t)r->calls.count * sizeof(*sites));
+            if (!sites) {
+                return;
+            }
+        }
+        sites[n++] = c;
+    }
+    if (n == 0) {
+        return;
+    }
+    qsort(sites, (size_t)n, sizeof(*sites), js_call_site_cmp);
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->kind != CBM_RESOLVED_INVOCATION || !rc->caller_qn || !rc->callee_qn ||
+            !rc->strategy || strcmp(rc->strategy, JS_TS_MODULE_LOCAL_STRATEGY) != 0 ||
+            rc->site_end_byte <= rc->site_start_byte) {
+            continue;
+        }
+        CBMCall probe = {.site_start_byte = rc->site_start_byte,
+                         .site_end_byte = rc->site_end_byte};
+        const CBMCall *key = &probe;
+        const CBMCall **hit = bsearch(&key, sites, (size_t)n, sizeof(*sites), js_call_site_cmp);
+        while (hit && hit > sites && js_call_site_cmp(&hit[-1], &key) == 0) {
+            hit--;
+        }
+        for (; hit && hit < sites + n && js_call_site_cmp(hit, &key) == 0; hit++) {
+            if (strcmp((*hit)->enclosing_func_qn, rc->caller_qn) == 0 &&
+                js_twin_leaf_matches(rc->callee_qn, (*hit)->callee_name)) {
+                rc->confidence = 0.0F;
+                break;
+            }
+        }
+    }
+    free(sites);
+}
+
 void cbm_js_rebind_resolved_calls(CBMFileResult *r) {
     if (!r || r->resolved_calls.count == 0 || r->calls.count == 0) {
         return;
@@ -15286,6 +15344,7 @@ void cbm_js_rebind_resolved_calls(CBMFileResult *r) {
      * both name the callable that holds the call. */
     js_rebind_row_callers(r);
     js_twin_unify_bound_callees(r);
+    js_drop_value_bound_rows(r);
 }
 
 /* ── Calls to a group member, by scope ──────────────────────────────── */
@@ -15336,10 +15395,16 @@ void cbm_js_twin_bind_local_callees(CBMExtractCtx *ctx) {
             continue;
         }
         /* The nearest binding of the name names the callee. A parameter, a
-         * variable, a catch clause or an import that is nearer leaves the
-         * call alone, as do two callables of one name in one scope. */
+         * variable or a catch clause that is nearer holds a value: no
+         * definition is the callee by its name, so the registry gives the
+         * call no edge (callee_is_locally_bound). An import, a class, or two
+         * callables of one name in one scope leave the call alone. */
         const js_twin_decl_t *d = js_twin_nearest(table, (int)(name - table->names),
                                                   c->site_start_byte, c->site_end_byte);
+        if (d && !d->qn && d->value) {
+            r->calls.items[i].callee_is_locally_bound = true;
+            continue;
+        }
         if (!d || !d->qn) {
             continue;
         }
@@ -15393,6 +15458,7 @@ void cbm_js_twin_bind_local_callees(CBMExtractCtx *ctx) {
     }
     free(added);
     free(rows);
+    js_drop_value_bound_rows(r);
 }
 
 void cbm_extract_definitions(CBMExtractCtx *ctx) {

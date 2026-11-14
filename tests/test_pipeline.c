@@ -35986,14 +35986,6 @@ static bool js_twin_expect(const char *what, const char *got, const char *want) 
     return false;
 }
 
-static bool js_twin_expect_absent(const char *what, const char *got, const char *absent) {
-    if (!strstr(got, absent)) {
-        return true;
-    }
-    fprintf(stderr, "  %s: [%s] holds [%s]\n", what, got, absent);
-    return false;
-}
-
 static cbm_pipeline_t *js_twin_index(const char *repo, const char *db) {
     cbm_pipeline_t *p = cbm_pipeline_new(repo, db, CBM_MODE_FULL);
     if (p && cbm_pipeline_run(p) != 0) {
@@ -36096,14 +36088,13 @@ TEST(pipeline_js_local_callee_is_nearest_binding) {
         ok = js_twin_expect(what, got, "main.local -> main.local.run") && ok;
         snprintf(what, sizeof(what), "%s line 4", exts[x]);
         js_twin_calls_at(db, project, main_file, 4, got, sizeof(got));
-        ok = js_twin_expect_absent(what, got, "-> main.caught.run") && ok;
+        ok = js_twin_expect(what, got, "main.caught -> main.local") && ok;
         snprintf(what, sizeof(what), "%s line 5", exts[x]);
         js_twin_calls_at(db, project, main_file, 5, got, sizeof(got));
-        ok = js_twin_expect_absent(what, got, "-> main.blocked.run") && ok;
+        ok = js_twin_expect(what, got, "") && ok;
         snprintf(what, sizeof(what), "%s line 6", exts[x]);
         js_twin_calls_at(db, project, main_file, 6, got, sizeof(got));
-        ok = js_twin_expect_absent(what, got, "-> main.local.run") && ok;
-        ok = js_twin_expect_absent(what, got, "-> main.outer.run") && ok;
+        ok = js_twin_expect(what, got, "") && ok;
         cbm_pipeline_free(p);
         th_rmtree(tmp);
     }
@@ -36555,54 +36546,74 @@ TEST(pipeline_js_this_member_follows_extends) {
  * next() {} }` inside observable) is a local of that function: its own file
  * reaches it by its derived name, and no name-only strategy offers it to
  * another file, where `iterator.next()` on any value matched the derived
- * tail iterator.next. A full and an incremental index agree. */
+ * tail iterator.next. One worker and several (more than 50 files, so the
+ * parallel route runs) agree, and so does an incremental index. */
 TEST(pipeline_js_local_twin_stays_out_of_name_guesses) {
-    char tmp[256] = "/tmp/cbm_js_local_twin_XXXXXX";
-    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-    XlangEnvSave saved = xlang_env_select(false);
-    write_temp_file(tmp, "lib/obs.ts",
-                    "export function observable() {\n"
-                    "  const iterator = { next() { return 1; } };\n"
-                    "  const other = { next() { return 2; } };\n"
-                    "  return iterator.next() + other.next();\n"
-                    "}\n");
-    write_temp_file(tmp, "app/use.ts",
-                    "export function drain(iterator) { return iterator.next(); }\n");
-    for (int i = 0; i < 4; i++) {
-        char name[32];
-        snprintf(name, sizeof(name), "pad%d.ts", i);
-        write_temp_file(tmp, name, "export const pad = 1;\n");
-    }
-    char db[512];
-    char use_path[512];
-    snprintf(db, sizeof(db), "%s/g.db", tmp);
-    snprintf(use_path, sizeof(use_path), "%s/app/use.ts", tmp);
-    cbm_pipeline_t *p = js_twin_index(tmp, db);
-    ASSERT_NOT_NULL(p);
-    char project[256];
-    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
-    cbm_pipeline_free(p);
+    enum { LOCAL_TWIN_PADS = 60 };
     static const char *const own =
         "lib.obs.observable -> lib.obs.iterator.next; lib.obs.observable -> lib.obs.other.next";
-    char got[1024];
-    js_twin_calls_at(db, project, "lib/obs.ts", 4, got, sizeof(got));
-    bool ok = js_twin_expect("full own file", got, own);
-    js_twin_calls_at(db, project, "app/use.ts", 1, got, sizeof(got));
-    ok = js_twin_expect("full other file", got, "") && ok;
+    bool ok = true;
+    for (int parallel = 0; parallel < 2; parallel++) {
+        char tmp[256] = "/tmp/cbm_js_local_twin_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        XlangEnvSave saved = xlang_env_select(parallel == 1);
+        write_temp_file(tmp, "lib/obs.ts",
+                        "export function observable() {\n"
+                        "  const iterator = { next() { return 1; } };\n"
+                        "  const other = { next() { return 2; } };\n"
+                        "  return iterator.next() + other.next();\n"
+                        "}\n");
+        write_temp_file(tmp, "app/use.ts",
+                        "export function drain(iterator) { return iterator.next(); }\n");
+        for (int i = 0; i < LOCAL_TWIN_PADS; i++) {
+            char name[32];
+            snprintf(name, sizeof(name), "pad%d.ts", i);
+            write_temp_file(tmp, name, "export const pad = 1;\n");
+        }
+        char db[512];
+        char use_path[512];
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        snprintf(use_path, sizeof(use_path), "%s/app/use.ts", tmp);
+        cbm_pipeline_worker_count_test_reset();
+        cbm_pipeline_t *p = js_twin_index(tmp, db);
+        int workers = cbm_pipeline_worker_count_test_last();
+        ASSERT_NOT_NULL(p);
+        char project[256];
+        snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+        cbm_pipeline_free(p);
+        char what[64];
+        char got[1024];
+        snprintf(what, sizeof(what), "%s full own file", parallel ? "parallel" : "one worker");
+        js_twin_calls_at(db, project, "lib/obs.ts", 4, got, sizeof(got));
+        ok = js_twin_expect(what, got, own) && ok;
+        snprintf(what, sizeof(what), "%s full other file", parallel ? "parallel" : "one worker");
+        js_twin_calls_at(db, project, "app/use.ts", 1, got, sizeof(got));
+        ok = js_twin_expect(what, got, "") && ok;
+        /* The parallel route runs with more than one worker and more than 50
+         * files (MIN_FILES_FOR_PARALLEL); the sequential one with one. */
+        if ((parallel == 1) != (workers > 1)) {
+            fprintf(stderr, "  %s: %d workers\n", parallel ? "parallel" : "one worker", workers);
+            ok = false;
+        }
 
-    write_temp_file(tmp, "app/use.ts",
-                    "export function drain(iterator) { return iterator.next() || 0; }\n");
-    ASSERT_EQ(pipeline_test_set_mtime(use_path, 2000000000, 0), 0);
-    cbm_pipeline_incremental_test_reset_faults();
-    p = js_twin_index(tmp, db);
-    ASSERT_NOT_NULL(p);
-    cbm_pipeline_free(p);
-    xlang_env_restore(&saved);
-    js_twin_calls_at(db, project, "app/use.ts", 1, got, sizeof(got));
-    ok = js_twin_expect("incremental other file", got, "") && ok;
-    js_twin_calls_at(db, project, "lib/obs.ts", 4, got, sizeof(got));
-    ok = js_twin_expect("incremental own file", got, own) && ok;
-    th_rmtree(tmp);
+        write_temp_file(tmp, "app/use.ts",
+                        "export function drain(iterator) { return iterator.next() || 0; }\n");
+        ASSERT_EQ(pipeline_test_set_mtime(use_path, 2000000000, 0), 0);
+        cbm_pipeline_incremental_test_reset_faults();
+        p = js_twin_index(tmp, db);
+        ASSERT_NOT_NULL(p);
+        cbm_pipeline_free(p);
+        xlang_env_restore(&saved);
+        snprintf(what, sizeof(what), "%s incremental other file",
+                 parallel ? "parallel" : "one worker");
+        js_twin_calls_at(db, project, "app/use.ts", 1, got, sizeof(got));
+        ok = js_twin_expect(what, got, "") && ok;
+        snprintf(what, sizeof(what), "%s incremental own file",
+                 parallel ? "parallel" : "one worker");
+        js_twin_calls_at(db, project, "lib/obs.ts", 4, got, sizeof(got));
+        ok = js_twin_expect(what, got, own) && ok;
+        th_rmtree(tmp);
+    }
     ASSERT_TRUE(ok);
     PASS();
 }
