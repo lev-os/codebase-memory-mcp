@@ -156,7 +156,7 @@ TEST(repro_issue514_data_flow_surfaces_arg_expr) {
              "\"mode\":\"data_flow\"}",
              lp.project);
 
-    char *resp = cbm_mcp_handle_tool(lp.srv, "trace_path", args);
+    char *resp = rh_call(&lp, "trace_path", args);
     ASSERT_NOT_NULL(resp);
 
     fprintf(stderr, "  [514] trace_path data_flow response: %.400s\n", resp);
@@ -232,17 +232,7 @@ static char *rh514_trace_inbound(RProj *lp, const char *fn_name) {
              "\"depth\":1}",
              fn_name, lp->project);
 
-    const char *prior_cache_dir = getenv("CBM_CACHE_DIR");
-    char *saved_cache_dir = prior_cache_dir ? strdup(prior_cache_dir) : NULL;
-    cbm_setenv("CBM_CACHE_DIR", lp->cachedir, 1);
-    char *resp = cbm_mcp_handle_tool(lp->srv, "trace_path", args);
-    if (saved_cache_dir) {
-        cbm_setenv("CBM_CACHE_DIR", saved_cache_dir, 1);
-        free(saved_cache_dir);
-    } else {
-        cbm_unsetenv("CBM_CACHE_DIR");
-    }
-    return resp;
+    return rh_call(lp, "trace_path", args);
 }
 
 TEST(repro_issue514_ctor_param_property_callers) {

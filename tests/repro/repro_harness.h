@@ -49,6 +49,24 @@ static inline void rh_to_fwd_slashes(char *p) {
     }
 }
 
+/* MCP tools resolve project databases on every call. Keep the fixture cache
+ * selected for the whole call, then restore the caller's environment. */
+static inline char *rh_call(RProj *lp, const char *tool, const char *args) {
+    const char *prior = getenv("CBM_CACHE_DIR");
+    char *saved = prior ? cbm_strdup(prior) : NULL;
+    if (prior && !saved)
+        return NULL;
+    cbm_setenv("CBM_CACHE_DIR", lp->cachedir, 1);
+    char *response = cbm_mcp_handle_tool(lp->srv, tool, args);
+    if (saved) {
+        cbm_setenv("CBM_CACHE_DIR", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    return response;
+}
+
 /* Index lp->tmpdir (already populated) via the production index_repository flow
  * and open the resulting graph DB (NULL on failure). */
 static inline cbm_store_t *rh_open_indexed(RProj *lp) {
