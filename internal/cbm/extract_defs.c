@@ -14342,11 +14342,14 @@ static bool js_twin_module_block(const TSNode *anc, int i) {
 static int js_twin_rank(const CBMExtractCtx *ctx, TSNode fn, const TSNode *anc, int depth,
                         const char *name) {
     const char *k = ts_node_type(fn);
-    int i = depth - SKIP_ONE; /* the parent */
-    if (i < 0) {
-        return JS_TWIN_RANK_NESTED;
-    }
-    if (js_twin_function_value_kind(k) || strcmp(k, "arrow_function") == 0) {
+    int p; /* the parent of the statement that declares it */
+    if (js_twin_declaration_kind(k)) {
+        p = depth - SKIP_ONE; /* the declaration is the statement */
+    } else if (js_twin_function_value_kind(k) || strcmp(k, "arrow_function") == 0) {
+        int i = depth - SKIP_ONE; /* the parent */
+        if (i < 0) {
+            return JS_TWIN_RANK_NESTED;
+        }
         const char *pk = ts_node_type(anc[i]);
         if (strcmp(pk, "export_statement") == 0) { /* export default function f() {} */
             return i > 0 && js_twin_module_block(anc, i - SKIP_ONE) ? JS_TWIN_RANK_EXPORTED
@@ -14354,28 +14357,29 @@ static int js_twin_rank(const CBMExtractCtx *ctx, TSNode fn, const TSNode *anc, 
         }
         const char *s = NULL;
         size_t len = 0;
-        if (strcmp(pk, "variable_declarator") != 0 || i < PAIR_LEN ||
+        if (strcmp(pk, "variable_declarator") != 0 || i < SKIP_ONE ||
             !js_twin_child_is(anc[i], TS_FIELD("value"), fn) ||
             !js_twin_name_text(ctx, ts_node_child_by_field_name(anc[i], TS_FIELD("name")), &s,
                                &len) ||
             strlen(name) != len || memcmp(name, s, len) != 0) {
             return JS_TWIN_RANK_NESTED; /* `const alias = function name() {}` binds alias */
         }
-        i--; /* the declaration */
-        const char *dk = ts_node_type(anc[i]);
+        const char *dk = ts_node_type(anc[i - SKIP_ONE]); /* the declaration */
         if (strcmp(dk, "lexical_declaration") != 0 && strcmp(dk, "variable_declaration") != 0) {
             return JS_TWIN_RANK_NESTED;
         }
-    } else if (!js_twin_declaration_kind(k)) {
+        p = i - PAIR_LEN;
+    } else {
         return JS_TWIN_RANK_NESTED; /* a method */
     }
-    /* anc[i] is the statement that declares it. */
-    if (i > 0 && strcmp(ts_node_type(anc[i - SKIP_ONE]), "export_statement") == 0) {
-        return i > SKIP_ONE && js_twin_module_block(anc, i - PAIR_LEN) ? JS_TWIN_RANK_EXPORTED
-                                                                       : JS_TWIN_RANK_NESTED;
+    if (p < 0) {
+        return JS_TWIN_RANK_NESTED;
     }
-    return i > 0 && js_twin_module_block(anc, i - SKIP_ONE) ? JS_TWIN_RANK_MODULE
-                                                            : JS_TWIN_RANK_NESTED;
+    if (strcmp(ts_node_type(anc[p]), "export_statement") == 0) {
+        return p > 0 && js_twin_module_block(anc, p - SKIP_ONE) ? JS_TWIN_RANK_EXPORTED
+                                                                : JS_TWIN_RANK_NESTED;
+    }
+    return js_twin_module_block(anc, p) ? JS_TWIN_RANK_MODULE : JS_TWIN_RANK_NESTED;
 }
 
 /* The named owner of the callable whose ancestors are anc[0..depth): the

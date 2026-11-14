@@ -36251,11 +36251,45 @@ TEST(pipeline_js_twin_insert_incremental_equals_full) {
     PASS();
 }
 
+/* A top-level declaration keeps the plain name although a same-name
+ * callable without a named owner comes before it in the file. */
+TEST(pipeline_js_top_level_declaration_keeps_plain_name) {
+    static const char *const exts[] = {"js", "tsx"};
+    bool ok = true;
+    for (int x = 0; x < 2; x++) {
+        char tmp[256] = "/tmp/cbm_js_top_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        char local[32];
+        snprintf(local, sizeof(local), "local.%s", exts[x]);
+        write_temp_file(tmp, local,
+                        "describe(() => { function run() { return 0; } run(); });\n"
+                        "function run() { return 1; }\n"
+                        "export function use() { return run(); }\n");
+        char db[512];
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        cbm_pipeline_t *p = js_twin_index(tmp, db);
+        ASSERT_NOT_NULL(p);
+        const char *project = cbm_pipeline_project_name(p);
+        char got[1024];
+        js_twin_qn_at(db, project, local, "run", 2, got, sizeof(got));
+        ok = js_twin_expect(exts[x], got, "local.run") && ok;
+        js_twin_qn_at(db, project, local, "run", 1, got, sizeof(got));
+        ok = js_twin_expect(exts[x], got, "local.run#2") && ok;
+        js_twin_calls_at(db, project, local, 3, got, sizeof(got));
+        ok = js_twin_expect(exts[x], got, "local.use -> local.run") && ok;
+        cbm_pipeline_free(p);
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
     RUN_TEST(pipeline_js_module_binding_keeps_plain_name);
     RUN_TEST(pipeline_js_local_callee_is_nearest_binding);
     RUN_TEST(pipeline_js_accessor_pairs_keep_their_calls);
     RUN_TEST(pipeline_js_twin_insert_incremental_equals_full);
+    RUN_TEST(pipeline_js_top_level_declaration_keeps_plain_name);
     RUN_TEST(pipeline_ts_caller_is_innermost_named_callable);
     RUN_TEST(pipeline_ts_signature_targets_require_owner);
     RUN_TEST(pipeline_inc_c_family_fragments);
