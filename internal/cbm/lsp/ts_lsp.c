@@ -2193,6 +2193,12 @@ static const CBMRegisteredFunc *lookup_method_at(TSLSPContext *ctx, const CBMTyp
                 }
             }
         }
+        /* Cross-file registries keep methods by their exact receiver QN,
+         * without a per-type method-name list. Use that same named-type
+         * lookup for a generic instance; its arguments remain on the caller
+         * for return-type substitution. */
+        const CBMType *named = cbm_type_named(ctx->arena, base->data.template_type.template_name);
+        return lookup_method_at(ctx, named, method_name, depth + 1, state);
     }
 
     if (base->kind == CBM_TYPE_UNION || base->kind == CBM_TYPE_INTERSECTION) {
@@ -2805,18 +2811,25 @@ static const CBMType *resolve_type_with_imports(TSLSPContext *ctx, const CBMType
 
     if (t->kind == CBM_TYPE_NAMED && t->data.named.qualified_name) {
         const char *qn = t->data.named.qualified_name;
-        const char *dot = strrchr(qn, '.');
-        const char *bare = dot ? dot + 1 : qn;
+        const char *bare = qn;
+        if (ctx->module_qn) {
+            size_t module_len = strlen(ctx->module_qn);
+            if (strncmp(qn, ctx->module_qn, module_len) == 0 && qn[module_len] == '.')
+                bare = qn + module_len + 1;
+        }
+        /* Only a bare name or the local prefix added by the type parser can
+         * denote an import. A qualified spelling keeps its owner; matching
+         * just its last segment would redirect it to a same-name decoy. */
+        if (strchr(bare, '.'))
+            return t;
 
-        // TS semantics: locally-declared types shadow ambient/stdlib types with the
-        // same name. parse_ts_type_text leaves stdlib names bare to match the stdlib
-        // registration QN; if the local module has a type with the same short name
-        // (e.g. test files declaring their own `Response`/`File`/etc.), prefer that.
-        if (!dot && ctx->module_qn) {
-            const char *local_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, bare);
+        // A registered local type shadows an import from an outer scope.
+        if (ctx->module_qn) {
+            const char *local_qn = bare != qn ? qn
+                : cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, bare);
             const CBMRegisteredType *local_rt = cbm_registry_lookup_type(ctx->registry, local_qn);
             if (local_rt)
-                return cbm_type_named(ctx->arena, local_qn);
+                return bare != qn ? t : cbm_type_named(ctx->arena, local_qn);
         }
 
         for (int i = 0; i < ctx->import_count; i++) {
@@ -2842,7 +2855,17 @@ static const CBMType *resolve_type_with_imports(TSLSPContext *ctx, const CBMType
             new_args[i] = resolve_type_with_imports(ctx, t->data.template_type.template_args[i]);
         }
         new_args[ac] = NULL;
-        return cbm_type_template(ctx->arena, t->data.template_type.template_name, new_args, ac);
+        /* The generic base has the same import identity as a named type.
+         * Resolving only its arguments strands imported Packet<T> in this
+         * module, so neither parameter nor field receivers find its methods. */
+        const char *base_name = t->data.template_type.template_name;
+        if (base_name) {
+            const CBMType *base =
+                resolve_type_with_imports(ctx, cbm_type_named(ctx->arena, base_name));
+            if (base && base->kind == CBM_TYPE_NAMED)
+                base_name = base->data.named.qualified_name;
+        }
+        return cbm_type_template(ctx->arena, base_name, new_args, ac);
     }
     if (t->kind == CBM_TYPE_UNION || t->kind == CBM_TYPE_INTERSECTION) {
         if (!t->data.union_type.members || t->data.union_type.count == 0)
