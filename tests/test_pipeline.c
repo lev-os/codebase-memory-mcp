@@ -7500,6 +7500,291 @@ TEST(pipeline_incremental_barrel_reexport_switch_matches_full) {
     PASS();
 }
 
+/* Closure repair through a barrel (review of #2900, item 2). The repair
+ * re-resolves only the files it re-parses, against proxies of the others; the
+ * barrel walk reads the barrel's re-export IMPORTS edges and the DEFINES edges
+ * of a plain star target, which a proxy does not carry. Each case indexes,
+ * edits only bodies (the route is the closure repair), indexes again, then
+ * indexes the edited tree clean. The repaired graph must equal the clean one
+ * edge for edge, strategy included, and run() must call lib/a.ts's pick by
+ * the strategy of the clean index (the import map for a named re-export, the
+ * TS LSP for a star one): no lost edge, and no name guess, which the decoy in
+ * other/ (the same names) would catch. */
+
+/* Every edge as one "TYPE source -> target strategy" line, QNs without the
+ * project prefix, sorted. NULL when the database cannot be read (the caller
+ * frees). */
+static char *barrel_repair_edges(const char *db_path) {
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+                           "SELECT e.type || ' ' || replace(s.qualified_name, e.project || '.', '')"
+                           " || ' -> ' || replace(t.qualified_name, e.project || '.', '')"
+                           " || ' ' || coalesce(json_extract(e.properties, '$.strategy'), '-')"
+                           " FROM edges e JOIN nodes s ON s.id = e.source_id"
+                           " JOIN nodes t ON t.id = e.target_id ORDER BY 1",
+                           -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return NULL;
+    }
+    size_t cap = 4096;
+    size_t len = 0;
+    char *buf = malloc(cap);
+    if (buf) {
+        buf[0] = '\0';
+    }
+    int step_rc = SQLITE_DONE;
+    while (buf && (step_rc = sqlite3_step(st)) == SQLITE_ROW) {
+        const char *line = (const char *)sqlite3_column_text(st, 0);
+        size_t l = line ? strlen(line) : 0;
+        if (len + l + 2 > cap) {
+            cap = (len + l + 2) * 2;
+            char *grown = realloc(buf, cap);
+            if (!grown) {
+                free(buf);
+                buf = NULL;
+                break;
+            }
+            buf = grown;
+        }
+        memcpy(buf + len, line ? line : "", l);
+        len += l;
+        buf[len++] = '\n';
+        buf[len] = '\0';
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    if (step_rc != SQLITE_DONE) {
+        free(buf);
+        buf = NULL;
+    }
+    return buf;
+}
+
+/* Invalid JSON makes json_extract fail during sqlite3_step, after prepare
+ * has succeeded. An empty/partial list must not masquerade as a full read. */
+TEST(pipeline_barrel_repair_edges_rejects_sql_error) {
+    char tmp[256] = "/tmp/cbm_barrel_sql_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char path[512];
+    snprintf(path, sizeof(path), "%s/edges.db", tmp);
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(path, &db), SQLITE_OK);
+    int rc = sqlite3_exec(db,
+                          "CREATE TABLE nodes(id INTEGER, qualified_name TEXT);"
+                          "CREATE TABLE edges(source_id INTEGER, target_id INTEGER,"
+                          " type TEXT, project TEXT, properties TEXT);"
+                          "INSERT INTO nodes VALUES(1, 'p.app.run'), (2, 'p.impl.b.pick');"
+                          "INSERT INTO edges VALUES(1, 2, 'CALLS', 'p', 'invalid JSON');",
+                          NULL, NULL, NULL);
+    sqlite3_close(db);
+    ASSERT_EQ(rc, SQLITE_OK);
+    char *edges = barrel_repair_edges(path);
+    bool rejected = edges == NULL;
+    free(edges);
+    th_rmtree(tmp);
+    ASSERT_TRUE(rejected);
+    PASS();
+}
+
+/* The lines of `a` that `b` lacks, each prefixed with `mark`. */
+static void barrel_repair_print_missing(const char *a, const char *b, const char *mark) {
+    for (const char *line = a; line && *line;) {
+        const char *end = strchr(line, '\n');
+        size_t l = end ? (size_t)(end - line) + 1 : strlen(line);
+        bool found = false;
+        for (const char *p = b; p && *p && !found;) {
+            const char *pe = strchr(p, '\n');
+            size_t pl = pe ? (size_t)(pe - p) + 1 : strlen(p);
+            found = pl == l && memcmp(p, line, l) == 0;
+            p += pl;
+        }
+        if (!found) {
+            printf("  %s %.*s", mark, (int)l, line);
+        }
+        line += l;
+    }
+}
+
+typedef struct {
+    const char *path;
+    const char *body;
+} barrel_edit_t;
+
+/* Index tmp, apply the edits, index again, then index the edited tree clean
+ * into reference-full.db. Returns the route of the second run, or -1 when a
+ * run fails; *inc and *full get the two edge sets (the caller frees). */
+static int barrel_repair_run(const char *tmp, const barrel_edit_t *edits, int edit_count,
+                             char **inc, char **full) {
+    *inc = NULL;
+    *full = NULL;
+    char db[512];
+    char full_db[512];
+    snprintf(db, sizeof(db), "%s/barrel.db", tmp);
+    snprintf(full_db, sizeof(full_db), "%s/reference-full.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_pipeline_free(p);
+    if (rc != 0) {
+        return -1;
+    }
+    for (int i = 0; i < edit_count; i++) {
+        write_temp_file(tmp, edits[i].path, edits[i].body);
+    }
+    cbm_pipeline_incremental_test_reset_faults();
+    p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    rc = p ? cbm_pipeline_run(p) : -1;
+    int route = (int)cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(p);
+    if (rc != 0) {
+        return -1;
+    }
+    cbm_unlink(full_db);
+    cbm_remove_db_sidecars(full_db);
+    p = cbm_pipeline_new(tmp, full_db, CBM_MODE_FULL);
+    rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_pipeline_free(p);
+    if (rc != 0) {
+        return -1;
+    }
+    *inc = barrel_repair_edges(db);
+    *full = barrel_repair_edges(full_db);
+    return route;
+}
+
+/* Run one case in a fresh tree (lib/a.ts, the decoy, and the given barrel
+ * and app.ts) and check it: run() calls lib/a.ts's pick by `strategy`.
+ * Prints the route and the edge differences when it fails. */
+static bool barrel_repair_case(const char *name, const char *barrel, const char *app,
+                               const char *strategy, const barrel_edit_t *edits,
+                               int edit_count) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_barrel_repair_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return false;
+    }
+    write_temp_file(tmp, "lib/a.ts", "export function pick(): number {\n  return 1;\n}\n");
+    write_temp_file(tmp, "lib/index.ts", barrel);
+    write_temp_file(tmp, "other/decoy.ts",
+                    "export function pick(): number {\n  return 9;\n}\n"
+                    "export function choose(): number {\n  return 8;\n}\n");
+    write_temp_file(tmp, "app.ts", app);
+    char *inc = NULL;
+    char *full = NULL;
+    int route = barrel_repair_run(tmp, edits, edit_count, &inc, &full);
+    th_rmtree(tmp);
+    char want[128];
+    snprintf(want, sizeof(want), "CALLS app.run -> lib.a.pick %s\n", strategy);
+    bool ok = route == (int)CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR && inc && full &&
+              strstr(full, want) && strcmp(inc, full) == 0;
+    if (!ok) {
+        printf("\n  [%s] route %d (closure repair is %d); clean index has the %s call: %s\n",
+               name, route, (int)CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR, strategy,
+               full && strstr(full, want) ? "yes" : "no");
+        barrel_repair_print_missing(full, inc, "only in the clean index:");
+        barrel_repair_print_missing(inc, full, "only in the repair:     ");
+    }
+    free(inc);
+    free(full);
+    return ok;
+}
+
+static const char barrel_app_named[] = "import { choose } from './lib';\n"
+                                       "export function run(): number {\n"
+                                       "  return choose();\n"
+                                       "}\n";
+static const char barrel_app_named_v2[] = "import { choose } from './lib';\n"
+                                          "export function run(): number {\n"
+                                          "  return choose() + 0;\n"
+                                          "}\n";
+static const char barrel_app_star[] = "import { pick } from './lib';\n"
+                                      "export function run(): number {\n"
+                                      "  return pick();\n"
+                                      "}\n";
+static const char barrel_app_star_v2[] = "import { pick } from './lib';\n"
+                                         "export function run(): number {\n"
+                                         "  return pick() + 0;\n"
+                                         "}\n";
+
+/* The maintainer's case: only app.ts changes; the barrel renames pick. */
+TEST(pipeline_incremental_barrel_named_importer_edit_matches_full) {
+    const barrel_edit_t edits[] = {{"app.ts", barrel_app_named_v2}};
+    ASSERT_TRUE(barrel_repair_case("named", "export { pick as choose } from './a';\n",
+                                   barrel_app_named, "import_map", edits, 1));
+    PASS();
+}
+
+/* The star form: the answer needs the DEFINES edges of the star target. */
+TEST(pipeline_incremental_barrel_star_importer_edit_matches_full) {
+    const barrel_edit_t edits[] = {{"app.ts", barrel_app_star_v2}};
+    ASSERT_TRUE(barrel_repair_case("star", "export * from './a';\n", barrel_app_star,
+                                   "lsp_ts_import", edits, 1));
+    PASS();
+}
+
+/* The star target changes too: the purge dropped the unchanged barrel's edge
+ * into a.ts, which now has fresh nodes. */
+TEST(pipeline_incremental_barrel_star_target_and_importer_edit_matches_full) {
+    const barrel_edit_t edits[] = {
+        {"lib/a.ts", "export function pick(): number {\n  return 1 + 1;\n}\n"},
+        {"app.ts", barrel_app_star_v2},
+    };
+    ASSERT_TRUE(barrel_repair_case("star target", "export * from './a';\n", barrel_app_star,
+                                   "lsp_ts_import", edits, 2));
+    PASS();
+}
+
+/* The barrel changes too (the body of a function it also defines): it draws
+ * its own edges again, but its star target a.ts stays a proxy. */
+TEST(pipeline_incremental_barrel_and_importer_edit_matches_full) {
+    const barrel_edit_t edits[] = {
+        {"lib/index.ts", "export * from './a';\n"
+                         "export function version(): number {\n  return 1 + 1;\n}\n"},
+        {"app.ts", barrel_app_star_v2},
+    };
+    ASSERT_TRUE(barrel_repair_case("barrel",
+                                   "export * from './a';\n"
+                                   "export function version(): number {\n  return 1;\n}\n",
+                                   barrel_app_star, "lsp_ts_import", edits, 2));
+    PASS();
+}
+
+/* A scoped alias can change a barrel's answer without changing its exports
+ * or the importer outside that scope. The persisted call must follow it. */
+TEST(pipeline_incremental_barrel_scoped_alias_change_matches_full) {
+    char tmp[256] = "/tmp/cbm_barrel_alias_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "impl/a.ts", "export function pick(): number { return 1; }\n");
+    write_temp_file(tmp, "impl/b.ts", "export function pick(): number { return 2; }\n");
+    write_temp_file(tmp, "lib/index.ts", "export { pick as choose } from '@selected';\n");
+    write_temp_file(
+        tmp, "lib/tsconfig.json",
+        "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@selected\":[\"../impl/a\"]}}}\n");
+    write_temp_file(tmp, "app.ts", barrel_app_named);
+    const barrel_edit_t edits[] = {
+        {"lib/tsconfig.json",
+         "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@selected\":[\"../impl/b\"]}}}\n"},
+    };
+    char *inc = NULL;
+    char *full = NULL;
+    int route = barrel_repair_run(tmp, edits, 1, &inc, &full);
+    th_rmtree(tmp);
+    const char *want = "CALLS app.run -> impl.b.pick import_map\n";
+    bool ok = route >= 0 && inc && full && strstr(full, want) && strstr(inc, want) &&
+              !strstr(inc, "CALLS app.run -> impl.a.pick ") && strcmp(inc, full) == 0;
+    if (!ok) {
+        printf("\n  [scoped alias] route %d; clean index calls impl.b.pick: %s\n", route,
+               full && strstr(full, want) ? "yes" : "no");
+        barrel_repair_print_missing(full, inc, "only in the clean index:");
+        barrel_repair_print_missing(inc, full, "only in the repair:     ");
+    }
+    free(inc);
+    free(full);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 /* Companion to pipeline_adr_written_during_reindex_survives (the full route):
  * an ADR written from the publication hook mid-reindex must also survive the
  * closure-DELTA route (item 7a — "both the full and the delta route"). The
@@ -35959,6 +36244,12 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_parallel_manifest_is_byte_stable_above_threshold);
     RUN_TEST(pipeline_closure_repair_body_edit_converges_with_fresh_full);
     RUN_TEST(pipeline_incremental_barrel_reexport_switch_matches_full);
+    RUN_TEST(pipeline_incremental_barrel_named_importer_edit_matches_full);
+    RUN_TEST(pipeline_incremental_barrel_star_importer_edit_matches_full);
+    RUN_TEST(pipeline_incremental_barrel_star_target_and_importer_edit_matches_full);
+    RUN_TEST(pipeline_incremental_barrel_and_importer_edit_matches_full);
+    RUN_TEST(pipeline_incremental_barrel_scoped_alias_change_matches_full);
+    RUN_TEST(pipeline_barrel_repair_edges_rejects_sql_error);
     RUN_TEST(pipeline_incremental_root_path_refreshed_across_directories);
     RUN_TEST(pipeline_closure_repair_removed_def_drops_dependent_edge);
     RUN_TEST(pipeline_closure_repair_added_name_declines_to_full);
