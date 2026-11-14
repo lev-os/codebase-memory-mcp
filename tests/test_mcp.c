@@ -1431,8 +1431,10 @@ TEST(mcp_metadata_byte_budget) {
      * 21 KiB overall (raised from 20 KiB for the infra filters and the
      * topology/deploy/run trace modes: one usage hint per mode keeps them
      * findable); only detect_changes may exceed the 3200-byte per-tool
-     * ceiling, with its own 4096-byte bound. */
-    ASSERT_LT((int)strlen(json), 21 * 1024);
+     * ceiling, with its own 4096-byte bound. On lev, 21 KiB + 256 B: the
+     * include_evidence hint names what name_guess marks (52 B over main),
+     * which with #2978's include_overrides passed 21 KiB by 24 B. */
+    ASSERT_LT((int)strlen(json), 21 * 1024 + 256);
 
     yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
     ASSERT_NOT_NULL(doc);
