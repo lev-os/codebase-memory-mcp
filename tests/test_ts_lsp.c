@@ -26,6 +26,7 @@
 #include "../src/foundation/compat.h"
 #include "../src/pipeline/lsp_resolve.h"
 #include "lsp/ts_lsp.h"
+#include "lsp/lsp_work.h"
 #include <limits.h>
 
 /* ── Helpers ───────────────────────────────────────────────────────────────── */
@@ -5415,7 +5416,49 @@ TEST(tslsp_module_receiver_occurrences_and_scopes) {
     PASS();
 }
 
+/* Unknown generic receivers cannot gain a target from unrelated functions.
+ * Increasing both declarations and calls fourfold must not multiply registry
+ * visits quadratically. Use the existing registry work counter, not timing. */
+static uint64_t ts_unknown_generic_work(int count, bool *no_edge) {
+    *no_edge = false;
+    size_t cap = (size_t)count * 128 + 512;
+    char *source = malloc(cap);
+    if (!source)
+        return 0;
+    int off = snprintf(source, cap, "class Decoy { deliver() {} }\n");
+    for (int i = 0; i < count; i++)
+        off += snprintf(source + off, cap - (size_t)off, "function padding%d() {}\n", i);
+    off += snprintf(source + off, cap - (size_t)off,
+                    "function probe(value: Missing<number>) {\n");
+    for (int i = 0; i < count; i++)
+        off += snprintf(source + off, cap - (size_t)off, "value.deliver();\n");
+    snprintf(source + off, cap - (size_t)off, "}\n");
+    (void)cbm_lsp_work_take();
+    CBMFileResult *r = extract_ts(source);
+    uint64_t work = cbm_lsp_work_take();
+    if (r) {
+        *no_edge = find_resolved(r, ".probe", ".deliver") < 0;
+        cbm_free_result(r);
+    }
+    free(source);
+    return work;
+}
+
+TEST(tslsp_unknown_generic_lookup_work_is_linear) {
+    bool small_unknown, large_unknown;
+    uint64_t small = ts_unknown_generic_work(256, &small_unknown);
+    uint64_t large = ts_unknown_generic_work(1024, &large_unknown);
+    fprintf(stderr, "unknown generic registry visits: 256=%llu 1024=%llu\n",
+            (unsigned long long)small, (unsigned long long)large);
+    ASSERT_TRUE(small_unknown);
+    ASSERT_TRUE(large_unknown);
+    ASSERT_GT(small, 0);
+    ASSERT_LTE(large, small * 6);
+    PASS();
+}
+
 SUITE(ts_lsp) {
+    RUN_TEST(tslsp_unknown_generic_lookup_work_is_linear);
     RUN_TEST(tslsp_module_receiver_occurrences_and_scopes);
     RUN_TEST(ts_lsp_index_file_local_scope);
     /* Smoke (Phase 1) */
