@@ -24,6 +24,7 @@
 #include "foundation/str_util.h"
 #include "foundation/win_utf8.h"
 #include "foundation/yaml.h"
+#include "helpers.h"
 
 #include <yyjson/yyjson.h>
 
@@ -1721,6 +1722,44 @@ static char *alias_module_qn(const cbm_pipeline_ctx_t *ctx, const char *module_p
     return stripped;
 }
 
+/* A resolved path can name a file whose extracted module has a different QN
+ * (hidden directory markers are removed during extraction), or no Module at
+ * all. Find the exact indexed file before using its extraction-owned name.
+ * A same-named file elsewhere must never satisfy this lookup. */
+static char *js_indexed_file_qn(const cbm_pipeline_ctx_t *ctx, const char *path) {
+    static const char *const suffixes[] = {
+        "", ".ts", ".tsx", ".d.ts", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs", ".json",
+        "/index.ts", "/index.tsx", "/index.d.ts", "/index.js", "/index.jsx", "/index.mts",
+        "/index.cts", "/index.mjs", "/index.cjs", "/index.json",
+    };
+    if (!ctx->gbuf || !path || !path[0]) {
+        return NULL;
+    }
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        char candidate[PKGMAP_PATH_BUF];
+        int n = snprintf(candidate, sizeof(candidate), "%s%s", path, suffixes[i]);
+        if (n < 0 || (size_t)n >= sizeof(candidate)) {
+            continue;
+        }
+        const cbm_gbuf_node_t *file =
+            cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, candidate);
+        if (!file || !file->file_path || strcmp(file->file_path, candidate) != 0) {
+            continue;
+        }
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        const char *module_qn = cbm_fqn_module(&arena, ctx->project_name, candidate);
+        const cbm_gbuf_node_t *module =
+            module_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, module_qn) : NULL;
+        bool exact = module && module->label && strcmp(module->label, "Module") == 0 &&
+                     module->file_path && strcmp(module->file_path, candidate) == 0;
+        char *qn = strdup(exact ? module->qualified_name : file->qualified_name);
+        cbm_arena_destroy(&arena);
+        return qn;
+    }
+    return NULL;
+}
+
 /* A JS directory import names its indexed entry module, never the Folder.
  * Package targets, including output-to-source mappings, must name a module
  * that exists in the graph. */
@@ -1824,8 +1863,14 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
          * dotted extensionless basename such as `featureX.engine` is not
          * stripped a second time by cbm_pipeline_fqn_module. */
         char *qn = cbm_pipeline_fqn_folder(ctx->project_name, resolved);
+        if (js) {
+            qn = js_module_qn(ctx, qn, false);
+            if (!qn) {
+                qn = js_indexed_file_qn(ctx, resolved);
+            }
+        }
         free(resolved);
-        return js ? js_module_qn(ctx, qn, false) : qn;
+        return qn;
     }
 
     /* 1b. Try build-tool path aliases (tsconfig/jsconfig paths today;
@@ -1837,8 +1882,14 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
             char *aliased = cbm_path_alias_resolve(amap, module_path);
             if (aliased) {
                 char *qn = alias_module_qn(ctx, module_path, aliased);
+                if (js) {
+                    qn = js_module_qn(ctx, qn, false);
+                    if (!qn) {
+                        qn = js_indexed_file_qn(ctx, aliased);
+                    }
+                }
                 free(aliased);
-                return js ? js_module_qn(ctx, qn, false) : qn;
+                return qn;
             }
         }
     }
@@ -2219,44 +2270,6 @@ static bool python_external_hit_rejected(const CBMImport *imp, const char *name,
  * `import com.example.Foo`, Rust `use crate::ops::helper`) keep it. */
 bool cbm_import_symbol_fallback_allowed(CBMLanguage lang) {
     return lang != CBM_LANG_GO;
-}
-
-/* A JS/TS import specifier always names a module, never a symbol: the
- * imported names live in local_name. A bare specifier (`path`, `node:fs`,
- * `@scope/pkg/sub`) that Strategy 1 (relative path, tsconfig paths, package
- * manifests) did not resolve is a Node built-in or a dependency outside the
- * graph, and the correct result is NO edge. The name-guess fallbacks instead
- * matched a path segment against any project symbol (`path` -> Router.path(),
- * `@acme/config` -> a test's local `config`), and the import map then sent
- * every call of the imported name there at import_map confidence. */
-static bool js_external_bare_specifier(CBMLanguage lang, const char *module_path) {
-    if (lang != CBM_LANG_JAVASCRIPT && lang != CBM_LANG_TYPESCRIPT && lang != CBM_LANG_TSX) {
-        return false;
-    }
-    if (!module_path || !module_path[0]) {
-        return false;
-    }
-    if (strncmp(module_path, "node:", strlen("node:")) == 0) {
-        return true;
-    }
-    /* Only an npm package-name shape: `pkg[/sub]` or `@scope/pkg[/sub]`.
-     * Bundler aliases (`@/x`, `~/x`) and `#x` subpath imports keep the
-     * fallbacks, since no package name spells them. */
-    const char *s = module_path;
-    if (*s == '@') {
-        s++;
-        if (!isalnum((unsigned char)*s)) {
-            return false;
-        }
-        while (*s && *s != '/') {
-            s++;
-        }
-        if (*s != '/') {
-            return false;
-        }
-        s++;
-    }
-    return isalnum((unsigned char)*s) != 0;
 }
 
 /* A Python def or class declared inside a function body -- a closure, a
@@ -3342,8 +3355,10 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
         return target;
     }
 
-    /* A bare JS/TS specifier Strategy 1 missed is external: no edge. */
-    if (js_external_bare_specifier(src_lang, imp->module_path)) {
+    /* JS/TS specifiers name modules. A path not found above must not fall
+     * through to an unrelated same-named function, folder or namespace. */
+    if (src_lang == CBM_LANG_JAVASCRIPT || src_lang == CBM_LANG_TYPESCRIPT ||
+        src_lang == CBM_LANG_TSX) {
         return NULL;
     }
 

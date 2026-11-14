@@ -272,8 +272,10 @@ typedef struct {
     const char *target;
 } EIFileEdgeExpect;
 
-static int ei_file_edges_match(const EILangFile *files, int nfiles, const EIFileEdgeExpect *want,
-                               int nwant, int expected_count, const char *target_label) {
+static int ei_file_edges_match_properties(const EILangFile *files, int nfiles,
+                                         const EIFileEdgeExpect *want, int nwant,
+                                         int expected_count, const char *target_label,
+                                         const bool *dynamic) {
     EILangProj lp;
     cbm_store_t *store = ei_index_files(&lp, files, nfiles);
     int ok = store && cbm_store_count_edges_by_type(store, lp.project, "IMPORTS") == expected_count;
@@ -296,6 +298,11 @@ static int ei_file_edges_match(const EILangFile *files, int nfiles, const EIFile
                     found = target.file_path && strcmp(target.file_path, want[i].target) == 0 &&
                             (!target_label ||
                              (target.label && strcmp(target.label, target_label) == 0));
+                    if (found) {
+                        bool is_dynamic = edges[j].properties_json &&
+                                          strstr(edges[j].properties_json, "\"dynamic\":true");
+                        found = is_dynamic == (dynamic && dynamic[i]);
+                    }
                     if (!found && target_label && edge_count == 1) {
                         fprintf(stderr, "  [IMPORTS] %s -> %s (%s), expected %s (%s)\n",
                                 want[i].importer, target.file_path ? target.file_path : "",
@@ -316,6 +323,12 @@ static int ei_file_edges_match(const EILangFile *files, int nfiles, const EIFile
     }
     ei_cleanup(&lp, store);
     return ok;
+}
+
+static int ei_file_edges_match(const EILangFile *files, int nfiles, const EIFileEdgeExpect *want,
+                               int nwant, int expected_count, const char *target_label) {
+    return ei_file_edges_match_properties(files, nfiles, want, nwant, expected_count, target_label,
+                                          NULL);
 }
 
 TEST(ei_relative_astro_css_imports_issue2558) {
@@ -511,6 +524,119 @@ TEST(ei_typescript_named_relative_import) {
         {"main.ts", "import { helper } from './util';\n\n"
                     "export function run(y: number): number { return helper(y); }\n"}};
     ASSERT_TRUE(ei_edge_present(f, 2, "IMPORTS", 1));
+    PASS();
+}
+
+/* Literal import() dependencies use the same exact targets as static imports.
+ * Computed paths and a string in the options argument must not create edges.
+ * Padding crosses the parallel pipeline threshold without changing the fixture. */
+static int ei_dynamic_import_case(int pad) {
+    EILangFile files[96] = {
+        {"package.json", "{\"private\":true,\"workspaces\":[\"packages/*\"]}\n"},
+        {"tsconfig.json", "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"~/*\":[\"src/*\"]}}}\n"},
+        {"src/lazy.ts", "export function run() { return 1; }\n"},
+        {"src/Page.tsx", "export default function Page() { return null; }\n"},
+        {"src/views/home/index.ts", "export const value = 1;\n"},
+        {"packages/shared/package.json",
+         "{\"name\":\"@sample/shared\",\"exports\":{\".\":\"./src/index.ts\","
+         "\"./feature\":\"./src/feature.ts\"}}\n"},
+        {"packages/shared/src/index.ts", "export const value = 2;\n"},
+        {"packages/shared/src/feature.ts", "export const value = 3;\n"},
+        {"decoy/lazy.ts", "export function run() { return 99; }\n"},
+        {"decoy/home.ts", "export const value = 99;\n"},
+        {"decoy/shared.ts", "export const value = 99;\n"},
+        {"src/awaited.ts", "export async function load() { const m = await import('./lazy'); return m.run(); }\n"},
+        {"src/promise.js", "import('./lazy').then(m => m.run());\n"},
+        {"src/nested.tsx", "const Page = lazy(() => import('./Page'));\n"},
+        {"src/routes.ts", "const routes = [{ load: () => import('~/views/home') }];\n"},
+        {"src/workspace.ts", "const load = () => import('@sample/shared');\n"},
+        {"src/subpath.ts", "const load = () => import('@sample/shared/feature');\n"},
+        {"src/options.ts", "const load = () => import(/* loader */ './lazy', { with: { type: 'json' } });\n"},
+        {"src/negative.ts", "declare const name: string; declare const path: string;\n"
+                            "import(`./locale/${name}.ts`); import('./' + 'lazy');\n"
+                            "import(path, { with: { type: './lazy' } });\n"
+                            "import('@external/shared'); import('./missing/lazy');\n"
+                            "loader.import('./lazy');\n"},
+        {"src/static.ts", "import './lazy'; import '~/views/home'; import '@sample/shared';\n"},
+    };
+    static const EIFileEdgeExpect want[] = {
+        {"src/awaited.ts", "src/lazy.ts"},
+        {"src/promise.js", "src/lazy.ts"},
+        {"src/nested.tsx", "src/Page.tsx"},
+        {"src/routes.ts", "src/views/home/index.ts"},
+        {"src/workspace.ts", "packages/shared/src/index.ts"},
+        {"src/subpath.ts", "packages/shared/src/feature.ts"},
+        {"src/options.ts", "src/lazy.ts"},
+        {"src/static.ts", "src/lazy.ts"},
+        {"src/static.ts", "src/views/home/index.ts"},
+        {"src/static.ts", "packages/shared/src/index.ts"},
+    };
+    int count = 0;
+    while (files[count].name) {
+        count++;
+    }
+    char names[60][32];
+    for (int i = 0; i < pad; i++) {
+        snprintf(names[i], sizeof(names[i]), "padding/file_%02d.ts", i);
+        files[count++] = (EILangFile){names[i], "export const padding = 0;\n"};
+    }
+    static const bool dynamic[] = {true, true, true, true, true, true, true, false, false, false};
+    return ei_file_edges_match_properties(files, count, want, sizeof(want) / sizeof(want[0]),
+                                          sizeof(want) / sizeof(want[0]), "Module", dynamic);
+}
+
+TEST(ei_dynamic_imports_resolve_exact_modules) {
+    int sequential_ok = ei_dynamic_import_case(0);
+    int parallel_ok = ei_dynamic_import_case(60);
+    ASSERT_TRUE(sequential_ok);
+    ASSERT_TRUE(parallel_ok);
+    PASS();
+}
+
+/* Extraction removes the hidden-directory marker from module names. Imports
+ * must reach those modules without losing dotted basenames or taking a decoy. */
+static int ei_hidden_directory_import_case(int pad) {
+    EILangFile files[80] = {
+        {"tsconfig.json", "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@hidden/*\":[\"fixtures/.sandbox/src/*\"]}}}\n"},
+        {"fixtures/.sandbox/src/widget.service.ts", "export const value = 1;\n"},
+        {"fixtures/.sandbox/src/index.ts", "export const value = 2;\n"},
+        {"decoy/widget.service.ts", "export const value = 99;\n"},
+        {"decoy/service.ts", "export function service() { return 99; }\n"},
+        {"missing/src/widget.service.ts", "export const value = 99;\n"},
+        {"app/missing.ts", "import { value } from '../.missing/src/widget.service';\n"},
+        {"fixtures/.sandbox/src/static.ts", "import { value } from './widget.service';\n"},
+        {"app/relative.ts", "import { value } from '../fixtures/.sandbox/src/widget.service';\n"},
+        {"app/alias.ts", "import { value } from '@hidden/widget.service';\n"},
+        {"app/index.ts", "import { value } from '../fixtures/.sandbox/src';\n"},
+        {"app/explicit.ts", "import { value } from '../fixtures/.sandbox/src/widget.service.ts';\n"},
+        {"app/alias-explicit.ts", "import { value } from '@hidden/widget.service.ts';\n"},
+    };
+    static const EIFileEdgeExpect want[] = {
+        {"fixtures/.sandbox/src/static.ts", "fixtures/.sandbox/src/widget.service.ts"},
+        {"app/relative.ts", "fixtures/.sandbox/src/widget.service.ts"},
+        {"app/alias.ts", "fixtures/.sandbox/src/widget.service.ts"},
+        {"app/index.ts", "fixtures/.sandbox/src/index.ts"},
+        {"app/explicit.ts", "fixtures/.sandbox/src/widget.service.ts"},
+        {"app/alias-explicit.ts", "fixtures/.sandbox/src/widget.service.ts"},
+    };
+    int count = 0;
+    while (files[count].name) {
+        count++;
+    }
+    char names[60][32];
+    for (int i = 0; i < pad; i++) {
+        snprintf(names[i], sizeof(names[i]), "padding/file_%02d.ts", i);
+        files[count++] = (EILangFile){names[i], "export const padding = 0;\n"};
+    }
+    return ei_file_edges_match(files, count, want, sizeof(want) / sizeof(want[0]),
+                               sizeof(want) / sizeof(want[0]), "Module");
+}
+
+TEST(ei_hidden_directory_imports_resolve_exact_modules) {
+    int sequential_ok = ei_hidden_directory_import_case(0);
+    int parallel_ok = ei_hidden_directory_import_case(60);
+    ASSERT_TRUE(sequential_ok);
+    ASSERT_TRUE(parallel_ok);
     PASS();
 }
 
@@ -2947,6 +3073,8 @@ TEST(ei_pkgmap_duplicate_package_name_at_equal_depth_is_settled_by_path) {
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 SUITE(edge_imports) {
+    RUN_TEST(ei_dynamic_imports_resolve_exact_modules);
+    RUN_TEST(ei_hidden_directory_imports_resolve_exact_modules);
     RUN_TEST(ei_relative_astro_css_imports_issue2558);
     RUN_TEST(ei_nix_parent_relative_import_issue2797);
     RUN_TEST(ei_thrift_parent_relative_import_issue2797);
