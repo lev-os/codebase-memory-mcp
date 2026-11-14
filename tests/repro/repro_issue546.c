@@ -108,14 +108,14 @@
  * stub node, and the test assertion will correctly turn RED.
  */
 static const RFile k_files[] = {
-    /* tsconfig: maps @widget alias to packages/widget/src */
+    /* Point the alias at the exported module; this fixture has no src/index.ts. */
     {
         "tsconfig.json",
         "{\n"
         "  \"compilerOptions\": {\n"
         "    \"baseUrl\": \".\",\n"
         "    \"paths\": {\n"
-        "      \"@widget\": [\"packages/widget/src\"]\n"
+        "      \"@widget\": [\"packages/widget/src/scroll\"]\n"
         "    }\n"
         "  }\n"
         "}\n"
