@@ -1479,7 +1479,10 @@ static const cbm_gbuf_node_t *pxc_defined_symbol(const cbm_gbuf_t *gbuf, const c
         return NULL;
     }
     const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(gbuf, qn);
-    if (node && node->qualified_name && node->label && !pxc_label_is_container(node->label)) {
+    /* Sibling extensions share a symbol prefix. A QN hit alone can name a
+     * definition from the other file after the graph deduplicates it. */
+    if (node && node->qualified_name && node->label && !pxc_label_is_container(node->label) &&
+        node->file_path && strcmp(node->file_path, rel_path) == 0) {
         return node;
     }
     return NULL;
@@ -2742,6 +2745,10 @@ static void pxc_append_synthetic_calls(CBMArena *dst_arena, CBMCallArray *dst_ca
         dst.second_arg_name =
             src->second_arg_name ? cbm_arena_strdup(dst_arena, src->second_arg_name) : NULL;
         dst.arg_shape = src->arg_shape ? cbm_arena_strdup(dst_arena, src->arg_shape) : NULL;
+        dst.js_this_class_qn =
+            src->js_this_class_qn ? cbm_arena_strdup(dst_arena, src->js_this_class_qn) : NULL;
+        dst.js_this_base =
+            src->js_this_base ? cbm_arena_strdup(dst_arena, src->js_this_base) : NULL;
         dst.args = NULL;
         if (src->args && src->arg_count > 0) {
             dst.args = cbm_arena_calloc(dst_arena, (size_t)src->arg_count * sizeof(CBMCallArg));

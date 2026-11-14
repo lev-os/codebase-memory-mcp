@@ -10082,6 +10082,13 @@ static int pipeline_exact_inputs_migrate_metadata_and_mode(int legacy_version) {
     cbm_store_close(metadata_store);
 
     cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *exact_after_migration = cbm_pipeline_new(tmp, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(exact_after_migration);
+    ASSERT_EQ(cbm_pipeline_run(exact_after_migration), 0);
+    cbm_incremental_route_t exact_after_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(exact_after_migration);
+
+    cbm_pipeline_incremental_test_reset_faults();
     cbm_pipeline_t *mode_change = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(mode_change);
     ASSERT_EQ(cbm_pipeline_run(mode_change), 0);
@@ -10113,6 +10120,7 @@ static int pipeline_exact_inputs_migrate_metadata_and_mode(int legacy_version) {
     ASSERT_EQ(migrated_version, CBM_SEMANTIC_INDEX_VERSION);
     ASSERT_TRUE(migrated_hashes_complete);
     ASSERT_STR_EQ(migrated_mode, "fast");
+    ASSERT_EQ(exact_after_route, CBM_INCREMENTAL_ROUTE_NOOP);
     ASSERT_EQ(mode_change_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     ASSERT_EQ(full_version, CBM_SEMANTIC_INDEX_VERSION);
     ASSERT_TRUE(full_hashes_complete);
@@ -35986,14 +35994,6 @@ static bool js_twin_expect(const char *what, const char *got, const char *want) 
     return false;
 }
 
-static bool js_twin_expect_absent(const char *what, const char *got, const char *absent) {
-    if (!strstr(got, absent)) {
-        return true;
-    }
-    fprintf(stderr, "  %s: [%s] holds [%s]\n", what, got, absent);
-    return false;
-}
-
 static cbm_pipeline_t *js_twin_index(const char *repo, const char *db) {
     cbm_pipeline_t *p = cbm_pipeline_new(repo, db, CBM_MODE_FULL);
     if (p && cbm_pipeline_run(p) != 0) {
@@ -36096,14 +36096,50 @@ TEST(pipeline_js_local_callee_is_nearest_binding) {
         ok = js_twin_expect(what, got, "main.local -> main.local.run") && ok;
         snprintf(what, sizeof(what), "%s line 4", exts[x]);
         js_twin_calls_at(db, project, main_file, 4, got, sizeof(got));
-        ok = js_twin_expect_absent(what, got, "-> main.caught.run") && ok;
+        ok = js_twin_expect(what, got, "main.caught -> main.local") && ok;
         snprintf(what, sizeof(what), "%s line 5", exts[x]);
         js_twin_calls_at(db, project, main_file, 5, got, sizeof(got));
-        ok = js_twin_expect_absent(what, got, "-> main.blocked.run") && ok;
+        ok = js_twin_expect(what, got, "") && ok;
         snprintf(what, sizeof(what), "%s line 6", exts[x]);
         js_twin_calls_at(db, project, main_file, 6, got, sizeof(got));
-        ok = js_twin_expect_absent(what, got, "-> main.local.run") && ok;
-        ok = js_twin_expect_absent(what, got, "-> main.outer.run") && ok;
+        ok = js_twin_expect(what, got, "") && ok;
+        cbm_pipeline_free(p);
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* A parameter default runs before the body, in a scope of its own: it cannot
+ * see a `var` of the body. `run()` in `value = run()` names the module's run,
+ * not the arrow the body binds to run; in the body, the body's run binds. */
+TEST(pipeline_js_param_default_skips_body_var) {
+    static const char *const exts[] = {"js", "tsx"};
+    bool ok = true;
+    for (int x = 0; x < 2; x++) {
+        char tmp[256] = "/tmp/cbm_js_param_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        char main_file[32];
+        snprintf(main_file, sizeof(main_file), "main.%s", exts[x]);
+        write_temp_file(tmp, main_file,
+                        "export function run() { return 1; }\n"
+                        "export function use(value = run()) { var run = () => 2; return value; }\n"
+                        "export function body() { var run = () => 3; return run(); }\n");
+        char db[512];
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        cbm_pipeline_t *p = js_twin_index(tmp, db);
+        ASSERT_NOT_NULL(p);
+        const char *project = cbm_pipeline_project_name(p);
+        char got[1024];
+        char what[64];
+        snprintf(what, sizeof(what), "%s line 2", exts[x]);
+        js_twin_qn_at(db, project, main_file, "run", 2, got, sizeof(got));
+        ok = js_twin_expect(what, got, "main.use.run") && ok;
+        js_twin_calls_at(db, project, main_file, 2, got, sizeof(got));
+        ok = js_twin_expect(what, got, "main.use -> main.run") && ok;
+        snprintf(what, sizeof(what), "%s line 3", exts[x]);
+        js_twin_calls_at(db, project, main_file, 3, got, sizeof(got));
+        ok = js_twin_expect(what, got, "main.body -> main.body.run") && ok;
         cbm_pipeline_free(p);
         th_rmtree(tmp);
     }
@@ -36466,6 +36502,161 @@ TEST(pipeline_ts_index_file_resolver_matches_main) {
         cbm_pipeline_free(p);
     }
     th_rmtree(tmp);
+/* The CALLS edges at `line` of `file` are exactly `want`; on a mismatch the
+ * strategy of each edge there is printed. */
+static bool js_this_calls_are(const char *db, const char *project, const char *file, int line,
+                              const char *want) {
+    char got[1024];
+    char what[96];
+    snprintf(what, sizeof(what), "%s line %d", file, line);
+    js_twin_calls_at(db, project, file, line, got, sizeof(got));
+    if (js_twin_expect(what, got, want)) {
+        return true;
+    }
+    js_twin_rows(db, project,
+                 "SELECT t.qualified_name, json_extract(e.properties, '$.strategy') "
+                 "FROM edges e JOIN nodes s ON s.id = e.source_id "
+                 "JOIN nodes t ON t.id = e.target_id "
+                 "WHERE e.project = ?1 AND e.type = 'CALLS' "
+                 "AND json_extract(e.properties, '$.line') = ?2 "
+                 "AND substr(s.file_path, -length(?3)) = ?3 AND ?4 = ?4 ORDER BY 1",
+                 line, file, NULL, true, got, sizeof(got));
+    fprintf(stderr, "  %s strategy: [%s]\n", what, got);
+    return false;
+}
+
+/* `this` in a non-arrow function, or in a method of an object literal, is
+ * not the instance of the class around it: `this.stop()` there names no
+ * member of that class, and gets no edge. In an arrow it stays the method's
+ * `this`. Index files, where the type-aware resolver gives no answer. */
+TEST(pipeline_js_this_in_nested_function_is_not_the_class) {
+    static const char *const files[] = {"pkg/index.ts", "pkg/index.js"};
+    bool ok = true;
+    for (int x = 0; x < 2; x++) {
+        char tmp[256] = "/tmp/cbm_js_this_fn_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        write_temp_file(tmp, files[x],
+                        "export class Adapter {\n"
+                        "  stop() { return 0; }\n"
+                        "  run() {\n"
+                        "    function inner() { return this.stop(); }\n"
+                        "    const box = { go() { return this.stop(); } };\n"
+                        "    return [inner, box];\n"
+                        "  }\n"
+                        "  halt() { return [0].map(() => this.stop()); }\n"
+                        "}\n");
+        char db[512];
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        cbm_pipeline_t *p = js_twin_index(tmp, db);
+        ASSERT_NOT_NULL(p);
+        const char *project = cbm_pipeline_project_name(p);
+        ok = js_this_calls_are(db, project, files[x], 4, "") && ok;
+        ok = js_this_calls_are(db, project, files[x], 5, "") && ok;
+        ok = js_this_calls_are(db, project, files[x], 8, "pkg.Adapter.halt -> pkg.Adapter.stop") &&
+             ok;
+        cbm_pipeline_free(p);
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* A static and an instance member of one name: the instance member keeps the
+ * plain name, also once a static one is added before it, and the static one
+ * takes the owner path `static`. `this.stop()` in an instance method reaches
+ * the instance member, in a static method the static one. */
+TEST(pipeline_js_static_and_instance_member_keep_their_names) {
+    static const char *const files[] = {"pkg/index.ts", "pkg/index.js", "main.ts"};
+    static const char *const mods[] = {"pkg", "pkg", "main"};
+    bool ok = true;
+    for (int x = 0; x < 3; x++) {
+        for (int phase = 0; phase < 2; phase++) {
+            char tmp[256] = "/tmp/cbm_js_static_XXXXXX";
+            ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+            write_temp_file(tmp, files[x],
+                            phase == 0 ? "export class Timer {\n"
+                                         "  stop() { return 2; }\n"
+                                         "  pause() { return this.stop(); }\n"
+                                         "}\n"
+                                       : "export class Timer {\n"
+                                         "  static stop() { return 1; }\n"
+                                         "  stop() { return 2; }\n"
+                                         "  static reset() { return this.stop(); }\n"
+                                         "  pause() { return this.stop(); }\n"
+                                         "}\n");
+            char db[512];
+            snprintf(db, sizeof(db), "%s/g.db", tmp);
+            cbm_pipeline_t *p = js_twin_index(tmp, db);
+            ASSERT_NOT_NULL(p);
+            const char *project = cbm_pipeline_project_name(p);
+            char got[1024];
+            char want[256];
+            char what[96];
+            snprintf(what, sizeof(what), "%s phase %d", files[x], phase);
+            snprintf(want, sizeof(want), "%s.Timer.stop", mods[x]);
+            js_twin_qn_at(db, project, files[x], "stop", 2 + phase, got, sizeof(got));
+            ok = js_twin_expect(what, got, want) && ok;
+            if (phase == 1) {
+                snprintf(want, sizeof(want), "%s.Timer.static.stop", mods[x]);
+                js_twin_qn_at(db, project, files[x], "stop", 2, got, sizeof(got));
+                ok = js_twin_expect(what, got, want) && ok;
+            }
+            if (x < 2) { /* the type-aware resolver answers in main.ts */
+                ok = js_this_calls_are(db, project, files[x], 3 + 2 * phase,
+                                       "pkg.Timer.pause -> pkg.Timer.stop") &&
+                     ok;
+                if (phase == 1) {
+                    ok = js_this_calls_are(db, project, files[x], 4,
+                                           "pkg.Timer.reset -> pkg.Timer.static.stop") &&
+                         ok;
+                }
+            }
+            cbm_pipeline_free(p);
+            th_rmtree(tmp);
+        }
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* `this.stop()` where the class declares no stop names the member its parent
+ * class declares, when the parent is a class of the project. A class with no
+ * such parent gets no edge: never a same-name callable nested in one of its
+ * methods, whose name (Lone.stop) reads like a member's. */
+TEST(pipeline_js_this_member_follows_extends) {
+    static const char *const exts[] = {"ts", "js"};
+    bool ok = true;
+    for (int x = 0; x < 2; x++) {
+        char tmp[256] = "/tmp/cbm_js_this_ext_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        char base[32];
+        char index[32];
+        snprintf(base, sizeof(base), "pkg/base.%s", exts[x]);
+        snprintf(index, sizeof(index), "pkg/index.%s", exts[x]);
+        write_temp_file(tmp, base,
+                        "export class Base {\n"
+                        "  stop() { return 1; }\n"
+                        "}\n");
+        write_temp_file(tmp, index,
+                        "import { Base } from \"./base\";\n"
+                        "export class Child extends Base {\n"
+                        "  start() { const handle = { stop: () => 2 }; return handle; }\n"
+                        "  halt() { return this.stop(); }\n"
+                        "}\n"
+                        "export class Lone {\n"
+                        "  run() { const h = { stop: () => 3 }; return h; }\n"
+                        "  halt() { return this.stop(); }\n"
+                        "}\n");
+        char db[512];
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        cbm_pipeline_t *p = js_twin_index(tmp, db);
+        ASSERT_NOT_NULL(p);
+        const char *project = cbm_pipeline_project_name(p);
+        ok = js_this_calls_are(db, project, index, 4, "pkg.Child.halt -> pkg.base.Base.stop") && ok;
+        ok = js_this_calls_are(db, project, index, 8, "") && ok;
+        cbm_pipeline_free(p);
+        th_rmtree(tmp);
+    }
     ASSERT_TRUE(ok);
     PASS();
 }
@@ -36474,54 +36665,74 @@ TEST(pipeline_ts_index_file_resolver_matches_main) {
  * next() {} }` inside observable) is a local of that function: its own file
  * reaches it by its derived name, and no name-only strategy offers it to
  * another file, where `iterator.next()` on any value matched the derived
- * tail iterator.next. A full and an incremental index agree. */
+ * tail iterator.next. One worker and several (more than 50 files, so the
+ * parallel route runs) agree, and so does an incremental index. */
 TEST(pipeline_js_local_twin_stays_out_of_name_guesses) {
-    char tmp[256] = "/tmp/cbm_js_local_twin_XXXXXX";
-    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-    XlangEnvSave saved = xlang_env_select(false);
-    write_temp_file(tmp, "lib/obs.ts",
-                    "export function observable() {\n"
-                    "  const iterator = { next() { return 1; } };\n"
-                    "  const other = { next() { return 2; } };\n"
-                    "  return iterator.next() + other.next();\n"
-                    "}\n");
-    write_temp_file(tmp, "app/use.ts",
-                    "export function drain(iterator) { return iterator.next(); }\n");
-    for (int i = 0; i < 4; i++) {
-        char name[32];
-        snprintf(name, sizeof(name), "pad%d.ts", i);
-        write_temp_file(tmp, name, "export const pad = 1;\n");
-    }
-    char db[512];
-    char use_path[512];
-    snprintf(db, sizeof(db), "%s/g.db", tmp);
-    snprintf(use_path, sizeof(use_path), "%s/app/use.ts", tmp);
-    cbm_pipeline_t *p = js_twin_index(tmp, db);
-    ASSERT_NOT_NULL(p);
-    char project[256];
-    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
-    cbm_pipeline_free(p);
+    enum { LOCAL_TWIN_PADS = 60 };
     static const char *const own =
         "lib.obs.observable -> lib.obs.iterator.next; lib.obs.observable -> lib.obs.other.next";
-    char got[1024];
-    js_twin_calls_at(db, project, "lib/obs.ts", 4, got, sizeof(got));
-    bool ok = js_twin_expect("full own file", got, own);
-    js_twin_calls_at(db, project, "app/use.ts", 1, got, sizeof(got));
-    ok = js_twin_expect("full other file", got, "") && ok;
+    bool ok = true;
+    for (int parallel = 0; parallel < 2; parallel++) {
+        char tmp[256] = "/tmp/cbm_js_local_twin_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        XlangEnvSave saved = xlang_env_select(parallel == 1);
+        write_temp_file(tmp, "lib/obs.ts",
+                        "export function observable() {\n"
+                        "  const iterator = { next() { return 1; } };\n"
+                        "  const other = { next() { return 2; } };\n"
+                        "  return iterator.next() + other.next();\n"
+                        "}\n");
+        write_temp_file(tmp, "app/use.ts",
+                        "export function drain(iterator) { return iterator.next(); }\n");
+        for (int i = 0; i < LOCAL_TWIN_PADS; i++) {
+            char name[32];
+            snprintf(name, sizeof(name), "pad%d.ts", i);
+            write_temp_file(tmp, name, "export const pad = 1;\n");
+        }
+        char db[512];
+        char use_path[512];
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        snprintf(use_path, sizeof(use_path), "%s/app/use.ts", tmp);
+        cbm_pipeline_worker_count_test_reset();
+        cbm_pipeline_t *p = js_twin_index(tmp, db);
+        int workers = cbm_pipeline_worker_count_test_last();
+        ASSERT_NOT_NULL(p);
+        char project[256];
+        snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+        cbm_pipeline_free(p);
+        char what[64];
+        char got[1024];
+        snprintf(what, sizeof(what), "%s full own file", parallel ? "parallel" : "one worker");
+        js_twin_calls_at(db, project, "lib/obs.ts", 4, got, sizeof(got));
+        ok = js_twin_expect(what, got, own) && ok;
+        snprintf(what, sizeof(what), "%s full other file", parallel ? "parallel" : "one worker");
+        js_twin_calls_at(db, project, "app/use.ts", 1, got, sizeof(got));
+        ok = js_twin_expect(what, got, "") && ok;
+        /* The parallel route runs with more than one worker and more than 50
+         * files (MIN_FILES_FOR_PARALLEL); the sequential one with one. */
+        if ((parallel == 1) != (workers > 1)) {
+            fprintf(stderr, "  %s: %d workers\n", parallel ? "parallel" : "one worker", workers);
+            ok = false;
+        }
 
-    write_temp_file(tmp, "app/use.ts",
-                    "export function drain(iterator) { return iterator.next() || 0; }\n");
-    ASSERT_EQ(pipeline_test_set_mtime(use_path, 2000000000, 0), 0);
-    cbm_pipeline_incremental_test_reset_faults();
-    p = js_twin_index(tmp, db);
-    ASSERT_NOT_NULL(p);
-    cbm_pipeline_free(p);
-    xlang_env_restore(&saved);
-    js_twin_calls_at(db, project, "app/use.ts", 1, got, sizeof(got));
-    ok = js_twin_expect("incremental other file", got, "") && ok;
-    js_twin_calls_at(db, project, "lib/obs.ts", 4, got, sizeof(got));
-    ok = js_twin_expect("incremental own file", got, own) && ok;
-    th_rmtree(tmp);
+        write_temp_file(tmp, "app/use.ts",
+                        "export function drain(iterator) { return iterator.next() || 0; }\n");
+        ASSERT_EQ(pipeline_test_set_mtime(use_path, 2000000000, 0), 0);
+        cbm_pipeline_incremental_test_reset_faults();
+        p = js_twin_index(tmp, db);
+        ASSERT_NOT_NULL(p);
+        cbm_pipeline_free(p);
+        xlang_env_restore(&saved);
+        snprintf(what, sizeof(what), "%s incremental other file",
+                 parallel ? "parallel" : "one worker");
+        js_twin_calls_at(db, project, "app/use.ts", 1, got, sizeof(got));
+        ok = js_twin_expect(what, got, "") && ok;
+        snprintf(what, sizeof(what), "%s incremental own file",
+                 parallel ? "parallel" : "one worker");
+        js_twin_calls_at(db, project, "lib/obs.ts", 4, got, sizeof(got));
+        ok = js_twin_expect(what, got, own) && ok;
+        th_rmtree(tmp);
+    }
     ASSERT_TRUE(ok);
     PASS();
 }
@@ -36585,61 +36796,149 @@ TEST(pipeline_js_twin_names_rebuild_old_index) {
     PASS();
 }
 
-/* 20,000 callables of one name in one file, each called from its owner,
- * index inside a few seconds: grouping and scope binding are near-linear. */
-TEST(pipeline_js_twin_callables_scale) {
-    enum { JS_TWIN_SCALE_N = 20000, JS_TWIN_SCALE_MS = 15000 };
-    char tmp[256] = "/tmp/cbm_js_twin_scale_XXXXXX";
-    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-    size_t cap = (size_t)JS_TWIN_SCALE_N * 80 + 256;
-    char *src = malloc(cap);
-    ASSERT_NOT_NULL(src);
-    size_t off = (size_t)snprintf(src, cap, "export function run() { return 0; }\n");
-    for (int i = 0; i < JS_TWIN_SCALE_N; i++) {
-        off += (size_t)snprintf(src + off, cap - off,
-                                "function f%d() { function run() { return %d; } return run(); }\n",
-                                i, i);
+/* The number of CALLS edges whose caller sits in the file ending in `file`
+ * and that `sql_where` (over s, the caller, and t, the target) admits. */
+static int js_twin_count_calls(const char *db_path, const char *project, const char *file,
+                               const char *sql_where) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return -1;
     }
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "SELECT count(*) FROM edges e JOIN nodes s ON s.id = e.source_id "
+             "JOIN nodes t ON t.id = e.target_id WHERE e.project = ?1 AND e.type = 'CALLS' "
+             "AND substr(s.file_path, -length(?2)) = ?2 AND (%s)",
+             sql_where);
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, file, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            n = sqlite3_column_int(st, 0);
+        }
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return n;
+}
+
+/* Index the one file `src` as main.js; the wall time in ms, or -1. */
+static long js_twin_scale_index(const char *tmp, const char *src, const char *db, char *project,
+                                size_t project_cap) {
     write_temp_file(tmp, "main.js", src);
-    free(src);
     XlangEnvSave saved = xlang_env_select(false);
-    char db[512];
-    snprintf(db, sizeof(db), "%s/g.db", tmp);
     struct timespec t0;
     struct timespec t1;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
     cbm_pipeline_t *p = js_twin_index(tmp, db);
     cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
     xlang_env_restore(&saved);
-    ASSERT_NOT_NULL(p);
-    long ms = (long)(t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
-    fprintf(stderr, "  js twin scale: %d callables indexed in %ld ms\n", JS_TWIN_SCALE_N, ms);
-    const char *project = cbm_pipeline_project_name(p);
+    if (!p) {
+        return -1;
+    }
+    snprintf(project, project_cap, "%s", cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    return (long)(t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+}
+
+/* Two large JS files index in well under a minute with every call bound:
+ * 20,000 callables of one name, each called from its owner (20,000 callers
+ * with one call each), and one caller with 20,000 calls. Grouping, scope
+ * binding and the resolver-row join are near-linear. */
+TEST(pipeline_js_twin_callables_scale) {
+    enum { JS_TWIN_SCALE_N = 20000, JS_TWIN_SCALE_MS = 60000 };
+    char tmp[256] = "/tmp/cbm_js_twin_scale_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    size_t cap = (size_t)JS_TWIN_SCALE_N * 80 + 256;
+    char *src = malloc(cap);
+    ASSERT_NOT_NULL(src);
+    char project[256];
+    char db[512];
     char got[1024];
-    js_twin_qn_at(db, project, "main.js", "run", 1, got, sizeof(got));
-    bool ok = js_twin_expect("scale export", got, "main.run");
-    js_twin_calls_at(db, project, "main.js", 2, got, sizeof(got));
-    ok = js_twin_expect("scale first", got, "main.f0 -> main.f0.run") && ok;
     char want[128];
+    bool ok = true;
+
+    /* Shape 1: 20,000 callers, one call each. */
+    size_t off = (size_t)snprintf(src, cap, "export function run() { return 0; }\n");
+    for (int i = 0; i < JS_TWIN_SCALE_N; i++) {
+        off += (size_t)snprintf(src + off, cap - off,
+                                "function f%d() { function run() { return %d; } return run(); }\n",
+                                i, i);
+    }
+    snprintf(db, sizeof(db), "%s/g1.db", tmp);
+    long ms_callers = js_twin_scale_index(tmp, src, db, project, sizeof(project));
+    fprintf(stderr, "  js twin scale: %d callers, one call each: %ld ms\n", JS_TWIN_SCALE_N,
+            ms_callers);
+    js_twin_qn_at(db, project, "main.js", "run", 1, got, sizeof(got));
+    ok = js_twin_expect("callers export", got, "main.run") && ok;
+    js_twin_calls_at(db, project, "main.js", 2, got, sizeof(got));
+    ok = js_twin_expect("callers first", got, "main.f0 -> main.f0.run") && ok;
     snprintf(want, sizeof(want), "main.f%d -> main.f%d.run", JS_TWIN_SCALE_N - 1,
              JS_TWIN_SCALE_N - 1);
     js_twin_calls_at(db, project, "main.js", JS_TWIN_SCALE_N + 1, got, sizeof(got));
-    ok = js_twin_expect("scale last", got, want) && ok;
-    cbm_pipeline_free(p);
+    ok = js_twin_expect("callers last", got, want) && ok;
+    int all = js_twin_count_calls(db, project, "main.js", "1");
+    int own = js_twin_count_calls(db, project, "main.js",
+                                  "t.qualified_name = s.qualified_name || '.run'");
+    if (all != JS_TWIN_SCALE_N || own != JS_TWIN_SCALE_N) {
+        fprintf(stderr, "  callers: %d calls edges, %d to the caller's own run; want %d\n", all,
+                own, JS_TWIN_SCALE_N);
+        ok = false;
+    }
+
+    /* Shape 2: one caller, 20,000 calls to 20,000 functions. */
+    th_rmtree(tmp);
+    snprintf(tmp, sizeof(tmp), "%s", "/tmp/cbm_js_twin_scale_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    off = 0;
+    for (int i = 0; i < JS_TWIN_SCALE_N; i++) {
+        off += (size_t)snprintf(src + off, cap - off, "function g%d() { return %d; }\n", i, i);
+    }
+    off += (size_t)snprintf(src + off, cap - off, "export function big() {\n");
+    for (int i = 0; i < JS_TWIN_SCALE_N; i++) {
+        off += (size_t)snprintf(src + off, cap - off, "  g%d();\n", i);
+    }
+    snprintf(src + off, cap - off, "}\n");
+    snprintf(db, sizeof(db), "%s/g2.db", tmp);
+    long ms_calls = js_twin_scale_index(tmp, src, db, project, sizeof(project));
+    free(src);
+    fprintf(stderr, "  js twin scale: one caller, %d calls: %ld ms\n", JS_TWIN_SCALE_N, ms_calls);
+    all = js_twin_count_calls(db, project, "main.js", "1");
+    own = js_twin_count_calls(db, project, "main.js", "s.name = 'big'");
+    /* g<i> is called on line N + 2 + i */
+    char where[128];
+    snprintf(where, sizeof(where), "t.name = 'g' || (json_extract(e.properties, '$.line') - %d)",
+             JS_TWIN_SCALE_N + 2);
+    int named = js_twin_count_calls(db, project, "main.js", where);
+    if (all != JS_TWIN_SCALE_N || own != JS_TWIN_SCALE_N || named != JS_TWIN_SCALE_N) {
+        fprintf(stderr,
+                "  one caller: %d calls edges, %d from big, %d to the g of their line; "
+                "want %d\n",
+                all, own, named, JS_TWIN_SCALE_N);
+        ok = false;
+    }
     th_rmtree(tmp);
     ASSERT_TRUE(ok);
-    ASSERT_TRUE(ms < JS_TWIN_SCALE_MS);
+    ASSERT_TRUE(ms_callers >= 0 && ms_callers < JS_TWIN_SCALE_MS);
+    ASSERT_TRUE(ms_calls >= 0 && ms_calls < JS_TWIN_SCALE_MS);
     PASS();
 }
 
 SUITE(pipeline) {
     RUN_TEST(pipeline_js_module_binding_keeps_plain_name);
     RUN_TEST(pipeline_js_local_callee_is_nearest_binding);
+    RUN_TEST(pipeline_js_param_default_skips_body_var);
     RUN_TEST(pipeline_js_accessor_pairs_keep_their_calls);
     RUN_TEST(pipeline_js_twin_insert_incremental_equals_full);
     RUN_TEST(pipeline_js_top_level_declaration_keeps_plain_name);
     RUN_TEST(pipeline_js_this_call_in_arrow_reaches_class_method);
     RUN_TEST(pipeline_ts_index_file_resolver_matches_main);
+    RUN_TEST(pipeline_js_this_in_nested_function_is_not_the_class);
+    RUN_TEST(pipeline_js_static_and_instance_member_keep_their_names);
+    RUN_TEST(pipeline_js_this_member_follows_extends);
     RUN_TEST(pipeline_js_local_twin_stays_out_of_name_guesses);
     RUN_TEST(pipeline_js_twin_names_rebuild_old_index);
     RUN_TEST(pipeline_js_twin_callables_scale);

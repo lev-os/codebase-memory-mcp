@@ -1388,9 +1388,8 @@ static cbm_resolution_t calls_registry_resolution(cbm_pipeline_ctx_t *ctx, const
     cbm_resolution_t res = {0};
     if (!rust_external && !php_vendor_call && !java_external) {
         /* Python LEGB fallback first (MUST match pass_parallel.c). */
-        res = cbm_registry_resolve_call_scoped(ctx->registry, call->callee_name, module_qn,
-                                               imp_keys, imp_vals, imp_count, lang,
-                                               call->enclosing_func_qn, caller_test);
+        res = cbm_registry_resolve_call_scoped(ctx->registry, call, module_qn, imp_keys, imp_vals,
+                                               imp_count, lang, caller_test);
         /* Cross-language veto: a name-only guess never binds another
          * language's symbol (a JS app.get must not become Python's
          * builtins.dict.get). The vetoed answer becomes EMPTY here, before

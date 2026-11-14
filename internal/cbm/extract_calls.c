@@ -5359,6 +5359,112 @@ static TSNode js_receiver_root(TSNode obj) {
     return obj;
 }
 
+/* Whether a class member node (a method, a field, a static block) carries
+ * the `static` keyword. */
+static bool js_member_is_static(TSNode member) {
+    if (strcmp(ts_node_type(member), "class_static_block") == 0) {
+        return true;
+    }
+    uint32_t n = ts_node_child_count(member);
+    for (uint32_t i = 0; i < n; i++) {
+        if (strcmp(ts_node_type(ts_node_child(member, i)), "static") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The QN of the named class node `cls`, as the class node and its members
+ * have it: the names of the classes and namespaces around it, outermost
+ * first (cbm_enclosing_func_qn's rule). NULL for an unnamed class. */
+static const char *js_class_qn(CBMExtractCtx *ctx, TSNode cls) {
+    const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
+    if (!spec || !spec->class_node_types ||
+        ts_node_is_null(ts_node_child_by_field_name(cls, TS_FIELD("name")))) {
+        return NULL;
+    }
+    const char *chain = NULL;
+    for (TSNode cur = cls; !ts_node_is_null(cur); cur = ts_node_parent(cur)) {
+        if (!cbm_kind_in_set(cur, spec->class_node_types) &&
+            !cbm_is_namespace_scope_kind(ctx->language, ts_node_type(cur))) {
+            continue;
+        }
+        TSNode name = ts_node_child_by_field_name(cur, TS_FIELD("name"));
+        char *text = ts_node_is_null(name) ? NULL : cbm_node_text(ctx->arena, name, ctx->source);
+        if (!text || !text[0]) {
+            continue;
+        }
+        chain = chain ? cbm_arena_sprintf(ctx->arena, "%s.%s", text, chain) : text;
+    }
+    return chain ? cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, chain) : NULL;
+}
+
+/* The text of the `extends` expression of class node `cls`, or NULL. */
+static const char *js_class_extends(CBMExtractCtx *ctx, TSNode cls) {
+    TSNode heritage = cbm_find_child_by_kind(cls, "class_heritage");
+    if (ts_node_is_null(heritage)) {
+        return NULL;
+    }
+    TSNode value = {0};
+    TSNode clause = cbm_find_child_by_kind(heritage, "extends_clause");
+    if (!ts_node_is_null(clause)) {
+        value = ts_node_child_by_field_name(clause, TS_FIELD("value"));
+    } else if (ts_node_named_child_count(heritage) > 0 &&
+               strcmp(ts_node_type(ts_node_named_child(heritage, 0)), "implements_clause") != 0) {
+        value = ts_node_named_child(heritage, 0); /* JavaScript: `extends <expression>` */
+    }
+    return ts_node_is_null(value) ? NULL : cbm_node_text(ctx->arena, value, ctx->source);
+}
+
+static bool js_this_binder_function(const char *k) {
+    return strcmp(k, "function_declaration") == 0 ||
+           strcmp(k, "generator_function_declaration") == 0 ||
+           strcmp(k, "function_expression") == 0 || strcmp(k, "function") == 0 ||
+           strcmp(k, "generator_function") == 0;
+}
+
+static bool js_this_binder_member(const char *k) {
+    return strcmp(k, "method_definition") == 0 || strcmp(k, "public_field_definition") == 0 ||
+           strcmp(k, "field_definition") == 0 || strcmp(k, "class_static_block") == 0;
+}
+
+/* What `this` is at the JS/TS call `call_node` (CBMJsThis): the nearest
+ * enclosing code that binds `this`, arrows being transparent. A method,
+ * field or static block of a class binds the instance or the class; a
+ * non-arrow function or an object-literal method binds something else,
+ * which inside a class is never that class (CBM_JS_THIS_OTHER). */
+static void js_this_binding(CBMExtractCtx *ctx, TSNode call_node, CBMCall *call) {
+    for (TSNode cur = ts_node_parent(call_node); !ts_node_is_null(cur); cur = ts_node_parent(cur)) {
+        const char *k = ts_node_type(cur);
+        bool member = js_this_binder_member(k);
+        if (!member && !js_this_binder_function(k)) {
+            if (strcmp(k, "program") == 0 || strcmp(k, "class_body") == 0) {
+                return; /* the module's `this`, or a computed key: no class binds it */
+            }
+            continue;
+        }
+        TSNode parent = ts_node_parent(cur);
+        if (member && !ts_node_is_null(parent) && strcmp(ts_node_type(parent), "class_body") == 0) {
+            TSNode cls = ts_node_parent(parent);
+            const char *qn = ts_node_is_null(cls) ? NULL : js_class_qn(ctx, cls);
+            if (qn) {
+                call->js_this =
+                    js_member_is_static(cur) ? CBM_JS_THIS_STATIC : CBM_JS_THIS_INSTANCE;
+                call->js_this_class_qn = qn;
+                call->js_this_base = js_class_extends(ctx, cls);
+            }
+            return;
+        }
+        for (TSNode up = parent; !ts_node_is_null(up); up = ts_node_parent(up)) {
+            if (strcmp(ts_node_type(up), "class_body") == 0) {
+                call->js_this = CBM_JS_THIS_OTHER;
+                return;
+            }
+        }
+        return;
+    }
+}
+
 CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                      WalkState *state) {
     CBMInvocationDescriptor invocation = {0};
@@ -5432,6 +5538,8 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                             call.is_method = true;
                             call.receiver_is_amd_dependency =
                                 cbm_walk_amd_dependency_binds(ctx, state, js_receiver_root(obj));
+                        } else if (strcmp(ok, "this") == 0) {
+                            js_this_binding(ctx, node, &call);
                         }
                     }
                 }

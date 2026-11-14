@@ -554,12 +554,13 @@ static inline bool cbm_pipeline_kotlin_receiver_external(const CBMResolvedCallAr
  *
  * The pointer returned aliases into `arr` and stays valid as long as the
  * underlying CBMFileResult is alive. */
-/* The invocation rows of one file by caller QN, then by array order. The
- * exact-caller join below reads only the rows of the call's caller, so a
- * file of n calls and n rows costs n log n, not n * n. One caller's rows keep
- * their array order: the join meets them as a full scan does and picks the
- * same row. `ready` false (no index, or the allocation failed) selects the
- * full scan. */
+/* The invocation rows of one file by caller QN, then by call site (start,
+ * end byte), then by array order. The exact-caller join below reads only the
+ * rows at the call's own site and the rows that carry no site (0:0), so a
+ * file of n calls and n rows costs n log n, not n * n, also when one caller
+ * makes all the calls. The rows of one caller and one site keep their array
+ * order: the join meets them as a full scan does and picks the same row.
+ * `ready` false (no index, or the allocation failed) selects the full scan. */
 typedef struct {
     const CBMResolvedCall **rows;
     int count;
@@ -578,7 +579,35 @@ static inline int cbm_pipeline_lsp_caller_row_cmp(const void *left_ptr, const vo
     if (by_caller != 0) {
         return by_caller;
     }
+    if (left->site_start_byte != right->site_start_byte) {
+        return left->site_start_byte < right->site_start_byte ? -1 : 1;
+    }
+    if (left->site_end_byte != right->site_end_byte) {
+        return left->site_end_byte < right->site_end_byte ? -1 : 1;
+    }
     return (left > right) - (left < right); /* rows of one array: array order */
+}
+
+/* The first row in [lo, hi) of the index at or after (caller, start, end). */
+static inline int cbm_pipeline_lsp_caller_lower_bound(const cbm_pipeline_lsp_caller_index_t *index,
+                                                      int lo, int hi, const char *caller,
+                                                      uint32_t start, uint32_t end) {
+    while (lo < hi) {
+        int mid = lo + ((hi - lo) / PAIR_LEN);
+        const CBMResolvedCall *row = index->rows[mid];
+        int c = strcmp(row->caller_qn, caller);
+        if (c == 0 && row->site_start_byte != start) {
+            c = row->site_start_byte < start ? -1 : 1;
+        } else if (c == 0 && row->site_end_byte != end) {
+            c = row->site_end_byte < end ? -1 : 1;
+        }
+        if (c < 0) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
 }
 
 static inline void cbm_pipeline_lsp_caller_index_build(const CBMResolvedCallArray *arr,
@@ -672,21 +701,31 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_indexed(
 
     cbm_pipeline_lsp_exact_pick_t pick = {0};
     if (index && index->ready) {
-        int lo = 0;
-        int hi = index->count;
-        while (lo < hi) {
-            int mid = lo + ((hi - lo) / PAIR_LEN);
-            if (strcmp(index->rows[mid]->caller_qn, call->enclosing_func_qn) < 0) {
-                lo = mid + SKIP_ONE;
-            } else {
-                hi = mid;
+        /* A row at the call's own site (rank 2) beats every row without a
+         * site (rank 1): the site's rows first, then, when none of them
+         * answered, the caller's rows without a site. Each run in array
+         * order, as the full scan meets them. */
+        const char *caller = call->enclosing_func_qn;
+        int legacy = cbm_pipeline_lsp_caller_lower_bound(index, 0, index->count, caller, 0, 0);
+        int legacy_end =
+            cbm_pipeline_lsp_caller_lower_bound(index, legacy, index->count, caller, 0, SKIP_ONE);
+        if (cbm_pipeline_source_site_present(call->site_start_byte, call->site_end_byte)) {
+            for (int i = cbm_pipeline_lsp_caller_lower_bound(index, legacy_end, index->count,
+                                                             caller, call->site_start_byte,
+                                                             call->site_end_byte);
+                 i < index->count && index->rows[i]->site_start_byte == call->site_start_byte &&
+                 index->rows[i]->site_end_byte == call->site_end_byte &&
+                 strcmp(index->rows[i]->caller_qn, caller) == 0;
+                 i++) {
+                cbm_pipeline_lsp_exact_consider(&pick, index->rows[i], call, allow_tail_match, gbuf,
+                                                project_name);
             }
         }
-        for (int i = lo;
-             i < index->count && strcmp(index->rows[i]->caller_qn, call->enclosing_func_qn) == 0;
-             i++) {
-            cbm_pipeline_lsp_exact_consider(&pick, index->rows[i], call, allow_tail_match, gbuf,
-                                            project_name);
+        if (!pick.best) {
+            for (int i = legacy; i < legacy_end; i++) {
+                cbm_pipeline_lsp_exact_consider(&pick, index->rows[i], call, allow_tail_match, gbuf,
+                                                project_name);
+            }
         }
     } else {
         for (int i = 0; i < arr->count; i++) {

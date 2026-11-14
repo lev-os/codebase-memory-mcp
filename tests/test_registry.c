@@ -391,6 +391,38 @@ TEST(resolve_same_module) {
     PASS();
 }
 
+/* A callable registered by qualified name only (a function-local JS/TS
+ * twin, a generated member) is in no by-name bucket. A call in its own module
+ * reaches it by the exact same-module key, however long module + callee is. */
+TEST(resolve_same_module_qn_only_any_length) {
+    static const size_t lens[] = {16, 600, 2000};
+    for (size_t i = 0; i < sizeof(lens) / sizeof(lens[0]); i++) {
+        size_t n = lens[i];
+        char *module_qn = malloc(n + 32);
+        char *qn = malloc(n + 64);
+        ASSERT_NOT_NULL(module_qn);
+        ASSERT_NOT_NULL(qn);
+        memcpy(module_qn, "proj.", 5);
+        memset(module_qn + 5, 'd', n);
+        memcpy(module_qn + 5 + n, ".obs", 5);
+        snprintf(qn, n + 64, "%s.observable.iterator.next", module_qn);
+        cbm_registry_t *r = cbm_registry_new();
+        cbm_registry_add_qn_only(r, qn, "Method");
+        cbm_resolution_t res =
+            cbm_registry_resolve(r, "observable.iterator.next", module_qn, NULL, NULL, 0);
+        if (!res.qualified_name || strcmp(res.qualified_name, qn) != 0) {
+            fprintf(stderr, "  module of %zu bytes: got %s\n", strlen(module_qn),
+                    res.qualified_name ? res.qualified_name : "(none)");
+        }
+        ASSERT_STR_EQ(res.qualified_name, qn);
+        ASSERT_STR_EQ(res.strategy, "same_module");
+        cbm_registry_free(r);
+        free(module_qn);
+        free(qn);
+    }
+    PASS();
+}
+
 /* #1128: these cases moved from the strategy chain to the call-site guard (the
  * review of 2026-10-19). The chain stays unchanged - it also resolves type
  * references, field types, reads/writes, SQL lineage and the cross-LSP pass for
@@ -3575,62 +3607,119 @@ TEST(registry_resolve_lexical_walks_enclosing_defs_issue1548) {
     PASS();
 }
 
-/* JS/TS `this.name()` names a member of the class around the caller. With no
- * type-aware answer, the nearest class around the caller in its own file
- * that declares `name` holds the target, before a name-only guess that a
- * same-name callable nested in another method wins on a tie
- * (Adapter.handle.stop sorts before Adapter.stop). An inherited member, a
- * longer path, a caller outside a class, an object literal on the way (its
- * `this` can be the literal) and other languages leave the call to the
- * other strategies. */
+/* JS/TS `this.name()` names a member of the class `this` is at the call
+ * (CBMCall.js_this, from the extractor). With no type-aware answer, the
+ * target is the Method `name` of that class (its static one for a static
+ * `this`), else of the project class its `extends` names, one level, by
+ * exact strategies only. `this` of a nested function or an object-literal
+ * method is not the class: no edge. A class that extends nothing and lacks
+ * `name`: no edge either. Otherwise the name guesses run, but never land on a
+ * callable nested in a body (Adapter.handle.go, label Function). */
+static bool js_this_case(const cbm_registry_t *r, const char *callee, uint8_t kind, const char *cls,
+                         const char *base, const char *module_qn, const char **keys,
+                         const char **vals, int n, CBMLanguage lang, const char *want,
+                         const char *want_strategy) {
+    CBMCall call = {0};
+    call.callee_name = callee;
+    call.enclosing_func_qn = "proj.pkg.Adapter.shutdown";
+    call.js_this = kind;
+    call.js_this_class_qn = cls;
+    call.js_this_base = base;
+    cbm_resolution_t res =
+        cbm_registry_resolve_call_scoped(r, &call, module_qn, keys, vals, n, lang, false);
+    const char *got = res.qualified_name && res.qualified_name[0] ? res.qualified_name : "";
+    bool ok = strcmp(got, want) == 0 &&
+              (!want[0] || (res.strategy && strcmp(res.strategy, want_strategy) == 0));
+    if (!ok) {
+        fprintf(stderr,
+                "  %s (this kind %d, class %s, base %s, lang %d): got '%s' via %s, want '%s'\n",
+                callee, kind, cls ? cls : "-", base ? base : "-", (int)lang, got,
+                res.strategy ? res.strategy : "-", want);
+    }
+    return ok;
+}
+
 TEST(registry_js_this_call_reaches_enclosing_class_member) {
     cbm_registry_t *r = cbm_registry_new();
     static const char *const defs[][3] = {
         {"Adapter", "proj.pkg.Adapter", "Class"},
         {"start", "proj.pkg.Adapter.start", "Method"},
         {"stop", "proj.pkg.Adapter.handle.stop", "Function"},
+        {"go", "proj.pkg.Adapter.handle.go", "Function"},
         {"stop", "proj.pkg.Adapter.stop", "Method"},
+        {"stop", "proj.pkg.Adapter.static.stop", "Method"},
         {"shutdown", "proj.pkg.Adapter.shutdown", "Method"},
+        {"Base", "proj.pkg.base.Base", "Class"},
+        {"reset", "proj.pkg.base.Base.reset", "Method"},
+        {"Child", "proj.pkg.Child", "Class"},
+        {"Peer", "proj.pkg.Peer", "Class"},
+        {"pause", "proj.pkg.Peer.pause", "Method"},
         {"helper", "proj.pkg.helper", "Function"},
     };
     for (size_t i = 0; i < sizeof(defs) / sizeof(defs[0]); i++) {
         cbm_registry_add_lang(r, defs[i][0], defs[i][1], defs[i][2], CBM_LANG_TYPESCRIPT, false);
     }
+    const char *keys[] = {"Base"};
+    const char *vals[] = {"proj.pkg.base.Base"};
     /* pkg/index.ts: the module QN keeps `index`, its symbols drop it. */
     static const char *const mods[] = {"proj.pkg.index", "proj.pkg"};
     static const CBMLanguage langs[] = {CBM_LANG_TYPESCRIPT, CBM_LANG_JAVASCRIPT, CBM_LANG_TSX};
+    const char *A = "proj.pkg.Adapter";
+    bool ok = true;
     for (int m = 0; m < 2; m++) {
         for (int l = 0; l < 3; l++) {
-            cbm_resolution_t res =
-                cbm_registry_resolve_call_scoped(r, "this.stop", mods[m], NULL, NULL, 0, langs[l],
-                                                 "proj.pkg.Adapter.shutdown", false);
-            ASSERT_STR_EQ(res.qualified_name, "proj.pkg.Adapter.stop");
-            ASSERT_STR_EQ(res.strategy, "this_member");
+            const char *mod = mods[m];
+            CBMLanguage lang = langs[l];
+            /* The instance member, and the static one beside it. */
+            ok &= js_this_case(r, "this.stop", CBM_JS_THIS_INSTANCE, A, NULL, mod, NULL, NULL, 0,
+                               lang, "proj.pkg.Adapter.stop", "this_member");
+            ok &= js_this_case(r, "this.stop", CBM_JS_THIS_STATIC, A, NULL, mod, NULL, NULL, 0,
+                               lang, "proj.pkg.Adapter.static.stop", "this_member");
+            /* `this` of a nested function or an object-literal method. */
+            ok &= js_this_case(r, "this.stop", CBM_JS_THIS_OTHER, A, NULL, mod, NULL, NULL, 0, lang,
+                               "", NULL);
+            /* No member, no extends: nothing else can declare it. */
+            ok &= js_this_case(r, "this.missing", CBM_JS_THIS_INSTANCE, A, NULL, mod, NULL, NULL, 0,
+                               lang, "", NULL);
+            ok &= js_this_case(r, "this.go", CBM_JS_THIS_INSTANCE, A, NULL, mod, NULL, NULL, 0,
+                               lang, "", NULL);
+            /* The parent class, through the import or beside the class. */
+            ok &= js_this_case(r, "this.reset", CBM_JS_THIS_INSTANCE, "proj.pkg.Child", "Base", mod,
+                               keys, vals, 1, lang, "proj.pkg.base.Base.reset", "this_member");
+            ok &= js_this_case(r, "this.pause", CBM_JS_THIS_INSTANCE, "proj.pkg.Child", "Peer", mod,
+                               NULL, NULL, 0, lang, "proj.pkg.Peer.pause", "this_member");
+            /* A parent outside the project: the guesses run, but never land
+             * on a callable nested in a body. */
+            ok &= js_this_case(r, "this.go", CBM_JS_THIS_INSTANCE, "proj.pkg.Child", "lib.Widget",
+                               mod, NULL, NULL, 0, lang, "", NULL);
+            /* No class binds `this` (module level, a plain function). */
+            ok &= js_this_case(r, "this.go", CBM_JS_THIS_NONE, NULL, NULL, mod, NULL, NULL, 0, lang,
+                               "", NULL);
         }
     }
-    static const struct {
-        const char *callee;
-        const char *caller;
-        CBMLanguage lang;
-    } others[] = {
-        {"this.missing", "proj.pkg.Adapter.shutdown", CBM_LANG_TYPESCRIPT},
-        {"this.handle.stop", "proj.pkg.Adapter.shutdown", CBM_LANG_TYPESCRIPT},
-        {"this.stop", "proj.pkg.helper", CBM_LANG_TYPESCRIPT},
-        {"this.start", "proj.pkg.Adapter.handle.stop", CBM_LANG_TYPESCRIPT},
-        {"this.stop", "proj.pkg.Adapter.shutdown", CBM_LANG_JAVA},
-        {"stop", "proj.pkg.Adapter.shutdown", CBM_LANG_TYPESCRIPT},
-    };
-    for (size_t i = 0; i < sizeof(others) / sizeof(others[0]); i++) {
-        cbm_resolution_t res =
-            cbm_registry_resolve_call_scoped(r, others[i].callee, "proj.pkg.index", NULL, NULL, 0,
-                                             others[i].lang, others[i].caller, false);
-        if (res.strategy && strcmp(res.strategy, "this_member") == 0) {
-            fprintf(stderr, "  %s from %s: this_member %s\n", others[i].callee, others[i].caller,
-                    res.qualified_name);
-            FAIL("this_member answered a call it does not own");
-        }
+    /* Other languages never read js_this: the same answer without it. */
+    CBMCall java = {0};
+    java.callee_name = "this.stop";
+    java.enclosing_func_qn = "proj.pkg.Adapter.shutdown";
+    CBMCall java_this = java;
+    java_this.js_this = CBM_JS_THIS_OTHER;
+    java_this.js_this_class_qn = A;
+    cbm_resolution_t plain = cbm_registry_resolve_call_scoped(r, &java, "proj.pkg.index", NULL,
+                                                              NULL, 0, CBM_LANG_JAVA, false);
+    cbm_resolution_t with_this = cbm_registry_resolve_call_scoped(
+        r, &java_this, "proj.pkg.index", NULL, NULL, 0, CBM_LANG_JAVA, false);
+    if (!plain.qualified_name || !with_this.qualified_name ||
+        strcmp(plain.qualified_name, with_this.qualified_name) != 0 ||
+        strcmp(plain.strategy, with_this.strategy) != 0) {
+        fprintf(stderr, "  java this.stop: %s via %s, with js_this %s via %s\n",
+                plain.qualified_name ? plain.qualified_name : "-",
+                plain.strategy ? plain.strategy : "-",
+                with_this.qualified_name ? with_this.qualified_name : "-",
+                with_this.strategy ? with_this.strategy : "-");
+        ok = false;
     }
     cbm_registry_free(r);
+    ASSERT_TRUE(ok);
     PASS();
 }
 
@@ -3787,6 +3876,7 @@ SUITE(registry) {
     RUN_TEST(registry_no_duplicates);
     /* Resolution */
     RUN_TEST(resolve_same_module);
+    RUN_TEST(resolve_same_module_qn_only_any_length);
     RUN_TEST(resolve_same_module_only_on_self_receiver);
     RUN_TEST(suppress_same_module_bound_receiver_binding_facts);
     RUN_TEST(resolve_qualified_disambiguates_same_name);

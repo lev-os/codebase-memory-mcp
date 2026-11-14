@@ -2577,6 +2577,7 @@ static void cbm_requalify_result(CBMArena *a, CBMFileResult *r, cbm_requalify_ru
     for (int i = 0; i < r->calls.count; i++) {
         CBMCall *c = &r->calls.items[i];
         c->enclosing_func_qn = cbm_requalify_qn(a, c->enclosing_func_qn, rules, n, false);
+        c->js_this_class_qn = cbm_requalify_qn(a, c->js_this_class_qn, rules, n, false);
     }
     for (int i = 0; i < r->usages.count; i++) {
         CBMUsage *u = &r->usages.items[i];

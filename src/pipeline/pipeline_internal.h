@@ -275,19 +275,22 @@ cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const c
                                                 const char *module_qn, const char **import_map_keys,
                                                 const char **import_map_vals, int import_map_count,
                                                 CBMLanguage lang);
-/* The registry step of BOTH call resolvers once the LSP has not answered:
- * for Python, the def or class `callee_name` binds in the nearest def enclosing
- * `scope_qn` (cbm_registry_resolve_lexical, "lexical_scope"); for JS/TS,
- * `this.name` names the member `name` the class around `scope_qn` declares
- * ("this_member"); otherwise, or when there is no such def,
- * cbm_registry_resolve_call_lang. `caller_test`: the calling definition's
- * test verdict, as for cbm_registry_resolve_ref. */
-cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const char *callee_name,
+/* The registry step of BOTH call resolvers once the LSP has not answered,
+ * for the extracted `call`: for Python, the def or class its callee binds in
+ * the nearest def enclosing its caller (cbm_registry_resolve_lexical,
+ * "lexical_scope"); for JS/TS, `this.name` names the member `name` of the
+ * class `this` is at the call, or of the project class it extends
+ * ("this_member"), and no edge when `this` is not that class's or nothing
+ * else can declare `name`; otherwise cbm_registry_resolve_call_lang, which
+ * never binds a JS/TS `this.name` to a callable nested in a body.
+ * `caller_test`: the calling definition's test verdict, as for
+ * cbm_registry_resolve_ref. */
+cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const CBMCall *call,
                                                   const char *module_qn,
                                                   const char **import_map_keys,
                                                   const char **import_map_vals,
                                                   int import_map_count, CBMLanguage lang,
-                                                  const char *scope_qn, bool caller_test);
+                                                  bool caller_test);
 /* The test verdict of the code making a reference, by the same three rules the
  * registry ranks candidates with: the extractor's verdict stored on the
  * caller's node (cbm_node_is_test), the extractor's file rule
@@ -1789,10 +1792,17 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      nested callable takes its owner's path (`file.box.run`) or "#<n>"
  *      (cbm_js_split_twin_callables). An index built before holds one node
  *      for such callables, or other names, so it rebuilds once on upgrade.
- *  17: JS/TS index-file resolver scopes omit index, matching symbol QNs.
+ *  17: a JS/TS static member beside an instance member of its name is
+ *      `Class.static.name`, not "#<n>"; `this.name()` names a member of the
+ *      class `this` is, or of the project class it extends, never a callable
+ *      nested in a body; a call bound to a parameter, variable or catch
+ *      clause, or made in a parameter default, follows its scope; a TS doc
+ *      link that two same-line definitions share stays a gap. Older indexes
+ *      rebuild once to drop the old names and edges.
+ *  18: JS/TS index-file resolver scopes omit index, matching symbol QNs.
  *      Unchanged files rebuild once to gain their type-resolved call edges.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 17 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 18 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

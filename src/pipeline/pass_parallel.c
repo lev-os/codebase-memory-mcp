@@ -3506,8 +3506,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             !rust_external && !php_vendor_call && !java_external && count == 0) {
             /* Python LEGB fallback first (MUST match pass_calls.c). */
             res = cbm_registry_resolve_call_scoped(
-                rc->registry, call->callee_name, module_qn, imp_keys, imp_vals, imp_count, lang,
-                call->enclosing_func_qn, cbm_pipeline_caller_is_test(source_node, rel, lang));
+                rc->registry, call, module_qn, imp_keys, imp_vals, imp_count, lang,
+                cbm_pipeline_caller_is_test(source_node, rel, lang));
         }
         /* `p->open(fd)`: the registry does not split a callee on the arrow.
          * The object's type decides, as for the dot call handled further

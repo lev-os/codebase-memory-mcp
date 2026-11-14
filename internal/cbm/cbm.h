@@ -396,6 +396,16 @@ typedef enum {
     CBM_SOURCE_ORIGIN_PREPROCESSED,
 } CBMSourceOrigin;
 
+/* What `this` is at a JS/TS `this.name()` call (CBMCall.js_this). Arrows
+ * keep the `this` of the code around them. */
+typedef enum {
+    CBM_JS_THIS_NONE = 0, /* no class binds it, or not a `this.` call */
+    CBM_JS_THIS_INSTANCE, /* an instance of js_this_class_qn: a method or field of it */
+    CBM_JS_THIS_STATIC,   /* the class js_this_class_qn itself: a static member of it */
+    CBM_JS_THIS_OTHER,    /* a non-arrow function or an object-literal method inside a
+                             class: never the class or its instance */
+} CBMJsThis;
+
 typedef struct {
     const char *callee_name;       // raw callee text ("pkg.Func", "foo")
     const char *enclosing_func_qn; // QN of enclosing function (or module QN)
@@ -425,8 +435,10 @@ typedef struct {
                                      // C++ operator). Never fall back to textual resolution.
     bool callee_is_locally_bound;    // bare call foo() whose callee identifier is bound as a
                                      // parameter of an enclosing function, so it cannot be the
-                                     // module-level foo. Python only today. Read by the
-                                     // weak-local-binding guard. Default false.
+                                     // module-level foo. Python: read by the weak-local-binding
+                                     // guard. JS/TS: a parameter, variable or catch clause is
+                                     // the nearest binding (cbm_js_twin_bind_local_callees), and
+                                     // the registry step gives no edge. Default false.
     bool receiver_is_amd_dependency; // JS/TS member call x.foo() whose receiver root x is a
                                      // parameter the factory of an enclosing AMD
                                      // define([...], fn) / require([...], fn) binds to a
@@ -438,6 +450,13 @@ typedef struct {
                                      // (self.compiler.apply_converters()). An object the
                                      // class owns, not a parameter: read by the weak-member
                                      // guard's unique-name exemption. Default false.
+    /* JS/TS `this.name()`: what `this` is there (CBMJsThis), and for an
+     * instance or static `this` the class (its QN as the class node has it)
+     * and the text of its `extends` expression (NULL: none). Read by the
+     * registry's this-member rule (cbm_registry_resolve_call_scoped). */
+    const char *js_this_class_qn;
+    const char *js_this_base;
+    uint8_t js_this;
     /* Java/Kotlin: the arguments written at the site, one entry each,
      * comma-separated: the Kotlin argument name or "_", and "*" for a
      * trailing lambda ("" = no arguments). NULL = not recorded. Read

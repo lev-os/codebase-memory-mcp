@@ -2324,34 +2324,36 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
     return empty_result();
 }
 
-/* Exact same-module lookup without ever hashing a truncated candidate. The
- * long path uses the canonical short-name bucket, not heuristic name limits. */
+/* The stored exact-table key `scope[0..scope_len)`.`name`, or NULL when no
+ * definition holds it. A key longer than the stack buffer is built on the
+ * heap, so an exact lookup never falls back to a by-name bucket: a callable
+ * registered by qualified name only (a function-local twin, a generated
+ * member) is in none. */
+static const char *registry_exact_join(const cbm_registry_t *r, const char *scope, size_t scope_len,
+                                       const char *name) {
+    size_t name_len = strlen(name);
+    size_t need = scope_len + SKIP_ONE + name_len + SKIP_ONE;
+    char small[CBM_SZ_512];
+    char *key = need <= sizeof(small) ? small : malloc(need);
+    if (!key) {
+        return NULL;
+    }
+    memcpy(key, scope, scope_len);
+    key[scope_len] = '.';
+    memcpy(key + scope_len + SKIP_ONE, name, name_len + SKIP_ONE);
+    const char *stored_key = cbm_ht_get_key(r->exact, key);
+    if (key != small) {
+        free(key);
+    }
+    return stored_key;
+}
+
+/* Exact same-module lookup without ever hashing a truncated candidate. */
 static const char *same_module_candidate(const cbm_registry_t *r, const char *module_qn,
                                          size_t scope_len, const char *name) {
     if (!module_qn || !name)
         return NULL;
-    size_t name_len = strlen(name);
-    char candidate[CBM_SZ_512];
-    if (scope_len < sizeof(candidate) && name_len < sizeof(candidate) - scope_len - 1) {
-        memcpy(candidate, module_qn, scope_len);
-        candidate[scope_len] = '.';
-        memcpy(candidate + scope_len + 1, name, name_len + 1);
-        return cbm_ht_get_key(r->exact, candidate);
-    }
-    qn_array_t *arr = (qn_array_t *)cbm_ht_get(r->by_name, simple_name(name));
-    if (!arr)
-        return NULL;
-    for (int i = 0; i < arr->count; i++) {
-        const char *qn = arr->items[i];
-        if (!qn)
-            continue;
-        size_t qn_len = strlen(qn);
-        if (qn_len > scope_len && qn_len - scope_len - 1 == name_len &&
-            memcmp(qn, module_qn, scope_len) == 0 && qn[scope_len] == '.' &&
-            memcmp(qn + scope_len + 1, name, name_len) == 0)
-            return qn;
-    }
-    return NULL;
+    return registry_exact_join(r, module_qn, scope_len, name);
 }
 
 /* Strategy 2: Same-module match. Scoring elsewhere retains the raw file QN. */
@@ -5465,85 +5467,187 @@ static bool js_member_name(const char *s) {
     return true;
 }
 
-/* JS/TS `this.name()` in a method names a member of the method's class. When
- * no type-aware resolver answered (the TS LSP types no `this` in some files),
- * the class around the caller holds the target if it declares `name`: the
- * walk goes outward from `scope_qn` inside the caller's own file, through
- * registered callables only, to the first Class. A prefix that is no def is
- * an object literal (Adapter.handle.stop), whose methods can see the literal
- * as `this`, and ends the walk. A caller outside any class, a longer path
- * (`this.a.b()`) and a member the class does not declare (inherited) stay
- * with the other strategies. It runs before them because a name-only guess
- * ranks every same-name callable alike, and a tie went to a callable that an
- * object literal in another method holds. Uncached: the answer depends on
- * the caller. */
-static cbm_resolution_t resolve_js_this_member(const cbm_registry_t *r, const char *callee_name,
-                                               const char *scope_qn, const char *module_qn) {
+/* The segment a static member of a JS/TS class takes beside an instance
+ * member of its name (cbm_js_split_twin_callables): Timer.static.stop. */
+#define JS_STATIC_SEGMENT "static"
+
+/* The member `name` of class `cls` a `this` names: for an instance the
+ * Method cls.name; for the class itself (`is_static`) cls.static.name, the
+ * name a static member takes beside a same-name instance member, else
+ * cls.name. Only a Method is a member: a Function under the class's QN is a
+ * callable nested in one of its methods (Lone.stop for the arrow of
+ * `const h = { stop: () => 3 }` in a method of Lone). */
+static const char *js_class_member(const cbm_registry_t *r, const char *cls, const char *name,
+                                   bool is_static) {
+    const char *qn = NULL;
+    size_t cls_len = strlen(cls);
+    if (is_static) {
+        char member[CBM_SZ_256];
+        int n = snprintf(member, sizeof(member), "%s.%s", JS_STATIC_SEGMENT, name);
+        if (n > 0 && (size_t)n < sizeof(member)) {
+            qn = registry_exact_join(r, cls, cls_len, member);
+        }
+    }
+    if (!qn) {
+        qn = registry_exact_join(r, cls, cls_len, name);
+    }
+    const char *label = qn ? cbm_ht_get(r->exact, qn) : NULL;
+    return label && strcmp(label, "Method") == 0 ? qn : NULL;
+}
+
+/* The project class the `extends` text `base` of class `cls` names, seen
+ * from the class's own file: an import of it, or a class of that name beside
+ * `cls` (in its namespace, then in its module). NULL when none: a class of a
+ * package, or an expression. Exact strategies only, never a name guess. */
+static const char *js_extends_class(const cbm_registry_t *r, const char *cls, const char *base,
+                                    const char *module_qn, const char **import_map_keys,
+                                    const char **import_map_vals, int import_map_count) {
+    char prefix[CBM_SZ_256];
+    const char *dot = strchr(base, '.');
+    size_t plen = dot ? (size_t)(dot - base) : strlen(base);
+    if (plen == 0 || plen >= sizeof(prefix)) {
+        return NULL;
+    }
+    memcpy(prefix, base, plen);
+    prefix[plen] = '\0';
+    const char *hit = resolve_import_map(r, prefix, dot ? dot + SKIP_ONE : NULL, import_map_keys,
+                                         import_map_vals, import_map_count)
+                          .qualified_name;
+    const char *at = strrchr(cls, '.');
+    if (!hit && at) {
+        hit = registry_exact_join(r, cls, (size_t)(at - cls), base);
+    }
+    if (!hit && module_qn) {
+        hit = registry_exact_join(r, module_qn, strlen(module_qn), base);
+    }
+    const char *label = hit ? cbm_ht_get(r->exact, hit) : NULL;
+    return label && strcmp(label, "Class") == 0 && strcmp(hit, cls) != 0 ? hit : NULL;
+}
+
+/* JS/TS `this.name()` names a member of the class `this` is at the call
+ * (CBMCall.js_this, from the extractor). When no type-aware resolver
+ * answered (the TS LSP types no `this` in some files), the target is the
+ * Method `name` of that class, the static one for a static `this`, or else
+ * of the class its `extends` names when that is a class of the project (one
+ * level). It runs before the name-only guesses, which rank every same-name
+ * callable alike.
+ *
+ * `*no_edge` is set when no guess may answer either: `this` is a function's
+ * or an object literal's inside a class (never the class), or the class
+ * extends nothing, so no other member can be meant. Uncached: the answer
+ * depends on the call. */
+static cbm_resolution_t resolve_js_this_member(const cbm_registry_t *r, const CBMCall *call,
+                                               const char *module_qn, const char **import_map_keys,
+                                               const char **import_map_vals, int import_map_count,
+                                               bool *no_edge) {
     static const char self[] = "this.";
     const size_t self_len = sizeof(self) - SKIP_ONE;
-    char scope[CBM_SZ_512];
-    char candidate[CBM_SZ_512];
-    size_t len = scope_qn ? strlen(scope_qn) : 0;
-    if (!r || !callee_name || strncmp(callee_name, self, self_len) != 0 ||
-        !js_member_name(callee_name + self_len) || len == 0 || len >= sizeof(scope)) {
+    *no_edge = false;
+    const char *callee = call->callee_name;
+    if (!r || !callee || strncmp(callee, self, self_len) != 0 ||
+        !js_member_name(callee + self_len)) {
         return empty_result();
     }
-    size_t floor = def_prefix_len(module_qn, scope_qn);
-    if (floor == 0) {
+    if (call->js_this == CBM_JS_THIS_OTHER) {
+        *no_edge = true;
         return empty_result();
     }
-    memcpy(scope, scope_qn, len + SKIP_ONE);
-    while (strlen(scope) > floor) {
-        const char *label = cbm_ht_get(r->exact, scope);
-        if (label && strcmp(label, "Class") == 0) {
-            int n = snprintf(candidate, sizeof(candidate), "%s.%s", scope, callee_name + self_len);
-            const char *stored_key =
-                n > 0 && (size_t)n < sizeof(candidate) ? cbm_ht_get_key(r->exact, candidate) : NULL;
-            if (stored_key && registry_label_is_callable(cbm_ht_get(r->exact, stored_key))) {
-                return (cbm_resolution_t){stored_key, "this_member", CONF_THIS_MEMBER,
-                                          REG_RESOLVED};
-            }
-            break;
-        }
-        if (!registry_label_is_callable(label)) {
-            break;
-        }
-        char *dot = strrchr(scope, '.');
-        if (!dot) {
-            break;
-        }
-        *dot = '\0';
+    const char *cls = call->js_this_class_qn;
+    const char *cls_label = cls ? cbm_ht_get(r->exact, cls) : NULL;
+    if ((call->js_this != CBM_JS_THIS_INSTANCE && call->js_this != CBM_JS_THIS_STATIC) ||
+        !cls_label || strcmp(cls_label, "Class") != 0) {
+        return empty_result();
     }
+    bool is_static = call->js_this == CBM_JS_THIS_STATIC;
+    const char *name = callee + self_len;
+    const char *hit = js_class_member(r, cls, name, is_static);
+    if (!hit && call->js_this_base) {
+        const char *parent = js_extends_class(r, cls, call->js_this_base, module_qn,
+                                              import_map_keys, import_map_vals, import_map_count);
+        hit = parent ? js_class_member(r, parent, name, is_static) : NULL;
+    }
+    if (hit) {
+        return (cbm_resolution_t){hit, "this_member", CONF_THIS_MEMBER, REG_RESOLVED};
+    }
+    *no_edge = !call->js_this_base;
     return empty_result();
+}
+
+/* A Function whose QN sits under a class or a callable: a callable declared
+ * in a method or function body, named like a member (Lone.stop), or under an
+ * object literal there, which has no node of its own (Adapter.handle.go). The
+ * nearest definition among the prefixes of its QN decides. A JS/TS
+ * `this.name()` never names one. */
+static bool js_nested_callable(const cbm_registry_t *r, const char *qn) {
+    const char *label = qn ? cbm_ht_get(r->exact, qn) : NULL;
+    if (!label || strcmp(label, "Function") != 0) {
+        return false;
+    }
+    size_t len = strlen(qn);
+    char small[CBM_SZ_512];
+    char *owner = len < sizeof(small) ? small : malloc(len + SKIP_ONE);
+    if (!owner) {
+        return false;
+    }
+    memcpy(owner, qn, len + SKIP_ONE);
+    bool nested = false;
+    for (char *dot = strrchr(owner, '.'); dot; dot = strrchr(owner, '.')) {
+        *dot = '\0';
+        const char *owner_label = cbm_ht_get(r->exact, owner);
+        if (owner_label) {
+            nested = strcmp(owner_label, "Class") == 0 || registry_label_is_callable(owner_label);
+            break;
+        }
+    }
+    if (owner != small) {
+        free(owner);
+    }
+    return nested;
 }
 
 /* The registry step both call resolvers (pass_calls.c, pass_parallel.c) run
  * once the LSP has not answered: a Python bare name bound in an enclosing def
  * first (the LSP binds those locals itself; this covers the sites it did not
- * resolve), or a JS/TS `this.name` the caller's class declares, then the
- * language-aware chain. One entry point, so the two resolvers cannot diverge
- * on the rule. */
-cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const char *callee_name,
+ * resolve), or a JS/TS `this.name` of the class `this` is at the call, then
+ * the language-aware chain, which never binds a JS/TS `this.name` to a
+ * nested callable. One entry point, so the two resolvers cannot diverge on
+ * the rule. */
+cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const CBMCall *call,
                                                   const char *module_qn,
                                                   const char **import_map_keys,
                                                   const char **import_map_vals,
                                                   int import_map_count, CBMLanguage lang,
-                                                  const char *scope_qn, bool caller_test) {
+                                                  bool caller_test) {
+    if (!call || !call->callee_name) {
+        return empty_result();
+    }
+    const char *callee_name = call->callee_name;
     if (lang == CBM_LANG_PYTHON) {
         cbm_resolution_t lexical =
-            cbm_registry_resolve_lexical(r, callee_name, scope_qn, module_qn);
+            cbm_registry_resolve_lexical(r, callee_name, call->enclosing_func_qn, module_qn);
         if (lexical.qualified_name && lexical.qualified_name[0]) {
             return lexical;
         }
     }
-    if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
-        cbm_resolution_t member = resolve_js_this_member(r, callee_name, scope_qn, module_qn);
-        if (member.qualified_name && member.qualified_name[0]) {
+    bool js = lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
+    if (js && call->callee_is_locally_bound) {
+        return empty_result(); /* a parameter, variable or catch clause holds the callee */
+    }
+    if (js) {
+        bool no_edge = false;
+        cbm_resolution_t member = resolve_js_this_member(
+            r, call, module_qn, import_map_keys, import_map_vals, import_map_count, &no_edge);
+        if ((member.qualified_name && member.qualified_name[0]) || no_edge) {
             return member;
         }
     }
-    return resolve_call_lang(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                             import_map_count, lang, caller_test);
+    cbm_resolution_t res = resolve_call_lang(r, callee_name, module_qn, import_map_keys,
+                                             import_map_vals, import_map_count, lang, caller_test);
+    if (js && strncmp(callee_name, "this.", strlen("this.")) == 0 &&
+        js_nested_callable(r, res.qualified_name)) {
+        return empty_result();
+    }
+    return res;
 }
 
 /* ── Fuzzy Resolve ──────────────────────────────────────────────── */
