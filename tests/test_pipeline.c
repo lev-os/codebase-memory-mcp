@@ -36284,12 +36284,60 @@ TEST(pipeline_js_top_level_declaration_keeps_plain_name) {
     PASS();
 }
 
+/* 20,000 callables of one name in one file, each called from its owner,
+ * index inside a few seconds: grouping and scope binding are near-linear. */
+TEST(pipeline_js_twin_callables_scale) {
+    enum { JS_TWIN_SCALE_N = 20000, JS_TWIN_SCALE_MS = 15000 };
+    char tmp[256] = "/tmp/cbm_js_twin_scale_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    size_t cap = (size_t)JS_TWIN_SCALE_N * 80 + 256;
+    char *src = malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t off = (size_t)snprintf(src, cap, "export function run() { return 0; }\n");
+    for (int i = 0; i < JS_TWIN_SCALE_N; i++) {
+        off += (size_t)snprintf(src + off, cap - off,
+                                "function f%d() { function run() { return %d; } return run(); }\n",
+                                i, i);
+    }
+    write_temp_file(tmp, "main.js", src);
+    free(src);
+    XlangEnvSave saved = xlang_env_select(false);
+    char db[512];
+    snprintf(db, sizeof(db), "%s/g.db", tmp);
+    struct timespec t0;
+    struct timespec t1;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
+    cbm_pipeline_t *p = js_twin_index(tmp, db);
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
+    xlang_env_restore(&saved);
+    ASSERT_NOT_NULL(p);
+    long ms = (long)(t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+    fprintf(stderr, "  js twin scale: %d callables indexed in %ld ms\n", JS_TWIN_SCALE_N, ms);
+    const char *project = cbm_pipeline_project_name(p);
+    char got[1024];
+    js_twin_qn_at(db, project, "main.js", "run", 1, got, sizeof(got));
+    bool ok = js_twin_expect("scale export", got, "main.run");
+    js_twin_calls_at(db, project, "main.js", 2, got, sizeof(got));
+    ok = js_twin_expect("scale first", got, "main.f0 -> main.f0.run") && ok;
+    char want[128];
+    snprintf(want, sizeof(want), "main.f%d -> main.f%d.run", JS_TWIN_SCALE_N - 1,
+             JS_TWIN_SCALE_N - 1);
+    js_twin_calls_at(db, project, "main.js", JS_TWIN_SCALE_N + 1, got, sizeof(got));
+    ok = js_twin_expect("scale last", got, want) && ok;
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(ms < JS_TWIN_SCALE_MS);
+    PASS();
+}
+
 SUITE(pipeline) {
     RUN_TEST(pipeline_js_module_binding_keeps_plain_name);
     RUN_TEST(pipeline_js_local_callee_is_nearest_binding);
     RUN_TEST(pipeline_js_accessor_pairs_keep_their_calls);
     RUN_TEST(pipeline_js_twin_insert_incremental_equals_full);
     RUN_TEST(pipeline_js_top_level_declaration_keeps_plain_name);
+    RUN_TEST(pipeline_js_twin_callables_scale);
     RUN_TEST(pipeline_ts_caller_is_innermost_named_callable);
     RUN_TEST(pipeline_ts_signature_targets_require_owner);
     RUN_TEST(pipeline_inc_c_family_fragments);

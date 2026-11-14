@@ -554,9 +554,115 @@ static inline bool cbm_pipeline_kotlin_receiver_external(const CBMResolvedCallAr
  *
  * The pointer returned aliases into `arr` and stays valid as long as the
  * underlying CBMFileResult is alive. */
-static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
-    const CBMResolvedCallArray *arr, const CBMCall *call, bool allow_tail_match,
-    const cbm_gbuf_t *gbuf, const char *project_name) {
+/* The invocation rows of one file by caller QN, then by array order. The
+ * exact-caller join below reads only the rows of the call's caller, so a
+ * file of n calls and n rows costs n log n, not n * n. One caller's rows keep
+ * their array order: the join meets them as a full scan does and picks the
+ * same row. `ready` false (no index, or the allocation failed) selects the
+ * full scan. */
+typedef struct {
+    const CBMResolvedCall **rows;
+    int count;
+    bool ready;
+} cbm_pipeline_lsp_caller_index_t;
+
+static inline bool cbm_pipeline_lsp_caller_row_usable(const CBMResolvedCall *row) {
+    return row->kind == CBM_RESOLVED_INVOCATION && row->caller_qn && row->callee_qn &&
+           row->confidence >= CBM_LSP_CONFIDENCE_FLOOR;
+}
+
+static inline int cbm_pipeline_lsp_caller_row_cmp(const void *left_ptr, const void *right_ptr) {
+    const CBMResolvedCall *left = *(const CBMResolvedCall *const *)left_ptr;
+    const CBMResolvedCall *right = *(const CBMResolvedCall *const *)right_ptr;
+    int by_caller = strcmp(left->caller_qn, right->caller_qn);
+    if (by_caller != 0) {
+        return by_caller;
+    }
+    return (left > right) - (left < right); /* rows of one array: array order */
+}
+
+static inline void cbm_pipeline_lsp_caller_index_build(const CBMResolvedCallArray *arr,
+                                                       cbm_pipeline_lsp_caller_index_t *index) {
+    index->rows = NULL;
+    index->count = 0;
+    index->ready = false;
+    int usable = 0;
+    for (int i = 0; arr && i < arr->count; i++) {
+        if (cbm_pipeline_lsp_caller_row_usable(&arr->items[i])) {
+            usable++;
+        }
+    }
+    if (usable == 0) {
+        index->ready = true;
+        return;
+    }
+    const CBMResolvedCall **rows =
+        (const CBMResolvedCall **)cbm_alloc(CBM_MEM_CLASS_RESOLVE, (size_t)usable * sizeof(*rows));
+    if (!rows) {
+        return;
+    }
+    int next = 0;
+    for (int i = 0; i < arr->count; i++) {
+        if (cbm_pipeline_lsp_caller_row_usable(&arr->items[i])) {
+            rows[next++] = &arr->items[i];
+        }
+    }
+    qsort(rows, (size_t)usable, sizeof(*rows), cbm_pipeline_lsp_caller_row_cmp);
+    index->rows = rows;
+    index->count = usable;
+    index->ready = true;
+}
+
+static inline void cbm_pipeline_lsp_caller_index_free(cbm_pipeline_lsp_caller_index_t *index) {
+    cbm_free(CBM_MEM_CLASS_RESOLVE, (void *)index->rows);
+    index->rows = NULL;
+    index->count = 0;
+    index->ready = false;
+}
+
+/* The exact-caller join's choice so far. */
+typedef struct {
+    const CBMResolvedCall *best;
+    int rank;
+    bool ambiguous;
+} cbm_pipeline_lsp_exact_pick_t;
+
+static inline void cbm_pipeline_lsp_exact_consider(cbm_pipeline_lsp_exact_pick_t *pick,
+                                                   const CBMResolvedCall *rc, const CBMCall *call,
+                                                   bool allow_tail_match, const cbm_gbuf_t *gbuf,
+                                                   const char *project_name) {
+    if (!cbm_pipeline_lsp_caller_row_usable(rc) ||
+        strcmp(rc->caller_qn, call->enclosing_func_qn) != 0) {
+        return;
+    }
+    int site_rank = cbm_pipeline_invocation_site_rank(rc, call);
+    if (site_rank == 0 || !cbm_pipeline_invocation_leaf_matches(rc, call, site_rank)) {
+        return;
+    }
+    if (!pick->best || site_rank > pick->rank) {
+        pick->best = rc;
+        pick->rank = site_rank;
+        pick->ambiguous = false;
+        return;
+    }
+    if (site_rank < pick->rank) {
+        return;
+    }
+    if (!cbm_pipeline_invocation_targets_equal(pick->best->callee_qn, rc->callee_qn, gbuf,
+                                               project_name, allow_tail_match)) {
+        pick->ambiguous = true;
+        return;
+    }
+    if (rc->confidence > pick->best->confidence) {
+        pick->best = rc;
+    }
+}
+
+/* cbm_pipeline_find_lsp_resolution_in_graph with the file's caller index
+ * (NULL, or not ready: a full scan). Same answer. */
+static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_indexed(
+    const CBMResolvedCallArray *arr, const cbm_pipeline_lsp_caller_index_t *index,
+    const CBMCall *call, bool allow_tail_match, const cbm_gbuf_t *gbuf, const char *project_name) {
     if (!arr || arr->count == 0 || !call) {
         return NULL;
     }
@@ -564,47 +670,32 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
         return NULL;
     }
 
-    const CBMResolvedCall *best_exact_caller = NULL;
-    int best_exact_caller_rank = 0;
-    bool exact_caller_ambiguous = false;
-    for (int i = 0; i < arr->count; i++) {
-        const CBMResolvedCall *rc = &arr->items[i];
-        if (rc->kind != CBM_RESOLVED_INVOCATION) {
-            continue;
+    cbm_pipeline_lsp_exact_pick_t pick = {0};
+    if (index && index->ready) {
+        int lo = 0;
+        int hi = index->count;
+        while (lo < hi) {
+            int mid = lo + ((hi - lo) / PAIR_LEN);
+            if (strcmp(index->rows[mid]->caller_qn, call->enclosing_func_qn) < 0) {
+                lo = mid + SKIP_ONE;
+            } else {
+                hi = mid;
+            }
         }
-        if (!rc->caller_qn || !rc->callee_qn) {
-            continue;
+        for (int i = lo;
+             i < index->count && strcmp(index->rows[i]->caller_qn, call->enclosing_func_qn) == 0;
+             i++) {
+            cbm_pipeline_lsp_exact_consider(&pick, index->rows[i], call, allow_tail_match, gbuf,
+                                            project_name);
         }
-        if (rc->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
-            continue;
-        }
-        if (strcmp(rc->caller_qn, call->enclosing_func_qn) != 0) {
-            continue;
-        }
-        int site_rank = cbm_pipeline_invocation_site_rank(rc, call);
-        if (site_rank == 0 || !cbm_pipeline_invocation_leaf_matches(rc, call, site_rank)) {
-            continue;
-        }
-        if (!best_exact_caller || site_rank > best_exact_caller_rank) {
-            best_exact_caller = rc;
-            best_exact_caller_rank = site_rank;
-            exact_caller_ambiguous = false;
-            continue;
-        }
-        if (site_rank < best_exact_caller_rank) {
-            continue;
-        }
-        if (!cbm_pipeline_invocation_targets_equal(best_exact_caller->callee_qn, rc->callee_qn,
-                                                   gbuf, project_name, allow_tail_match)) {
-            exact_caller_ambiguous = true;
-            continue;
-        }
-        if (rc->confidence > best_exact_caller->confidence) {
-            best_exact_caller = rc;
+    } else {
+        for (int i = 0; i < arr->count; i++) {
+            cbm_pipeline_lsp_exact_consider(&pick, &arr->items[i], call, allow_tail_match, gbuf,
+                                            project_name);
         }
     }
-    if (best_exact_caller) {
-        return exact_caller_ambiguous ? NULL : best_exact_caller;
+    if (pick.best) {
+        return pick.ambiguous ? NULL : pick.best;
     }
     if (!allow_tail_match) {
         return NULL;
@@ -662,6 +753,13 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
         return tail_exact_ambiguous ? NULL : best_tail_exact;
     }
     return tail_legacy_ambiguous ? NULL : best_tail_legacy;
+}
+
+static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
+    const CBMResolvedCallArray *arr, const CBMCall *call, bool allow_tail_match,
+    const cbm_gbuf_t *gbuf, const char *project_name) {
+    return cbm_pipeline_find_lsp_resolution_indexed(arr, NULL, call, allow_tail_match, gbuf,
+                                                    project_name);
 }
 
 /* Graph-free compatibility entry point for resolver unit tests. Raw distinct

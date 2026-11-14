@@ -1440,6 +1440,124 @@ static bool ts_scope_has_binding(const CBMScope *scope, const char *name) {
     return ts_scope_binding_owner(scope, name) != NULL;
 }
 
+/* ── Functions by QN ──────────────────────────────────────────────────
+ *
+ * The per-file registry has no hash index, so cbm_registry_lookup_func scans
+ * it, and the resolver looks up each function of the file at least twice
+ * (its implicit return, its body): a file of n functions cost n * n.
+ * TsFuncOrder is a sorted copy of the registry's QNs, first registered
+ * first, so a search finds the function the scan finds. Functions added
+ * after the copy are scanned until they are many enough to copy again. */
+typedef struct {
+    const char *qn;
+    int index;
+} TsFuncSlot;
+
+struct TsFuncOrder {
+    const CBMTypeRegistry *reg;
+    TsFuncSlot *slots;
+    int count;   /* slots in use */
+    int covered; /* reg->funcs[0, covered) are in the copy */
+};
+
+enum { TS_FUNC_ORDER_MIN = 64 };
+
+static int ts_func_slot_cmp(const void *pa, const void *pb) {
+    const TsFuncSlot *a = (const TsFuncSlot *)pa;
+    const TsFuncSlot *b = (const TsFuncSlot *)pb;
+    int by_qn = strcmp(a->qn, b->qn);
+    return by_qn != 0 ? by_qn : (a->index > b->index) - (a->index < b->index);
+}
+
+/* The sorted copy of reg's QNs, made again when reg is another registry or
+ * grew by more than half since the copy. NULL for a small registry or when
+ * the arena is out of memory: the caller scans. */
+static const struct TsFuncOrder *ts_func_order(TSLSPContext *ctx, const CBMTypeRegistry *reg) {
+    if (!ctx->arena || reg->func_count < TS_FUNC_ORDER_MIN) {
+        return NULL;
+    }
+    struct TsFuncOrder *order = ctx->func_order;
+    if (order && order->reg == reg && order->covered <= reg->func_count &&
+        reg->func_count - order->covered <= order->covered / 2) {
+        return order;
+    }
+    if (!order) {
+        order = (struct TsFuncOrder *)cbm_arena_alloc(ctx->arena, sizeof(*order));
+        if (!order) {
+            return NULL;
+        }
+        memset(order, 0, sizeof(*order));
+        ctx->func_order = order;
+    }
+    TsFuncSlot *slots =
+        (TsFuncSlot *)cbm_arena_alloc(ctx->arena, (size_t)reg->func_count * sizeof(*slots));
+    if (!slots) {
+        order->reg = NULL;
+        return NULL;
+    }
+    int n = 0;
+    for (int i = 0; i < reg->func_count; i++) {
+        if (reg->funcs[i].qualified_name) {
+            slots[n].qn = reg->funcs[i].qualified_name;
+            slots[n].index = i;
+            n++;
+        }
+    }
+    qsort(slots, (size_t)n, sizeof(*slots), ts_func_slot_cmp);
+    order->reg = reg;
+    order->slots = slots;
+    order->count = n;
+    order->covered = reg->func_count;
+    return order;
+}
+
+/* The first function of reg itself (not of its fallback) whose QN is `qn`:
+ * the one a scan of reg->funcs meets first. */
+static const CBMRegisteredFunc *ts_own_func(TSLSPContext *ctx, const CBMTypeRegistry *reg,
+                                            const char *qn) {
+    const struct TsFuncOrder *order = ts_func_order(ctx, reg);
+    int tail = 0;
+    if (order) {
+        int lo = 0;
+        int hi = order->count;
+        while (lo < hi) {
+            int mid = lo + (hi - lo) / 2;
+            if (strcmp(order->slots[mid].qn, qn) < 0) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo < order->count && strcmp(order->slots[lo].qn, qn) == 0) {
+            return &reg->funcs[order->slots[lo].index];
+        }
+        tail = order->covered;
+    }
+    for (int i = tail; i < reg->func_count; i++) {
+        if (reg->funcs[i].qualified_name && strcmp(reg->funcs[i].qualified_name, qn) == 0) {
+            return &reg->funcs[i];
+        }
+    }
+    return NULL;
+}
+
+/* cbm_registry_lookup_func with a search in place of its scan of a registry
+ * that has no hash index. Same answer. */
+static const CBMRegisteredFunc *ts_lookup_func(TSLSPContext *ctx, const CBMTypeRegistry *reg,
+                                               const char *qn) {
+    if (!reg || !qn) {
+        return NULL;
+    }
+    if (!ctx || (reg->func_qn_buckets && reg->func_qn_bucket_count > 0)) {
+        return cbm_registry_lookup_func(reg, qn);
+    }
+    const CBMRegisteredFunc *own = ts_own_func(ctx, reg, qn);
+    if (!own && reg->fallback) {
+        return cbm_registry_lookup_func(reg->fallback, qn);
+    }
+    return own;
+}
+
 /* The member an import binding names in its module: the exported name of a
  * renamed named import (`foo` for `import { foo as bar }`, #2297), else the
  * binding itself. Callers have already matched `local` to an import binding. */
@@ -1471,7 +1589,7 @@ static const char *ts_import_symbol_qn(TSLSPContext *ctx, const char *module_qn,
     if (module_len > name_len + 1 && module_qn[module_len - name_len - 1] == '.' &&
         strcmp(module_qn + module_len - name_len, name) == 0) {
         if (appended && (cbm_registry_lookup_type(ctx->registry, appended) ||
-                         cbm_registry_lookup_func(ctx->registry, appended))) {
+                         ts_lookup_func(ctx, ctx->registry, appended))) {
             return appended;
         }
         return module_qn;
@@ -1487,7 +1605,7 @@ static const CBMRegisteredFunc *ts_exact_same_module_function(TSLSPContext *ctx,
         return NULL;
     }
     const char *full_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name);
-    return full_qn ? cbm_registry_lookup_func(ctx->registry, full_qn) : NULL;
+    return full_qn ? ts_lookup_func(ctx, ctx->registry, full_qn) : NULL;
 }
 
 /* Return a function only when the local import binding maps to one unambiguous
@@ -1515,7 +1633,7 @@ static const CBMRegisteredFunc *ts_exact_imported_function(TSLSPContext *ctx, co
     }
     const char *full_qn =
         ts_import_symbol_qn(ctx, matched_module, ts_import_export_name(ctx, name));
-    return full_qn ? cbm_registry_lookup_func(ctx->registry, full_qn) : NULL;
+    return full_qn ? ts_lookup_func(ctx, ctx->registry, full_qn) : NULL;
 }
 
 static void ts_block_shadowed_reference_usage(TSLSPContext *ctx, const char *name, TSNode site) {
@@ -1565,7 +1683,7 @@ static const CBMType *type_of_identifier(TSLSPContext *ctx, const char *name) {
         const char *full_qn = ts_import_symbol_qn(ctx, mqn, ts_import_export_name(ctx, name));
 
         // Try the symbol lookup precedence: registered func, then registered type.
-        const CBMRegisteredFunc *f = cbm_registry_lookup_func(ctx->registry, full_qn);
+        const CBMRegisteredFunc *f = ts_lookup_func(ctx, ctx->registry, full_qn);
         if (f && f->signature)
             return f->signature;
         const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, full_qn);
@@ -1583,7 +1701,7 @@ static const CBMType *type_of_identifier(TSLSPContext *ctx, const char *name) {
         const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, candidate);
         if (rt)
             return cbm_type_named(ctx->arena, candidate);
-        const CBMRegisteredFunc *f = cbm_registry_lookup_func(ctx->registry, candidate);
+        const CBMRegisteredFunc *f = ts_lookup_func(ctx, ctx->registry, candidate);
         if (f && f->signature)
             return f->signature;
     }
@@ -1594,7 +1712,7 @@ static const CBMType *type_of_identifier(TSLSPContext *ctx, const char *name) {
         const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, name);
         if (rt)
             return cbm_type_named(ctx->arena, name);
-        const CBMRegisteredFunc *f = cbm_registry_lookup_func(ctx->registry, name);
+        const CBMRegisteredFunc *f = ts_lookup_func(ctx, ctx->registry, name);
         if (f && f->signature)
             return f->signature;
     }
@@ -1731,7 +1849,7 @@ static const CBMType *lookup_member_type_at(TSLSPContext *ctx, const CBMType *re
                 for (int i = 0; rt->method_names[i]; i++) {
                     if (strcmp(rt->method_names[i], name) == 0) {
                         const CBMRegisteredFunc *f =
-                            cbm_registry_lookup_func(ctx->registry, rt->method_qns[i]);
+                            ts_lookup_func(ctx, ctx->registry, rt->method_qns[i]);
                         if (f && f->signature) {
                             return cbm_type_substitute(ctx->arena, f->signature,
                                                        rt->type_param_names,
@@ -1811,8 +1929,7 @@ static const CBMType *lookup_member_type_at(TSLSPContext *ctx, const CBMType *re
     if (rt->method_qns && rt->method_names) {
         for (int i = 0; rt->method_names[i]; i++) {
             if (strcmp(rt->method_names[i], name) == 0) {
-                const CBMRegisteredFunc *f =
-                    cbm_registry_lookup_func(ctx->registry, rt->method_qns[i]);
+                const CBMRegisteredFunc *f = ts_lookup_func(ctx, ctx->registry, rt->method_qns[i]);
                 if (f && f->signature)
                     return f->signature;
                 return cbm_type_unknown();
@@ -1967,7 +2084,7 @@ static const CBMRegisteredFunc *lookup_method_at(TSLSPContext *ctx, const CBMTyp
         if (rt && rt->method_qns && rt->method_names) {
             for (int i = 0; rt->method_names[i]; i++) {
                 if (strcmp(rt->method_names[i], method_name) == 0) {
-                    return cbm_registry_lookup_func(ctx->registry, rt->method_qns[i]);
+                    return ts_lookup_func(ctx, ctx->registry, rt->method_qns[i]);
                 }
             }
         }
@@ -3863,7 +3980,7 @@ static void process_function_body(TSLSPContext *ctx, TSNode func_node, const cha
         // param bound to UNKNOWN (no inline TS annotation), use the registered func's
         // signature param_types[i] (which apply_jsdoc_signatures may have populated).
         if (func_qn) {
-            const CBMRegisteredFunc *rf = cbm_registry_lookup_func(ctx->registry, func_qn);
+            const CBMRegisteredFunc *rf = ts_lookup_func(ctx, ctx->registry, func_qn);
             if (rf && rf->signature && rf->signature->kind == CBM_TYPE_FUNC &&
                 rf->signature->data.func.param_names && rf->signature->data.func.param_types) {
                 for (int i = 0; rf->signature->data.func.param_names[i] &&
@@ -5652,7 +5769,7 @@ static void infer_implicit_returns(TSLSPContext *ctx, TSNode root, CBMTypeRegist
         if (!fname)
             continue;
         const char *fqn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, fname);
-        const CBMRegisteredFunc *existing = cbm_registry_lookup_func(reg, fqn);
+        const CBMRegisteredFunc *existing = ts_lookup_func(ctx, reg, fqn);
         if (!existing)
             continue;
         // Only infer when the existing signature lacks an explicit return type.
@@ -5677,14 +5794,10 @@ static void infer_implicit_returns(TSLSPContext *ctx, TSNode root, CBMTypeRegist
         const CBMType *rets[2] = {inferred, NULL};
         const CBMType *new_sig = cbm_type_func(ctx->arena, param_names, param_types, rets);
 
-        // Patch the registered func in place.
-        for (int fi = 0; fi < reg->func_count; fi++) {
-            if (reg->funcs[fi].qualified_name == fqn ||
-                (reg->funcs[fi].qualified_name &&
-                 strcmp(reg->funcs[fi].qualified_name, fqn) == 0)) {
-                reg->funcs[fi].signature = new_sig;
-                break;
-            }
+        // Patch the registered func in place: the first of that QN in reg.
+        CBMRegisteredFunc *own = (CBMRegisteredFunc *)ts_own_func(ctx, reg, fqn);
+        if (own) {
+            own->signature = new_sig;
         }
     }
 }
