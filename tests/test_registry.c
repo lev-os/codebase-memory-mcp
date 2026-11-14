@@ -1880,9 +1880,12 @@ TEST(registry_receiver_gate_judges_type_roots_at_import_fallback) {
     cbm_resolution_t res =
         cbm_registry_resolve_call_lang(r, "Future.exception", mod, keys, vals, 1, CBM_LANG_SCALA);
     ASSERT_TRUE(gate_empty(&res));
-    /* The reference resolver keeps its answer. */
+    /* On lev the reference resolver refuses it too: the receiver-chain guard
+     * narrows the import path's candidates on every resolve, as on the
+     * unique-name and no-import paths (cb1e3704), and Future names no
+     * candidate's ancestry. */
     res = cbm_registry_resolve_lang(r, "Future.exception", mod, keys, vals, 1, CBM_LANG_SCALA);
-    ASSERT_FALSE(gate_empty(&res));
+    ASSERT_TRUE(gate_empty(&res));
     cbm_registry_free(r);
     PASS();
 }
