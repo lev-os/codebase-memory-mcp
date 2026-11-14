@@ -35976,6 +35976,14 @@ static bool js_twin_expect(const char *what, const char *got, const char *want) 
     return false;
 }
 
+static bool js_twin_expect_absent(const char *what, const char *got, const char *absent) {
+    if (!strstr(got, absent)) {
+        return true;
+    }
+    fprintf(stderr, "  %s: [%s] holds [%s]\n", what, got, absent);
+    return false;
+}
+
 static cbm_pipeline_t *js_twin_index(const char *repo, const char *db) {
     cbm_pipeline_t *p = cbm_pipeline_new(repo, db, CBM_MODE_FULL);
     if (p && cbm_pipeline_run(p) != 0) {
@@ -36033,6 +36041,60 @@ TEST(pipeline_js_module_binding_keeps_plain_name) {
             }
             cbm_pipeline_free(p);
         }
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* A named function expression's own name is visible only inside it: the
+ * block around it binds `alias`, not `run`. A bare call binds to a local
+ * callable only when that is the nearest binding of its name: a parameter,
+ * a catch clause or a block variable in between keeps it away. */
+TEST(pipeline_js_local_callee_is_nearest_binding) {
+    static const char *const exts[] = {"js", "tsx"};
+    bool ok = true;
+    for (int x = 0; x < 2; x++) {
+        char tmp[256] = "/tmp/cbm_js_bind_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        char main_file[32];
+        snprintf(main_file, sizeof(main_file), "main.%s", exts[x]);
+        write_temp_file(
+            tmp, main_file,
+            "export function run() { return 0; }\n"
+            "function outer() { const alias = function run() { return 1; }; return run(); }\n"
+            "function local() { function run() { return 2; } return run(); }\n"
+            "function caught() { function run() { return 3; } try { local(); } catch (run) { "
+            "run(); } }\n"
+            "function blocked() { function run() { return 4; } { let run = local; run(); } }\n"
+            "function param(run) { function inner() { return run(); } return inner; }\n"
+            "export function use() { outer(); caught(); blocked(); param(local); }\n");
+        char db[512];
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        cbm_pipeline_t *p = js_twin_index(tmp, db);
+        ASSERT_NOT_NULL(p);
+        const char *project = cbm_pipeline_project_name(p);
+        char got[1024];
+        char what[64];
+        snprintf(what, sizeof(what), "%s line 2", exts[x]);
+        js_twin_calls_at(db, project, main_file, 2, got, sizeof(got));
+        ok = js_twin_expect(what, got, "main.outer -> main.run") && ok;
+        js_twin_qn_at(db, project, main_file, "run", 2, got, sizeof(got));
+        ok = js_twin_expect(what, got, "main.outer.run") && ok;
+        snprintf(what, sizeof(what), "%s line 3", exts[x]);
+        js_twin_calls_at(db, project, main_file, 3, got, sizeof(got));
+        ok = js_twin_expect(what, got, "main.local -> main.local.run") && ok;
+        snprintf(what, sizeof(what), "%s line 4", exts[x]);
+        js_twin_calls_at(db, project, main_file, 4, got, sizeof(got));
+        ok = js_twin_expect_absent(what, got, "-> main.caught.run") && ok;
+        snprintf(what, sizeof(what), "%s line 5", exts[x]);
+        js_twin_calls_at(db, project, main_file, 5, got, sizeof(got));
+        ok = js_twin_expect_absent(what, got, "-> main.blocked.run") && ok;
+        snprintf(what, sizeof(what), "%s line 6", exts[x]);
+        js_twin_calls_at(db, project, main_file, 6, got, sizeof(got));
+        ok = js_twin_expect_absent(what, got, "-> main.local.run") && ok;
+        ok = js_twin_expect_absent(what, got, "-> main.outer.run") && ok;
+        cbm_pipeline_free(p);
         th_rmtree(tmp);
     }
     ASSERT_TRUE(ok);
@@ -36191,6 +36253,7 @@ TEST(pipeline_js_twin_insert_incremental_equals_full) {
 
 SUITE(pipeline) {
     RUN_TEST(pipeline_js_module_binding_keeps_plain_name);
+    RUN_TEST(pipeline_js_local_callee_is_nearest_binding);
     RUN_TEST(pipeline_js_accessor_pairs_keep_their_calls);
     RUN_TEST(pipeline_js_twin_insert_incremental_equals_full);
     RUN_TEST(pipeline_ts_caller_is_innermost_named_callable);

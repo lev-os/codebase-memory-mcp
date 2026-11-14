@@ -1494,10 +1494,14 @@ const char *cbm_js_twin_qn(const CBMExtractCtx *ctx, const char *base_qn, uint32
  * caller; then a resolver row at a site the scope binder bound takes the
  * bound target. Idempotent. */
 void cbm_js_rebind_resolved_calls(CBMFileResult *r);
-/* After the per-file JS/TS resolver ran: a bare call `name()` whose innermost
- * declaring block around it declares a split member `name` (a function
- * declaration, or a variable whose value is a function) targets that member.
- * The resolver row at the call's site is corrected, or one is added. */
+/* After the per-file JS/TS resolver ran: a bare call `name()` whose nearest
+ * binding of `name` is a callable of a same-name group targets that callable.
+ * The binding is found by the scopes around the call: a block's function
+ * declarations and variables, a callable's parameters, a catch clause, the
+ * module's imports, a function expression's own name inside it. A nearer
+ * parameter, variable or import leaves the call alone. The resolver row at
+ * the call's site is corrected, or one is added. Near-linear: the
+ * declarations of the groups' names come from the split's one tree walk. */
 void cbm_js_twin_bind_local_callees(CBMExtractCtx *ctx);
 // dbt lineage for Jinja-templated SQL models: emits a Model def plus one usage
 // per ref()/source() call. No-op unless the file parses as SQL and actually
