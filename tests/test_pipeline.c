@@ -36284,6 +36284,65 @@ TEST(pipeline_js_top_level_declaration_keeps_plain_name) {
     PASS();
 }
 
+/* CBM_SEMANTIC_INDEX_VERSION 15: version 14 gave a JS/TS object method the
+ * plain name of an exported function beside it and the export "#2". An index
+ * it wrote is stale with no file changed, so the next run rebuilds it. */
+TEST(pipeline_js_twin_names_rebuild_old_index) {
+    char tmp[256] = "/tmp/cbm_js_twin_ver_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "consumer.js",
+                    "import { run } from \"./lib\";\n"
+                    "export function use() { run(); }\n");
+    write_temp_file(tmp, "lib.js",
+                    "const box = { run() { return 1; } };\n"
+                    "export function run() { return 2; }\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/g.db", tmp);
+    cbm_pipeline_t *first = js_twin_index(tmp, db);
+    ASSERT_NOT_NULL(first);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(first));
+    cbm_pipeline_free(first);
+
+    /* Put the stored index back to a version-14 one: its version, and the
+     * export under a name of that version's kind. */
+    cbm_store_t *store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(store);
+    cbm_coverage_row_t *coverage_rows = NULL;
+    int coverage_count = 0;
+    ASSERT_EQ(cbm_store_coverage_get(store, project, &coverage_rows, &coverage_count),
+              CBM_STORE_OK);
+    cbm_coverage_meta_t meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, project, &meta), CBM_STORE_OK);
+    cbm_coverage_meta_t old_meta = meta;
+    old_meta.coverage_version = 14;
+    ASSERT_EQ(
+        cbm_store_coverage_replace_ex(store, project, coverage_rows, coverage_count, &old_meta),
+        CBM_STORE_OK);
+    cbm_store_free_coverage(coverage_rows, coverage_count);
+    cbm_store_coverage_meta_clear(&meta);
+    ASSERT_EQ(cbm_store_exec(store, "UPDATE nodes SET qualified_name = qualified_name || '#9' "
+                                    "WHERE name = 'run' AND start_line = 2 "
+                                    "AND file_path = 'lib.js';"),
+              CBM_STORE_OK);
+    cbm_store_close(store);
+
+    /* Nothing in the tree changed: only the version says the index is stale. */
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *upgrade = js_twin_index(tmp, db);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    ASSERT_NOT_NULL(upgrade);
+    cbm_pipeline_free(upgrade);
+    char got[1024];
+    js_twin_qn_at(db, project, "lib.js", "run", 2, got, sizeof(got));
+    bool ok = js_twin_expect("upgraded export", got, "lib.run");
+    th_rmtree(tmp);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_TRUE(ok);
+    ASSERT_GT(CBM_SEMANTIC_INDEX_VERSION, 14);
+    PASS();
+}
+
 /* 20,000 callables of one name in one file, each called from its owner,
  * index inside a few seconds: grouping and scope binding are near-linear. */
 TEST(pipeline_js_twin_callables_scale) {
@@ -36337,6 +36396,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_accessor_pairs_keep_their_calls);
     RUN_TEST(pipeline_js_twin_insert_incremental_equals_full);
     RUN_TEST(pipeline_js_top_level_declaration_keeps_plain_name);
+    RUN_TEST(pipeline_js_twin_names_rebuild_old_index);
     RUN_TEST(pipeline_js_twin_callables_scale);
     RUN_TEST(pipeline_ts_caller_is_innermost_named_callable);
     RUN_TEST(pipeline_ts_signature_targets_require_owner);

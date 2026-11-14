@@ -1774,8 +1774,14 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      targets but leave the name-guess registry. Persist is_abstract so
  *      incremental proxy seeds retain that distinction. Older indexes rebuild
  *      once to remove guessed edges and populate the signature mark.
+ *  15: two JS/TS callables of one file with one qualified name are two
+ *      nodes, and a call is recorded under the callable that holds it. The
+ *      module-level binding of the name keeps the plain name; a member or
+ *      nested callable takes its owner's path (`file.box.run`) or "#<n>"
+ *      (cbm_js_split_twin_callables). An index built before holds one node
+ *      for such callables, or other names, so it rebuilds once on upgrade.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 14 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 15 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
