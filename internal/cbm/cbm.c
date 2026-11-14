@@ -1630,17 +1630,107 @@ static void cbm_walk_error_nodes(TSNode root, const char *source, int source_len
     }
 }
 
+/* The TypeScript grammar reads this valid type suffix as an empty expression subscript. */
+static bool cbm_ts_import_array_type_recovery(TSNode n, const char *source, int source_len) {
+    if (!source || source_len <= 0 || !ts_node_is_missing(n) ||
+        strcmp(ts_node_type(n), "identifier") != 0) {
+        return false;
+    }
+    TSNode subscript = ts_node_parent(n);
+    if (ts_node_is_null(subscript) ||
+        strcmp(ts_node_type(subscript), "subscript_expression") != 0) {
+        return false;
+    }
+
+    uint32_t start = ts_node_start_byte(subscript);
+    uint32_t end = ts_node_end_byte(subscript);
+    uint32_t missing = ts_node_start_byte(n);
+    if (end > (uint32_t)source_len || start >= end || missing != end - 1 ||
+        source[end - 1] != ']') {
+        return false;
+    }
+
+    uint32_t i = start;
+    if (end - i < 9 || memcmp(source + i, "import(", 7) != 0) {
+        return false;
+    }
+    i += 7;
+    if (i >= end || (source[i] != '\'' && source[i] != '"')) {
+        return false;
+    }
+    char quote = source[i++];
+    while (i < end && source[i] != quote) {
+        if (source[i] == '\\' && i + 1 < end) {
+            i++;
+        }
+        i++;
+    }
+    if (i >= end || source[i++] != quote || i + 2 >= end || source[i++] != ')' ||
+        source[i++] != '.') {
+        return false;
+    }
+    unsigned char c = (unsigned char)source[i];
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c == '$')) {
+        return false;
+    }
+    do {
+        i++;
+        if (i >= end) {
+            return false;
+        }
+        c = (unsigned char)source[i];
+    } while ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+             c == '_' || c == '$');
+    if (i + 2 != end || source[i] != '[' || source[i + 1] != ']') {
+        return false;
+    }
+
+    i = end;
+    while (i < (uint32_t)source_len && isspace((unsigned char)source[i])) {
+        i++;
+    }
+    if (i >= (uint32_t)source_len || source[i++] != '}') {
+        return false;
+    }
+    while (i < (uint32_t)source_len && isspace((unsigned char)source[i])) {
+        i++;
+    }
+    if (i >= (uint32_t)source_len || source[i++] != '>') {
+        return false;
+    }
+    while (i < (uint32_t)source_len && isspace((unsigned char)source[i])) {
+        i++;
+    }
+    return i < (uint32_t)source_len && source[i] == '(';
+}
+
 /* Walks to the end even after the cap is full, so `dropped` is the real number
  * of ranges lost rather than a lower bound. This costs little: the walk never
  * descends into an ERROR subtree — it records the top-most node and moves on —
- * so it only visits the spine of nodes that contain an error, plus one level. */
+ * so it only visits the spine of nodes that contain an error, plus one level.
+ * The context carries what the collector needs beside the node: in TypeScript
+ * a valid import-array type suffix the grammar misreads
+ * (cbm_ts_import_array_type_recovery) is not a region. */
+typedef struct {
+    cbm_error_regions_t *acc;
+    const char *source;
+    int source_len;
+    CBMLanguage language;
+} cbm_collect_error_ctx_t;
+
 static void cbm_collect_error_region(TSNode c, void *arg) {
-    cbm_error_regions_push((cbm_error_regions_t *)arg, c);
+    const cbm_collect_error_ctx_t *ctx = (const cbm_collect_error_ctx_t *)arg;
+    if (ctx->language == CBM_LANG_TYPESCRIPT &&
+        cbm_ts_import_array_type_recovery(c, ctx->source, ctx->source_len)) {
+        return;
+    }
+    cbm_error_regions_push(ctx->acc, c);
 }
 
 static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc, const char *source,
-                                      int source_len) {
-    cbm_walk_error_nodes(n, source, source_len, cbm_collect_error_region, acc);
+                                      int source_len, CBMLanguage language) {
+    cbm_collect_error_ctx_t ctx = {acc, source, source_len, language};
+    cbm_walk_error_nodes(n, source, source_len, cbm_collect_error_region, &ctx);
 }
 
 /* ── Phase 2 line map: what the preprocessed parse already explained ───────
@@ -3236,7 +3326,8 @@ static void cbm_rescue_defs_from_projection(CBMExtractCtx *raw_ctx, const TSLang
         regs.ends[0] = ts_node_end_point(raw_ctx->root).row + 1;
         regs.count = 1;
     } else {
-        cbm_collect_error_regions(raw_ctx->root, &regs, raw_ctx->source, raw_ctx->source_len);
+        cbm_collect_error_regions(raw_ctx->root, &regs, raw_ctx->source, raw_ctx->source_len,
+                                  raw_ctx->language);
         for (int r = 0; r < regs.count && !broken; r++) {
             broken = regs.ends[r] >= regs.starts[r] + CBM_PROJ_MIN_ERROR_LINES;
         }
@@ -3386,7 +3477,8 @@ static const char *swift_mask_conditional_directives(CBMArena *a, TSNode root, c
 /* Lines the error regions of this tree cover; a region past the cap counts one. */
 static uint64_t swift_error_lines(TSTree *tree, const char *source, int source_len) {
     cbm_error_regions_t regions = {{0}, {0}, 0, 0};
-    cbm_collect_error_regions(ts_tree_root_node(tree), &regions, source, source_len);
+    cbm_collect_error_regions(ts_tree_root_node(tree), &regions, source, source_len,
+                              CBM_LANG_SWIFT);
     uint64_t lines = (uint64_t)regions.dropped;
     for (int i = 0; i < regions.count; i++) {
         lines += regions.ends[i] - regions.starts[i] + SKIP_ONE;
@@ -4285,7 +4377,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                      * reduces to the original #961 behavior. */
                     if (ts_node_has_error(root) || export_cand_count > 0) {
                         cbm_error_regions_t raw_regs = {{0}, {0}, 0, 0};
-                        cbm_collect_error_regions(root, &raw_regs, source, source_len);
+                        cbm_collect_error_regions(root, &raw_regs, source, source_len, language);
                         if (raw_regs.count > 0 || export_cand_count > 0) {
                             int defs_before = result->defs.count;
                             cbm_extract_definitions(&pp_ctx);
@@ -4700,7 +4792,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         if (strcmp(ts_node_type(root), "ERROR") == 0) {
             cbm_error_regions_push(&regs, root); /* whole file unparseable */
         } else {
-            cbm_collect_error_regions(root, &regs, source, source_len);
+            cbm_collect_error_regions(root, &regs, source, source_len, language);
         }
         /* Recovery subtraction runs on the RAW ranges, before the Phase 2
          * refinement below. Its evidence is a whole definition that starts
