@@ -2696,6 +2696,42 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
     pxc_scratch_give(PXC_SCRATCH_KEYS, &keys);
 }
 
+/* The JS rebind (cbm_js_rebind_resolved_calls) renames a row's caller to the
+ * callable that holds the call. pxc_append_results removed duplicates before
+ * that, so a resolver row and a row the per-file pass already held can end
+ * with the same caller, target and site. Keep the strongest row of each
+ * (kind, caller, callee, site, origin), the first on a tie, in place. */
+static void pxc_dedup_after_rebind(CBMResolvedCallArray *calls) {
+    if (!calls || calls->count < 2)
+        return;
+    CBMArena keys;
+    pxc_scratch_take(PXC_SCRATCH_KEYS, &keys);
+    CBMHashTable *seen = cbm_ht_create((uint32_t)calls->count + 1);
+    int kept = 0;
+    for (int i = 0; i < calls->count; i++) {
+        CBMResolvedCall cur = calls->items[i];
+        char *k = NULL;
+        if (cur.caller_qn && cur.callee_qn) {
+            k = cbm_arena_sprintf(&keys, "%u\x1f%s\x1f%s\x1f%u:%u\x1f%u", (unsigned)cur.kind,
+                                  cur.caller_qn, cur.callee_qn, cur.site_start_byte,
+                                  cur.site_end_byte, (unsigned)cur.source_origin);
+        }
+        void *prior = k ? cbm_ht_get(seen, k) : NULL;
+        if (prior) {
+            CBMResolvedCall *dst = &calls->items[(int)(uintptr_t)prior - 1];
+            if (cur.confidence > dst->confidence)
+                *dst = cur;
+            continue;
+        }
+        calls->items[kept++] = cur;
+        if (k)
+            cbm_ht_set(seen, k, (void *)(uintptr_t)kept);
+    }
+    calls->count = kept;
+    cbm_ht_free(seen);
+    pxc_scratch_give(PXC_SCRATCH_KEYS, &keys);
+}
+
 /* Merge exact synthetic call carriers produced by a cross-LSP resolver. The
  * source may live in the per-file result arena or in cbm_pxc_run_one's scratch
  * arena, so every pointer-bearing field is copied explicitly. Invalid/legacy
@@ -2953,6 +2989,7 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
 
     pxc_append_results(&r->arena, &r->resolved_calls, &out);
     cbm_js_rebind_resolved_calls(r);
+    pxc_dedup_after_rebind(&r->resolved_calls);
     pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
 }
 
@@ -3151,6 +3188,7 @@ void cbm_pxc_dispatch_file_with_php_bindings(
                 lang == CBM_LANG_TSX) {
                 /* The resolver names its caller by the function it walked (cbm.h). */
                 cbm_js_rebind_resolved_calls(result);
+                pxc_dedup_after_rebind(&result->resolved_calls);
             }
         }
         pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);

@@ -22243,6 +22243,56 @@ TEST(pipeline_python_init_import_probe_failure_falls_back) {
 /* #1910: with no shared Go registry (the incremental route can pass NULL
  * cross_registries) the dispatch takes the per-file fallback, which must name
  * each init() caller from the file path exactly as the def extractor does. */
+/* The cross pass renames a resolver row's caller to the callable that holds
+ * the call after it has merged the rows. A row the per-file pass already
+ * holds under that caller must not gain a twin with the same caller, target
+ * and site. */
+TEST(pipeline_ts_cross_rows_unique_after_caller_rebind) {
+    const char *source = "class Port { send() {} }\n"
+                         "const port = new Port();\n"
+                         "describe('nested', () => { const run = function () { port.send(); }; });\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.main.Port",
+         .short_name = "Port",
+         .label = "Class",
+         .def_module_qn = "test.main",
+         .method_names_str = "send",
+         .lang = CBM_LANG_TYPESCRIPT},
+        {.qualified_name = "test.main.Port.send",
+         .short_name = "send",
+         .label = "Method",
+         .def_module_qn = "test.main",
+         .receiver_type = "test.main.Port",
+         .lang = CBM_LANG_TYPESCRIPT},
+    };
+    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_TYPESCRIPT,
+                                             "test", "main.ts", 0, NULL, NULL);
+    ASSERT_NOT_NULL(result);
+    cbm_pxc_dispatch_file(CBM_LANG_TYPESCRIPT, result, source, (int)strlen(source), "main.ts",
+                          "test.main", NULL, NULL, defs, 2, NULL, NULL, 0, NULL, NULL);
+    const char *site = strstr(source, "port.send()");
+    uint32_t start = (uint32_t)(site - source);
+    int rows = 0;
+    int run_rows = 0;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &result->resolved_calls.items[i];
+        if (!rc->caller_qn || !rc->callee_qn || rc->confidence <= 0 ||
+            strcmp(rc->callee_qn, "test.main.Port.send") != 0 || rc->site_start_byte < start ||
+            rc->site_start_byte >= start + (uint32_t)strlen("port.send()")) {
+            continue;
+        }
+        fprintf(stderr, "cross row: %s -> %s [%s %.2f] %u:%u\n", rc->caller_qn, rc->callee_qn,
+                rc->strategy ? rc->strategy : "(null)", rc->confidence, rc->site_start_byte,
+                rc->site_end_byte);
+        rows++;
+        run_rows += strcmp(rc->caller_qn, "test.main.run") == 0;
+    }
+    cbm_free_result(result);
+    ASSERT_EQ(run_rows, 1);
+    ASSERT_EQ(rows, 1);
+    PASS();
+}
+
 TEST(pipeline_go_init_dispatch_fallback_names_init_caller) {
     const char *source = "package reg\n\n"
                          "func init() {\n\tc := NewCodec()\n\tc.Register()\n}\n\n"
@@ -37260,6 +37310,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_init_register_scope_failure_parallel);
     RUN_TEST(pipeline_python_init_import_filter_precedence);
     RUN_TEST(pipeline_python_init_import_probe_failure_falls_back);
+    RUN_TEST(pipeline_ts_cross_rows_unique_after_caller_rebind);
     RUN_TEST(pipeline_go_init_dispatch_fallback_names_init_caller);
     RUN_TEST(pipeline_issue1527_python_raw_memo_failure_sequential);
     RUN_TEST(pipeline_issue1527_python_raw_memo_failure_parallel);
