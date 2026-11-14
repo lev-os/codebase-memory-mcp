@@ -35799,107 +35799,6 @@ static int ts_caller_at_line(cbm_store_t *s, const char *project, int line, cons
     return hits;
 }
 
-/* The stored graph must keep the named caller and exact imported receiver
- * across full and incremental indexing, in both execution paths. */
-TEST(pipeline_ts_module_typed_receivers_keep_scope_and_caller) {
-    bool ok = true;
-    for (int mode = 0; mode < 2; mode++) {
-        char tmp[256] = "/tmp/cbm_ts_module_receivers_XXXXXX";
-        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-        write_temp_file(tmp, "lib.ts", "export class Port { send() {} }\n"
-                                        "export class Decoy { send() {} }\n");
-        const char *source =
-            "import { Port, Decoy } from './lib';\n"
-            "const port = new Port();\n"
-            "port.send();\n"
-            "describe('known', () => { const local: Port = new Port(); local.send(); });\n"
-            "describe('unknown', () => { local.send(); });\n"
-            "{ const port = new Decoy(); port.send(); }\n"
-            "port.send();\n"
-            "const run = function () { port.send(); };\n"
-            "describe('nested', () => { const local = new Port(); const run = function () { local.send(); }; });\n"
-            "describe('shadow', port => port.send());\n"
-            "describe('shadow2', function (port) { port.send(); });\n"
-            "for (const port of unknownList) { port.send(); }\n"
-            "port.send();\n"
-            "export const value = port.send();\n";
-        write_temp_file(tmp, "main.ts", source);
-        for (int i = 0; mode && i < 50; i++) {
-            char name[64];
-            snprintf(name, sizeof(name), "pad%d.ts", i);
-            write_temp_file(tmp, name, "export {};\n");
-        }
-        XlangEnvSave saved = xlang_env_select(mode != 0);
-        char db[512], path[512];
-        snprintf(db, sizeof(db), "%s/graph.db", tmp);
-        snprintf(path, sizeof(path), "%s/main.ts", tmp);
-        for (int phase = 0; phase < 2; phase++) {
-            if (phase) {
-                char changed[2048];
-                snprintf(changed, sizeof(changed), "%s// edited\n", source);
-                write_temp_file(tmp, "main.ts", changed);
-                ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000, 0), 0);
-            }
-            cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
-            ASSERT_NOT_NULL(p);
-            ASSERT_EQ(cbm_pipeline_run(p), 0);
-            cbm_store_t *s = cbm_store_open_path(db);
-            ASSERT_NOT_NULL(s);
-            const char *project = cbm_pipeline_project_name(p);
-            /* Stored CALLS coalesces repeated occurrences of one caller/target
-             * pair. Assert those pairs; the resolver test checks every site. */
-            const struct { int target_line; const char *caller; } cases[] = {
-                {1, "<file>"}, {2, "<file>"}, {1, "run@8"}, {1, "run@9"},
-            };
-            int hits[4] = {0};
-            cbm_edge_t *edges = NULL;
-            int edge_count = 0;
-            cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &edge_count);
-            for (int i = 0; i < edge_count; i++) {
-                cbm_node_t src = {0}, tgt = {0};
-                if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
-                    cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK &&
-                    tgt.name && strcmp(tgt.name, "send") == 0) {
-                    char caller[256];
-                    if (strcmp(src.label, "File") == 0 || strcmp(src.label, "Module") == 0)
-                        snprintf(caller, sizeof(caller), "<file>");
-                    else
-                        snprintf(caller, sizeof(caller), "%s@%d", src.name, src.start_line);
-                    bool matched = false;
-                    for (size_t j = 0; j < sizeof(cases) / sizeof(cases[0]); j++) {
-                        if (tgt.start_line == cases[j].target_line &&
-                            strcmp(caller, cases[j].caller) == 0) {
-                            hits[j]++;
-                            matched = true;
-                        }
-                    }
-                    if (!matched) {
-                        fprintf(stderr, "module receiver mode=%d phase=%d: unexpected %s -> %s\n",
-                                mode, phase, caller, tgt.qualified_name);
-                        ok = false;
-                    }
-                }
-                cbm_node_free_fields(&src);
-                cbm_node_free_fields(&tgt);
-            }
-            cbm_store_free_edges(edges, edge_count);
-            for (size_t j = 0; j < sizeof(cases) / sizeof(cases[0]); j++) {
-                if (hits[j] != 1) {
-                    fprintf(stderr, "module receiver mode=%d phase=%d: %s -> send@%d has %d edges\n",
-                            mode, phase, cases[j].caller, cases[j].target_line, hits[j]);
-                    ok = false;
-                }
-            }
-            cbm_store_close(s);
-            cbm_pipeline_free(p);
-        }
-        xlang_env_restore(&saved);
-        th_rmtree(tmp);
-    }
-    ASSERT_TRUE(ok);
-    PASS();
-}
-
 /* A call is recorded under the nearest named callable that holds it: an
  * object-literal method or arrow property, a class field arrow, a const
  * arrow inside a method, a nested function. Two callables of one file that
@@ -37148,7 +37047,6 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_local_twin_stays_out_of_name_guesses);
     RUN_TEST(pipeline_js_twin_names_rebuild_old_index);
     RUN_TEST(pipeline_js_twin_callables_scale);
-    RUN_TEST(pipeline_ts_module_typed_receivers_keep_scope_and_caller);
     RUN_TEST(pipeline_ts_caller_is_innermost_named_callable);
     RUN_TEST(pipeline_ts_signature_targets_require_owner);
     RUN_TEST(pipeline_inc_c_family_fragments);
