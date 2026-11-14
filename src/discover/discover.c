@@ -912,12 +912,12 @@ static bool dir_is_cache_tree(const char *abs_path) {
  * which yield to tracked content; built-in skips and .cbmignore never do. */
 typedef enum { DIR_KEEP, DIR_SKIP, DIR_GIT_IGNORED } dir_verdict_t;
 
-static dir_verdict_t directory_verdict(const char *entry_name, const char *rel_path,
-                                       const cbm_discover_opts_t *opts,
-                                       const gitignore_link_t *ignore_chain,
-                                       const cbm_gitignore_t *global_gi,
-                                       const cbm_gitignore_t *cbmignore) {
-    bool builtin_skip = cbm_should_skip_dir(entry_name, opts ? opts->mode : CBM_MODE_FULL) &&
+/* The built-in skip list and .cbmignore, as one decision. *cbm_result gets
+ * the .cbmignore verdict (>0 ignored, <0 re-included, 0 no opinion). */
+static bool directory_excluded(const char *entry_name, const char *rel_path, cbm_index_mode_t mode,
+                               const cbm_gitignore_t *cbmignore, int *cbm_result) {
+    *cbm_result = cbmignore ? cbm_gitignore_match_result(cbmignore, rel_path, true) : 0;
+    bool builtin_skip = cbm_should_skip_dir(entry_name, mode) &&
                         (cbm_discover_is_safety_core_directory(entry_name) ||
                          !cbm_discover_path_in_jvm_package(rel_path));
     if (builtin_skip || cbm_discover_path_has_skip_suffix(rel_path)) {
@@ -925,22 +925,35 @@ static dir_verdict_t directory_verdict(const char *entry_name, const char *rel_p
          * match for this dir un-skips a built-in skip-list dir — except the
          * non-negatable safety core. Fall through so .gitignore/global/local
          * rules still apply to the un-skipped dir. */
-        bool unskipped = cbmignore && !cbm_discover_is_safety_core_directory(entry_name) &&
-                         cbm_gitignore_match_result(cbmignore, rel_path, true) < 0;
+        bool unskipped =
+            cbmignore && !cbm_discover_is_safety_core_directory(entry_name) && *cbm_result < 0;
         if (!unskipped) {
-            return DIR_SKIP;
+            return true;
         }
+    }
+    return *cbm_result > 0;
+}
+
+bool cbm_discover_dir_excluded(const char *name, const char *rel_path, cbm_index_mode_t mode,
+                               const cbm_gitignore_t *cbmignore) {
+    int cbm_result = 0;
+    return name && rel_path && directory_excluded(name, rel_path, mode, cbmignore, &cbm_result);
+}
+
+static dir_verdict_t directory_verdict(const char *entry_name, const char *rel_path,
+                                       const cbm_discover_opts_t *opts,
+                                       const gitignore_link_t *ignore_chain,
+                                       const cbm_gitignore_t *global_gi,
+                                       const cbm_gitignore_t *cbmignore) {
+    int cbm_result = 0;
+    if (directory_excluded(entry_name, rel_path, opts ? opts->mode : CBM_MODE_FULL, cbmignore,
+                           &cbm_result)) {
+        return DIR_SKIP;
     }
     bool git_ignored = gitignore_chain_result(ignore_chain, rel_path, true) > 0;
     bool global_ignored = global_gi && cbm_gitignore_matches(global_gi, rel_path, true);
-    if (cbmignore) {
-        int cbm_result = cbm_gitignore_match_result(cbmignore, rel_path, true);
-        if (cbm_result > 0) {
-            return DIR_SKIP;
-        }
-        if (cbm_result < 0) {
-            global_ignored = false; /* a .cbmignore negation un-ignores a global match */
-        }
+    if (cbm_result < 0) {
+        global_ignored = false; /* a .cbmignore negation un-ignores a global match */
     }
     return git_ignored || global_ignored ? DIR_GIT_IGNORED : DIR_KEEP;
 }

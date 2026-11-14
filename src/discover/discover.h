@@ -165,6 +165,15 @@ typedef enum {
  * Only checks the basename, not the full path. */
 bool cbm_should_skip_dir(const char *dirname, cbm_index_mode_t mode);
 
+/* Discovery's decision for the directory `name` at `rel_path` (relative to
+ * the repository root): true when the walk never enters it, because of the
+ * built-in skip list (unless a .cbmignore negation re-includes it; a safety
+ * folder such as node_modules never comes back) or a .cbmignore match.
+ * `cbmignore` may be NULL. Git's own ignore rules are not part of it:
+ * discovery still enters a git-ignored directory for its tracked files. */
+bool cbm_discover_dir_excluded(const char *name, const char *rel_path, cbm_index_mode_t mode,
+                               const cbm_gitignore_t *cbmignore);
+
 /* Check if a file has a suffix that should be skipped (e.g. .pyc, .png). */
 bool cbm_has_ignored_suffix(const char *filename, cbm_index_mode_t mode);
 

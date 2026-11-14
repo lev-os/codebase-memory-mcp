@@ -511,6 +511,66 @@ TEST(path_alias_loader_no_configs) {
     PASS();
 }
 
+/* ── Loader follows discovery's .cbmignore re-include ──────────── */
+
+/* Discovery indexes a built-in skip folder that a .cbmignore negation
+ * re-includes (`!vendor/`), but never node_modules (a safety folder). The
+ * loader makes the same decision, so a re-included folder keeps its aliases.
+ * Control first: without the negation the vendor config stays out. */
+TEST(path_alias_loader_follows_cbmignore_reinclude) {
+    char tmpl[256];
+    snprintf(tmpl, sizeof(tmpl), "/tmp/cbm_palias_reinc_XXXXXX");
+    char *root = cbm_mkdtemp(tmpl);
+    ASSERT_NOT_NULL(root);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/vendor", root);
+    cbm_mkdir(path);
+    snprintf(path, sizeof(path), "%s/node_modules", root);
+    cbm_mkdir(path);
+    snprintf(path, sizeof(path), "%s/vendor/tsconfig.json", root);
+    ASSERT_EQ(write_file(path, "{\"compilerOptions\":{\"paths\":{\"@kit/*\":[\"./src/*\"]}}}\n"),
+              0);
+    snprintf(path, sizeof(path), "%s/node_modules/tsconfig.json", root);
+    ASSERT_EQ(write_file(path, "{\"compilerOptions\":{\"paths\":{\"@dep/*\":[\"./src/*\"]}}}\n"),
+              0);
+
+    cbm_path_alias_collection_t *coll = cbm_load_path_aliases(root);
+    ASSERT_NULL(coll);
+
+    snprintf(path, sizeof(path), "%s/.cbmignore", root);
+    ASSERT_EQ(write_file(path, "!vendor/\n!node_modules/\n"), 0);
+    coll = cbm_load_path_aliases(root);
+    int count = coll ? coll->count : 0;
+    const cbm_path_alias_map_t *m =
+        coll ? cbm_path_alias_find_for_file(coll, "vendor/app/main.ts") : NULL;
+    char *r = m ? cbm_path_alias_resolve(m, "@kit/widget") : NULL;
+    const cbm_path_alias_map_t *dep =
+        coll ? cbm_path_alias_find_for_file(coll, "node_modules/app/main.ts") : NULL;
+    char *dep_r = dep ? cbm_path_alias_resolve(dep, "@dep/widget") : NULL;
+    bool resolved = r && strcmp(r, "vendor/src/widget") == 0;
+    bool dep_resolved = dep_r != NULL;
+    free(r);
+    free(dep_r);
+    cbm_path_alias_collection_free(coll);
+
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/vendor/tsconfig.json", root);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/node_modules/tsconfig.json", root);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/vendor", root);
+    rmdir(path);
+    snprintf(path, sizeof(path), "%s/node_modules", root);
+    rmdir(path);
+    rmdir(root);
+
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(resolved);
+    ASSERT_FALSE(dep_resolved);
+    PASS();
+}
+
 /* ── Loader does not follow a linked directory ─────────────────── */
 
 /* The walk must not leave the repository through a link, as discovery does
@@ -669,6 +729,7 @@ void suite_path_alias(void) {
     RUN_TEST(path_alias_loader_honors_discovery_exclusions);
     RUN_TEST(path_alias_loader_jsconfig_fallback);
     RUN_TEST(path_alias_loader_no_configs);
+    RUN_TEST(path_alias_loader_follows_cbmignore_reinclude);
     RUN_TEST(path_alias_loader_skips_linked_directory);
 #ifdef _WIN32
     RUN_TEST(path_alias_loader_skips_junction);

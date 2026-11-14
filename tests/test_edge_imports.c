@@ -805,6 +805,33 @@ TEST(ei_file_target_namespace_calls_reach_its_definitions) {
     PASS();
 }
 
+/* A .cbmignore negation (`!vendor/`) re-includes a folder the built-in skip
+ * list names. Its files are indexed, so its tsconfig aliases load too. */
+static int ei_reincluded_folder_alias_case(int pad) {
+    EILangFile files[80] = {
+        {".cbmignore", "!vendor/\n"},
+        {"vendor/kit/tsconfig.json",
+         "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@kit/*\":[\"./src/*\"]}}}\n"},
+        {"vendor/kit/src/widget.ts", "export const value = 1;\n"},
+        {"vendor/kit/app/main.ts", "import { value } from '@kit/widget';\n"},
+        {"decoy/widget.ts", "export const value = 99;\n"},
+    };
+    static const EIFileEdgeExpect want[] = {
+        {"vendor/kit/app/main.ts", "vendor/kit/src/widget.ts"},
+    };
+    char names[60][32];
+    int count = ei_pad_files(files, ei_count_files(files), names, pad);
+    return ei_file_edges_match(files, count, want, 1, 1, "Module");
+}
+
+TEST(ei_reincluded_folder_keeps_its_aliases) {
+    int sequential_ok = ei_reincluded_folder_alias_case(0);
+    int parallel_ok = ei_reincluded_folder_alias_case(60);
+    ASSERT_TRUE(sequential_ok);
+    ASSERT_TRUE(parallel_ok);
+    PASS();
+}
+
 /* #1682: extensionless dotted basenames are part of the module name.  The
  * resolver used to strip `.engine`, miss the module, and bind both imports to
  * the same-named fixture Function in the sibling spec file. */
@@ -3242,6 +3269,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_hidden_directory_imports_resolve_exact_modules);
     RUN_TEST(ei_alias_target_keeps_its_extension);
     RUN_TEST(ei_file_target_namespace_calls_reach_its_definitions);
+    RUN_TEST(ei_reincluded_folder_keeps_its_aliases);
     RUN_TEST(ei_relative_astro_css_imports_issue2558);
     RUN_TEST(ei_nix_parent_relative_import_issue2797);
     RUN_TEST(ei_thrift_parent_relative_import_issue2797);

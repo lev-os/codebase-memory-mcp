@@ -423,7 +423,7 @@ enum { TS_CONFIG_NAMES_COUNT = 2 };
 
 static void find_alias_files(const char *abs_dir, const char *rel_dir, alias_config_hit_t *out,
                              int *count, int max_count, int depth, char **excluded_dirs,
-                             int excluded_count) {
+                             int excluded_count, const cbm_gitignore_t *cbmignore) {
     if (*count >= max_count || depth > CBM_PATH_ALIAS_MAX_DEPTH) {
         return;
     }
@@ -462,10 +462,7 @@ static void find_alias_files(const char *abs_dir, const char *rel_dir, alias_con
             continue;
         }
         const char *name = ent->name;
-        /* Hidden source directories can own a tsconfig too. Match discovery's
-         * exclusions rather than dropping every directory with a leading dot. */
-        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 ||
-            cbm_should_skip_dir(name, CBM_MODE_FULL) || strcmp(name, "build") == 0) {
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 || strcmp(name, "build") == 0) {
             continue;
         }
         char child_abs[CBM_SZ_512];
@@ -476,7 +473,11 @@ static void find_alias_files(const char *abs_dir, const char *rel_dir, alias_con
         } else {
             snprintf(child_rel, sizeof(child_rel), "%s/%s", rel_dir, name);
         }
-        if (cbm_pipeline_relpath_is_excluded(child_rel, excluded_dirs, excluded_count)) {
+        /* Discovery's own decision: a hidden source directory can own a
+         * tsconfig, and a skipped one (vendor) that .cbmignore re-includes
+         * keeps its configs, as it keeps its files. */
+        if (cbm_discover_dir_excluded(name, child_rel, CBM_MODE_FULL, cbmignore) ||
+            cbm_pipeline_relpath_is_excluded(child_rel, excluded_dirs, excluded_count)) {
             continue;
         }
         /* A link is not followed, as discovery does not follow one. is_dir is
@@ -489,7 +490,7 @@ static void find_alias_files(const char *abs_dir, const char *rel_dir, alias_con
             continue;
         }
         find_alias_files(child_abs, child_rel, out, count, max_count, depth + 1, excluded_dirs,
-                         excluded_count);
+                         excluded_count, cbmignore);
     }
     cbm_closedir(d);
 }
@@ -505,8 +506,13 @@ cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_pat
         return NULL;
     }
     int count = 0;
+    /* The pipeline's discovery reads the repository's own .cbmignore. */
+    char ignore_path[CBM_SZ_4K];
+    snprintf(ignore_path, sizeof(ignore_path), "%s/.cbmignore", repo_path);
+    cbm_gitignore_t *cbmignore = cbm_gitignore_load(ignore_path);
     find_alias_files(repo_path, "", hits, &count, CBM_PATH_ALIAS_MAX_FILES, 0, excluded_dirs,
-                     excluded_count);
+                     excluded_count, cbmignore);
+    cbm_gitignore_free(cbmignore);
     if (count >= CBM_PATH_ALIAS_MAX_FILES) {
         cbm_log_warn("path_alias.files.cap_hit", "repo", repo_path, "kept", "256_of_more");
     }
