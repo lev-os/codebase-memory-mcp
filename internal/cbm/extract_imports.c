@@ -1893,6 +1893,43 @@ static bool process_commonjs_require(CBMExtractCtx *ctx, TSNode call) {
     return true;
 }
 
+/* import() is a dependency even inside a callback. Only its first argument
+ * can name the module; computed paths and strings in options are not evidence.
+ * Keep it unbound: an awaited local inside a function is not a file-wide name. */
+static void process_es_dynamic_import(CBMExtractCtx *ctx, TSNode call) {
+    TSNode fn = ts_node_child_by_field_name(call, TS_FIELD("function"));
+    if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "import") != 0) {
+        return;
+    }
+    TSNode args = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+    if (ts_node_is_null(args)) {
+        return;
+    }
+    TSNode first = {0};
+    uint32_t count = ts_node_named_child_count(args);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode arg = ts_node_named_child(args, i);
+        if (strcmp(ts_node_type(arg), "comment") != 0) {
+            first = arg;
+            break;
+        }
+    }
+    if (ts_node_is_null(first)) {
+        return;
+    }
+    const char *kind = ts_node_type(first);
+    if (strcmp(kind, "string") != 0 && strcmp(kind, "string_literal") != 0) {
+        return;
+    }
+    const char *path = strip_quotes(ctx->arena, cbm_node_text(ctx->arena, first, ctx->source));
+    if (!path || !path[0]) {
+        return;
+    }
+    CBMImport imp = {
+        .module_path = path, .local_name_synthesized = true, .is_dynamic = true};
+    cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
+}
+
 static void process_es_export_statement(CBMExtractCtx *ctx, TSNode node) {
     CBMArena *a = ctx->arena;
     TSNode src = ts_node_child_by_field_name(node, TS_FIELD("source"));
@@ -1971,10 +2008,10 @@ static void walk_es_imports(CBMExtractCtx *ctx, TSNode root) {
         } else if (strcmp(kind, "export_statement") == 0) {
             process_es_export_statement(ctx, node);
         } else if (strcmp(kind, "call_expression") == 0) {
-            /* CommonJS require() — only consume the node if we recognized
-             * it as a require call; otherwise keep traversing the children. */
-            if (process_commonjs_require(ctx, node)) {
-                push_children = false;
+            /* A call's arguments can contain more dependencies, including
+             * a literal import() passed to require(). Keep walking them. */
+            if (!process_commonjs_require(ctx, node)) {
+                process_es_dynamic_import(ctx, node);
             }
         }
 

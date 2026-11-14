@@ -19,6 +19,7 @@
  */
 
 #include "pipeline/path_alias.h"
+#include "discover/discover.h"
 
 #include "pipeline/pipeline_internal.h"
 
@@ -436,9 +437,10 @@ static void find_alias_files(const char *abs_dir, const char *rel_dir, alias_con
             continue;
         }
         const char *name = ent->name;
-        if (name[0] == '.' || strcmp(name, "node_modules") == 0 || strcmp(name, "dist") == 0 ||
-            strcmp(name, "build") == 0 || strcmp(name, ".next") == 0 ||
-            strcmp(name, "coverage") == 0 || strcmp(name, "target") == 0 /* Rust */) {
+        /* Hidden source directories can own a tsconfig too. Match discovery's
+         * exclusions rather than dropping every directory with a leading dot. */
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 ||
+            cbm_should_skip_dir(name, CBM_MODE_FULL) || strcmp(name, "build") == 0) {
             continue;
         }
         char child_abs[CBM_SZ_512];
