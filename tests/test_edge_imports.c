@@ -1209,6 +1209,102 @@ TEST(ei_ts_bare_specifier_never_binds_project_symbol) {
     PASS();
 }
 
+/* Workspace specifiers must reach the exact file, including directory entries,
+ * nested build-output exports and wildcard exports. A same-name file and an
+ * external package must not acquire an edge. Padding selects both drivers. */
+static int ei_ts_workspace_package_case(int pad) {
+    EILangFile files[112] = {
+        {"package.json", "{\"name\":\"workspace\",\"private\":true,\"workspaces\":[\"packages/*\"]}\n"},
+        {"tsconfig.json", "{\"compilerOptions\":{\"paths\":{\"@sample/alias\":[\"./packages/alias/src\"],"
+                          "\"@sample/alias/*\":[\"./packages/alias/src/*\"]}}}\n"},
+        {"packages/alias/package.json", "{\"name\":\"@sample/alias\"}\n"},
+        {"packages/alias/src/index.ts", "export const value = 1;\n"},
+        {"packages/alias/src/nested/index.ts", "export const value = 2;\n"},
+        {"packages/nested/package.json",
+         "{\"name\":\"@sample/nested\",\"exports\":{\".\":{\"import\":{"
+         "\"types\":\"./dist/index.d.mts\",\"default\":\"./dist/index.mjs\"}},"
+         "\"./feature\":{\"import\":{\"types\":\"./dist/feature.d.mts\","
+         "\"default\":\"./dist/feature.mjs\"}}}}\n"},
+        {"packages/nested/src/index.ts", "export const value = 3;\n"},
+        {"packages/nested/src/feature.ts", "export const value = 4;\n"},
+        {"packages/pattern/package.json",
+         "{\"name\":\"@sample/pattern\",\"exports\":{\"./*\":\"./src/*.ts\","
+         "\"./widgets/*\":\"./components/*.tsx\",\"./widgets/special\":\"./special.ts\",\"./private\":null}}\n"},
+        {"packages/pattern/src/theme.css.ts", "export const value = 5;\n"},
+        {"packages/pattern/src/widgets/button.ts", "export const value = 99;\n"},
+        {"packages/pattern/components/button.tsx", "export const value = 6;\n"},
+        {"packages/pattern/special.ts", "export const value = 7;\n"},
+        {"packages/string/package.json", "{\"name\":\"@sample/string\",\"exports\":\"./src/main.ts\"}\n"},
+        {"packages/string/src/main.ts", "export const value = 8;\n"},
+        {"packages/types/package.json", "{\"name\":\"@sample/types\",\"types\":\"./src/public.ts\","
+                                       "\"main\":\"./dist/other.js\"}\n"},
+        {"packages/types/src/public.ts", "export const value = 9;\n"},
+        {"packages/module/package.json", "{\"name\":\"@sample/module\",\"module\":\"./src/main.ts\"}\n"},
+        {"packages/module/src/main.ts", "export const value = 10;\n"},
+        {"packages/default/package.json", "{\"name\":\"@sample/default\",\"exports\":{"
+                                         "\".\":{\"default\":\"./src/main.ts\"}}}\n"},
+        {"packages/default/src/main.ts", "export const value = 11;\n"},
+        {"apps/root.ts", "import { value } from '@sample/alias';\n"},
+        {"apps/subpath.ts", "import { value } from '@sample/alias/nested';\n"},
+        {"apps/nested.ts", "import { value } from '@sample/nested';\n"},
+        {"apps/feature.ts", "import { value } from '@sample/nested/feature';\n"},
+        {"apps/pattern.ts", "import { value } from '@sample/pattern/theme.css';\n"},
+        {"apps/specific.ts", "import { value } from '@sample/pattern/widgets/button';\n"},
+        {"apps/exact.ts", "import { value } from '@sample/pattern/widgets/special';\n"},
+        {"apps/string.ts", "import { value } from '@sample/string';\n"},
+        {"apps/types.ts", "import { value } from '@sample/types';\n"},
+        {"apps/module.ts", "import { value } from '@sample/module';\n"},
+        {"apps/default.ts", "import { value } from '@sample/default';\n"},
+        {"apps/relative.ts", "import { value } from '../packages/alias/src/nested';\n"},
+        {"apps/external.ts", "import { value } from '@outside/feature';\n"},
+        {"apps/blocked.ts", "import { value } from '@sample/pattern/private';\n"},
+        {"index.ts", "export const value = 99;\n"},
+        {"decoy/feature.ts", "export const value = 99;\n"},
+        {"packages/subpath-only/package.json", "{\"name\":\"@sample/subpath-only\",\"exports\":{"
+                                              "\"./public\":\"./src/public.ts\"}}\n"},
+        {"packages/subpath-only/src/public.ts", "export const value = 12;\n"},
+        {"apps/no-root.ts", "import { value } from '@sample/subpath-only';\n"},
+        {"apps/public.ts", "import { value } from '@sample/subpath-only/public';\n"},
+        {"packages/dist/package.json", "{\"name\":\"@sample/missing\",\"exports\":\"./dist/ghost.mjs\"}\n"},
+        {"packages/src/dist/ghost.ts", "export const value = 99;\n"},
+        {"apps/missing.ts", "import { value } from '@sample/missing';\n"},
+    };
+    static const EIFileEdgeExpect want[] = {
+        {"apps/root.ts", "packages/alias/src/index.ts"},
+        {"apps/subpath.ts", "packages/alias/src/nested/index.ts"},
+        {"apps/nested.ts", "packages/nested/src/index.ts"},
+        {"apps/feature.ts", "packages/nested/src/feature.ts"},
+        {"apps/pattern.ts", "packages/pattern/src/theme.css.ts"},
+        {"apps/specific.ts", "packages/pattern/components/button.tsx"},
+        {"apps/exact.ts", "packages/pattern/special.ts"},
+        {"apps/string.ts", "packages/string/src/main.ts"},
+        {"apps/types.ts", "packages/types/src/public.ts"},
+        {"apps/module.ts", "packages/module/src/main.ts"},
+        {"apps/default.ts", "packages/default/src/main.ts"},
+        {"apps/relative.ts", "packages/alias/src/nested/index.ts"},
+        {"apps/public.ts", "packages/subpath-only/src/public.ts"},
+    };
+    int count = 0;
+    while (files[count].name) {
+        count++;
+    }
+    char names[64][32];
+    for (int i = 0; i < pad; i++) {
+        snprintf(names[i], sizeof(names[i]), "padding/file_%02d.ts", i);
+        files[count++] = (EILangFile){names[i], "export const padding = 0;\n"};
+    }
+    return ei_file_edges_match(files, count, want, sizeof(want) / sizeof(want[0]),
+                               sizeof(want) / sizeof(want[0]), "Module");
+}
+
+TEST(ei_ts_workspace_packages_resolve_exact_source_files) {
+    int sequential_ok = ei_ts_workspace_package_case(0);
+    int parallel_ok = ei_ts_workspace_package_case(60);
+    ASSERT_TRUE(sequential_ok);
+    ASSERT_TRUE(parallel_ok);
+    PASS();
+}
+
 /* Base-class helper: INHERITS edges out of the (single) Class named `src`
  * (return value), and how many land on a node whose QN ends with
  * `want_qn_suffix` (*to_want); -1 when the class is missing. */
@@ -2892,6 +2988,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_go_import_never_binds_symbol);
     RUN_TEST(ei_py_external_import_never_binds_project_symbol);
     RUN_TEST(ei_ts_bare_specifier_never_binds_project_symbol);
+    RUN_TEST(ei_ts_workspace_packages_resolve_exact_source_files);
     RUN_TEST(ei_py_external_base_never_inherits_project_class);
     RUN_TEST(ei_cpp_header_include_targets_header_file);
 

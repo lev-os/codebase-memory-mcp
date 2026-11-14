@@ -153,24 +153,9 @@ static char *path_dirname(const char *rel_path) {
     return cbm_strndup(rel_path, (size_t)(last - rel_path));
 }
 
-/* Strip file extension from a path. Returns heap-allocated string.
- * "src/index.ts" → "src/index", "lib/main" → "lib/main" */
-static char *strip_extension(const char *path) {
-    size_t len = strlen(path);
-    for (size_t i = len; i > 0; i--) {
-        if (path[i - SKIP_ONE] == '.') {
-            return cbm_strndup(path, i - SKIP_ONE);
-        }
-        if (path[i - SKIP_ONE] == '/') {
-            break;
-        }
-    }
-    return strdup(path);
-}
-
-/* Join directory + relative entry path, normalize.
- * "packages/foo" + "src/index.ts" → "packages/foo/src/index" (stripped ext) */
-static char *join_and_strip(const char *dir, const char *entry) {
+/* Join a package directory and entry. Keep the extension until QN creation,
+ * so dotted basenames lose only their actual file extension. */
+static char *join_package_entry(const char *dir, const char *entry) {
     if (!entry || entry[0] == '\0') {
         return NULL;
     }
@@ -178,13 +163,23 @@ static char *join_and_strip(const char *dir, const char *entry) {
     if (entry[0] == '.' && entry[SKIP_ONE] == '/') {
         entry += PAIR_LEN;
     }
+    /* Only a build directory relative to this manifest can map to source.
+     * Do this before QN creation: a dotted name or an ancestor named dist
+     * must not be mistaken for the package's output directory. */
+    bool output = strncmp(entry, "dist/", strlen("dist/")) == 0;
     char buf[PKGMAP_PATH_BUF];
-    if (dir[0] == '\0') {
-        snprintf(buf, sizeof(buf), "%s", entry);
-    } else {
-        snprintf(buf, sizeof(buf), "%s/%s", dir, entry);
+    int n = snprintf(buf, sizeof(buf), "%s%s%s%s", dir, dir[0] ? "/" : "",
+                     output ? "src/" : "", output ? entry + strlen("dist/") : entry);
+    if (n < 0 || n >= (int)sizeof(buf)) {
+        return NULL;
     }
-    return strip_extension(buf);
+    char *ext = strrchr(buf, '.');
+    if (output && ext && ext - buf >= PAIR_LEN && ext[-PAIR_LEN] == '.' &&
+        ext[-SKIP_ONE] == 'd' &&
+        (strcmp(ext, ".ts") == 0 || strcmp(ext, ".mts") == 0 || strcmp(ext, ".cts") == 0)) {
+        memmove(ext - PAIR_LEN, ext, strlen(ext) + SKIP_ONE);
+    }
+    return strdup(buf);
 }
 
 /* Check if a string ends with a suffix. */
@@ -276,28 +271,40 @@ static bool is_ts_source_path(const char *p) {
  * A condition that names a TypeScript source file wins: in a source-first
  * workspace "types" points at src/ while "import" points at gitignored build
  * output that has no graph node (#1732). Otherwise the runtime conditions. */
-static const char *resolve_exports_dot(yyjson_val *dot) {
-    if (yyjson_is_str(dot)) {
-        return yyjson_get_str(dot);
-    }
-    if (!yyjson_is_obj(dot)) {
+static const char *resolve_exports_entry(yyjson_val *entry, int depth) {
+    if (depth >= PKGMAP_WALK_MAX_DEPTH) {
         return NULL;
     }
-    size_t ci;
-    size_t cmax;
-    yyjson_val *ck;
-    yyjson_val *cv;
-    yyjson_obj_foreach(dot, ci, cmax, ck, cv) {
-        (void)ck;
-        if (yyjson_is_str(cv) && is_ts_source_path(yyjson_get_str(cv))) {
-            return yyjson_get_str(cv);
+    if (yyjson_is_str(entry)) {
+        return yyjson_get_str(entry);
+    }
+    if (yyjson_is_arr(entry)) {
+        size_t i, max;
+        yyjson_val *v;
+        yyjson_arr_foreach(entry, i, max, v) {
+            const char *target = resolve_exports_entry(v, depth + SKIP_ONE);
+            if (target) {
+                return target;
+            }
         }
     }
-    static const char *keys[] = {"import", "default", "require"};
-    for (int i = 0; i < (int)(sizeof(keys) / sizeof(keys[0])); i++) {
-        yyjson_val *v = yyjson_obj_get(dot, keys[i]);
-        if (yyjson_is_str(v)) {
-            return yyjson_get_str(v);
+    if (!yyjson_is_obj(entry)) {
+        return NULL;
+    }
+    size_t i, max;
+    yyjson_val *key, *val;
+    yyjson_obj_foreach(entry, i, max, key, val) {
+        (void)key;
+        if (yyjson_is_str(val) && is_ts_source_path(yyjson_get_str(val))) {
+            return yyjson_get_str(val);
+        }
+    }
+    static const char *keys[] = {"source", "import", "types", "default", "require"};
+    for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+        const char *target = resolve_exports_entry(yyjson_obj_get(entry, keys[k]),
+                                                   depth + SKIP_ONE);
+        if (target) {
+            return target;
         }
     }
     return NULL;
@@ -306,20 +313,35 @@ static const char *resolve_exports_dot(yyjson_val *dot) {
 /* Resolve JS/TS entry point from package.json root. */
 static const char *resolve_pkg_entry(yyjson_val *root) {
     yyjson_val *exports = yyjson_obj_get(root, "exports");
-    if (yyjson_is_obj(exports)) {
-        const char *e = resolve_exports_dot(yyjson_obj_get(exports, "."));
-        if (e) {
-            return e;
+    if (exports) {
+        yyjson_val *dot = yyjson_obj_get(exports, ".");
+        if (!dot && yyjson_is_obj(exports)) {
+            yyjson_obj_iter iter = yyjson_obj_iter_with(exports);
+            yyjson_val *key;
+            while ((key = yyjson_obj_iter_next(&iter)) != NULL) {
+                const char *name = yyjson_get_str(key);
+                if (name && name[0] == '.') {
+                    return NULL; /* A subpath-only export map has no root entry. */
+                }
+            }
+        }
+        return resolve_exports_entry(dot ? dot : exports, 0);
+    }
+    static const char *source_keys[] = {"source", "types", "typings", "module", "main"};
+    for (size_t i = 0; i < sizeof(source_keys) / sizeof(source_keys[0]); i++) {
+        const char *target = yyjson_get_str(yyjson_obj_get(root, source_keys[i]));
+        if (is_ts_source_path(target)) {
+            return target;
         }
     }
-    static const char *fallback_keys[] = {"main", "module"};
-    for (int i = 0; i < (int)(sizeof(fallback_keys) / sizeof(fallback_keys[0])); i++) {
-        yyjson_val *v = yyjson_obj_get(root, fallback_keys[i]);
-        if (yyjson_is_str(v)) {
-            return yyjson_get_str(v);
+    static const char *fallback_keys[] = {"main", "module", "types", "typings"};
+    for (size_t i = 0; i < sizeof(fallback_keys) / sizeof(fallback_keys[0]); i++) {
+        const char *target = yyjson_get_str(yyjson_obj_get(root, fallback_keys[i]));
+        if (target) {
+            return target;
         }
     }
-    return "src/index.ts"; /* last resort default */
+    return "src/index.ts";
 }
 
 /* JS/TS: package.json — name + entry point resolution */
@@ -349,7 +371,7 @@ static void parse_package_json(const char *source, int source_len, const char *r
     const char *entry = resolve_pkg_entry(root);
     char *dir = path_dirname(rel_path);
     if (entry && dir) {
-        char *resolved = join_and_strip(dir, entry);
+        char *resolved = join_package_entry(dir, entry);
         if (resolved) {
             pkg_entries_push(entries, strdup(name), resolved);
         }
@@ -357,8 +379,8 @@ static void parse_package_json(const char *source, int source_len, const char *r
 
     /* Subpath exports: `"./xdg-paths": {...}` makes `<name>/xdg-paths` an
      * importable specifier with its own target. Without it the subpath was
-     * glued onto the root entry's QN and named no node. Star patterns are
-     * left to the existing prefix fallback. */
+     * glued onto the root entry's QN and named no node. Keep star patterns
+     * for substitution when resolving the importing specifier. */
     yyjson_val *exports = yyjson_obj_get(root, "exports");
     if (dir && yyjson_is_obj(exports)) {
         size_t ei;
@@ -367,16 +389,13 @@ static void parse_package_json(const char *source, int source_len, const char *r
         yyjson_val *ev;
         yyjson_obj_foreach(exports, ei, emax, ek, ev) {
             const char *sub = yyjson_get_str(ek);
-            if (!sub || sub[0] != '.' || sub[SKIP_ONE] != '/' || strchr(sub, '*')) {
+            if (!sub || sub[0] != '.' || sub[SKIP_ONE] != '/') {
                 continue;
             }
-            const char *target = resolve_exports_dot(ev);
-            if (!target) {
-                continue;
-            }
+            const char *target = resolve_exports_entry(ev, 0);
             char key[PKGMAP_PATH_BUF];
             snprintf(key, sizeof(key), "%s%s", name, sub + SKIP_ONE);
-            char *resolved = join_and_strip(dir, target);
+            char *resolved = target ? join_package_entry(dir, target) : strdup("");
             if (resolved) {
                 pkg_entries_push(entries, strdup(key), resolved);
             }
@@ -1702,11 +1721,100 @@ static char *alias_module_qn(const cbm_pipeline_ctx_t *ctx, const char *module_p
     return stripped;
 }
 
+/* A JS directory import names its indexed entry module, never the Folder.
+ * Package targets, including output-to-source mappings, must name a module
+ * that exists in the graph. */
+static char *js_module_qn(const cbm_pipeline_ctx_t *ctx, char *qn, bool from_package) {
+    if (!qn || !ctx->gbuf) {
+        return qn;
+    }
+    /* An empty export target records a blocked subpath, not a root entry. */
+    if (from_package && strcmp(qn, ctx->project_name) == 0) {
+        free(qn);
+        return NULL;
+    }
+    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(ctx->gbuf, qn);
+    if (node && node->label &&
+        (strcmp(node->label, "Module") == 0 || strcmp(node->label, "File") == 0)) {
+        return qn;
+    }
+    char candidate[PKGMAP_PATH_BUF];
+    int n = snprintf(candidate, sizeof(candidate), "%s.index", qn);
+    node = n > 0 && n < (int)sizeof(candidate)
+               ? cbm_gbuf_find_by_qn(ctx->gbuf, candidate) : NULL;
+    if (node && node->label && strcmp(node->label, "Module") == 0) {
+        free(qn);
+        return strdup(candidate);
+    }
+    free(qn);
+    return NULL;
+}
+
+typedef struct {
+    const char *specifier;
+    const char *key;
+    const char *target;
+    size_t prefix_len;
+    size_t suffix_len;
+} js_export_match_t;
+
+static void js_match_export(const char *key, void *value, void *userdata) {
+    js_export_match_t *match = userdata;
+    const char *star = strchr(key, '*');
+    if (!star || strchr(star + SKIP_ONE, '*')) {
+        return;
+    }
+    size_t prefix = (size_t)(star - key), suffix = strlen(star + SKIP_ONE);
+    size_t len = strlen(match->specifier);
+    if (len < prefix + suffix || strncmp(match->specifier, key, prefix) != 0 ||
+        strcmp(match->specifier + len - suffix, star + SKIP_ONE) != 0) {
+        return;
+    }
+    if (!match->key || prefix > match->prefix_len ||
+        (prefix == match->prefix_len && suffix > match->suffix_len)) {
+        match->key = key;
+        match->target = value;
+        match->prefix_len = prefix;
+        match->suffix_len = suffix;
+    }
+}
+
+static char *js_wildcard_export(const cbm_pipeline_ctx_t *ctx, CBMHashTable *map,
+                                const char *specifier, bool *matched) {
+    js_export_match_t match = {.specifier = specifier};
+    cbm_ht_foreach(map, js_match_export, &match);
+    *matched = match.key != NULL;
+    if (!match.target) {
+        return NULL;
+    }
+    const char *star = strchr(match.target, '*');
+    char candidate[PKGMAP_PATH_BUF];
+    int n = star ? snprintf(candidate, sizeof(candidate), "%.*s%.*s%s",
+                           (int)(star - match.target), match.target,
+                           (int)(strlen(specifier) - match.prefix_len - match.suffix_len),
+                           specifier + match.prefix_len, star + SKIP_ONE)
+                 : snprintf(candidate, sizeof(candidate), "%s", match.target);
+    if (n <= 0 || n >= (int)sizeof(candidate)) {
+        return NULL;
+    }
+    /* QNs use dots for path separators, including the substituted subpath. */
+    for (char *c = candidate; *c; c++) {
+        if (*c == '/') {
+            *c = '.';
+        }
+    }
+    return js_module_qn(ctx, strdup(candidate), true);
+}
+
 char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
                                   const char *module_path) {
     if (!ctx || !module_path) {
         return cbm_pipeline_fqn_module(ctx ? ctx->project_name : NULL, module_path);
     }
+
+    const char *ext = source_rel ? strrchr(source_rel, '.') : NULL;
+    CBMLanguage lang = ext ? cbm_language_for_extension(ext) : CBM_LANG_COUNT;
+    bool js = lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
 
     /* 1. Try relative import resolution (existing logic) */
     char *resolved = cbm_pipeline_resolve_relative_import(source_rel, module_path);
@@ -1717,7 +1825,7 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
          * stripped a second time by cbm_pipeline_fqn_module. */
         char *qn = cbm_pipeline_fqn_folder(ctx->project_name, resolved);
         free(resolved);
-        return qn;
+        return js ? js_module_qn(ctx, qn, false) : qn;
     }
 
     /* 1b. Try build-tool path aliases (tsconfig/jsconfig paths today;
@@ -1730,7 +1838,7 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
             if (aliased) {
                 char *qn = alias_module_qn(ctx, module_path, aliased);
                 free(aliased);
-                return qn;
+                return js ? js_module_qn(ctx, qn, false) : qn;
             }
         }
     }
@@ -1744,7 +1852,15 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
     /* 3. Exact lookup */
     const char *mapped_qn = (const char *)cbm_ht_get(pkgmap, module_path);
     if (mapped_qn) {
-        return strdup(mapped_qn);
+        return js ? js_module_qn(ctx, strdup(mapped_qn), true) : strdup(mapped_qn);
+    }
+
+    if (js) {
+        bool matched = false;
+        char *wildcard = js_wildcard_export(ctx, pkgmap, module_path, &matched);
+        if (matched) {
+            return wildcard;
+        }
     }
 
     /* 4. Prefix matching by separator type */
