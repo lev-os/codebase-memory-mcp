@@ -5591,7 +5591,36 @@ TEST(tslsp_destructured_names_shadow_outer_receiver) {
     PASS();
 }
 
+/* A `var` belongs to its function, not to the block that declares it. A
+ * write in a nested block or branch leaves the function's binding unknown. */
+TEST(tslsp_var_hoists_to_function_scope) {
+    const char *source =
+        "class Port { send() {} }\n"
+        "class Decoy { send() {} }\n"
+        "const port = new Port();\n"
+        "(() => { { var port = new Decoy(); } port.send(); })();\n"
+        "(() => { port.send(); var port = new Decoy(); })();\n"
+        "(() => { if (Math.random()) { var port = new Decoy(); } port.send(); })();\n"
+        "(() => { for (var port of [new Decoy()]) {} port.send(); })();\n"
+        "(() => { for (var i = 0, port = new Decoy(); i < 1; i++) {} port.send(); })();\n"
+        "(() => { { var port = new Decoy(); port.send(); } })();\n"
+        "function f() { var q = new Port(); if (Math.random()) { var q = new Decoy(); } q.send(); }\n"
+        "function g() { var r = new Port(); r.send(); }\n"
+        "var mod = new Port(); { var mod = new Decoy(); } mod.send();\n"
+        "namespace NS { { var port = new Decoy(); } port.send(); }\n"
+        "(() => { switch (Math.random()) { case 1: var port = new Decoy(); } port.send(); })();\n"
+        "(() => { var c = new Port(); const k = () => c.send(); { var c = new Decoy(); } })();\n";
+    const TsLineTarget cases[] = {
+        {4, NULL}, {5, NULL}, {6, NULL}, {7, NULL}, {8, NULL}, {9, "test.main.Decoy.send"},
+        {10, NULL}, {11, "test.main.Port.send"}, {12, NULL}, {13, NULL}, {14, NULL}, {15, NULL},
+    };
+    ASSERT_TRUE(ts_check_line_targets("var hoist", source, cases,
+                                      sizeof(cases) / sizeof(cases[0])));
+    PASS();
+}
+
 SUITE(ts_lsp) {
+    RUN_TEST(tslsp_var_hoists_to_function_scope);
     RUN_TEST(tslsp_destructured_names_shadow_outer_receiver);
     RUN_TEST(tslsp_reassignment_replaces_receiver_type);
     RUN_TEST(tslsp_unknown_generic_lookup_work_is_linear);

@@ -1568,6 +1568,10 @@ struct TsAssignSites {
     TsAssignSite **by_start; /* the same sites, sorted by start */
     int count;
     bool complete; /* false: a write may be missing, so every write is a closure write */
+    /* Every name a `var` declares, by the function it hoists to, sorted by
+     * (fn_start, fn_end, start). */
+    TsAssignSite *hoisted;
+    int hoisted_count;
 };
 
 typedef struct {
@@ -1651,8 +1655,49 @@ static void ts_site_push_pattern(TSLSPContext *ctx, TsSiteVec *v, TSNode pattern
     }
 }
 
-static void ts_site_visit(TSLSPContext *ctx, TsSiteVec *v, TSNode node, uint32_t fs, uint32_t fe) {
+/* True when the `var` declaration under the cursor is a statement of a
+ * function body or of the file, so it runs whenever its function does. */
+static bool ts_var_declaration_is_top(const TSTreeCursor *cursor) {
+    TSTreeCursor up = ts_tree_cursor_copy(cursor);
+    bool top = false;
+    if (ts_tree_cursor_goto_parent(&up)) {
+        TSNode parent = ts_tree_cursor_current_node(&up);
+        if (node_kind_is(parent, "export_statement") && ts_tree_cursor_goto_parent(&up))
+            parent = ts_tree_cursor_current_node(&up);
+        if (node_kind_is(parent, "program"))
+            top = true;
+        else if (node_kind_is(parent, "statement_block") && ts_tree_cursor_goto_parent(&up))
+            top = ts_is_flow_function(ts_tree_cursor_current_node(&up));
+    }
+    ts_tree_cursor_delete(&up);
+    return top;
+}
+
+/* A `var` hoists to its function. A declarator with a value in a nested
+ * block, branch or loop header is also a write of that hoisted binding. */
+static void ts_site_visit_var(TSLSPContext *ctx, TsSiteVec *v, TsSiteVec *hoist,
+                              const TSTreeCursor *cursor, TSNode node, uint32_t fs, uint32_t fe) {
+    bool nested = !ts_var_declaration_is_top(cursor);
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode decl = ts_node_named_child(node, i);
+        if (!node_kind_is(decl, "variable_declarator"))
+            continue;
+        TSNode name = ts_node_child_by_field_name(decl, "name", TS_LSP_FIELD_LEN("name"));
+        ts_site_push_pattern(ctx, hoist, name, fs, fe, 0);
+        TSNode value = ts_node_child_by_field_name(decl, "value", TS_LSP_FIELD_LEN("value"));
+        if (nested && !ts_node_is_null(value))
+            ts_site_push_pattern(ctx, v, name, fs, fe, 0);
+    }
+}
+
+static void ts_site_visit(TSLSPContext *ctx, TsSiteVec *v, TsSiteVec *hoist,
+                          const TSTreeCursor *cursor, TSNode node, uint32_t fs, uint32_t fe) {
     const char *kind = ts_node_type(node);
+    if (kind[0] == 'v' && strcmp(kind, "variable_declaration") == 0) {
+        ts_site_visit_var(ctx, v, hoist, cursor, node, fs, fe);
+        return;
+    }
     if (kind[0] == 'a' && (strcmp(kind, "assignment_expression") == 0 ||
                            strcmp(kind, "augmented_assignment_expression") == 0)) {
         ts_site_push_pattern(ctx, v,
@@ -1666,7 +1711,22 @@ static void ts_site_visit(TSLSPContext *ctx, TsSiteVec *v, TSNode node, uint32_t
         if (ts_node_is_null(decl_kind) && !node_kind_is(left, "lexical_declaration") &&
             !node_kind_is(left, "variable_declaration"))
             ts_site_push_pattern(ctx, v, left, fs, fe, 0);
+        /* `for (var x of xs)` declares x in the function and writes it. */
+        if (!ts_node_is_null(decl_kind) && node_kind_is(decl_kind, "var")) {
+            ts_site_push_pattern(ctx, hoist, left, fs, fe, 0);
+            ts_site_push_pattern(ctx, v, left, fs, fe, 0);
+        }
     }
+}
+
+static int ts_site_fn_cmp(const void *pa, const void *pb) {
+    const TsAssignSite *a = (const TsAssignSite *)pa;
+    const TsAssignSite *b = (const TsAssignSite *)pb;
+    if (a->fn_start != b->fn_start)
+        return (a->fn_start > b->fn_start) - (a->fn_start < b->fn_start);
+    if (a->fn_end != b->fn_end)
+        return (a->fn_end > b->fn_end) - (a->fn_end < b->fn_end);
+    return (a->start > b->start) - (a->start < b->start);
 }
 
 static int ts_site_name_cmp(const void *pa, const void *pb) {
@@ -1696,6 +1756,7 @@ static void ts_collect_assign_sites(TSLSPContext *ctx, TSNode root) {
     ctx->assign_sites = sites;
 
     TsSiteVec v = {0};
+    TsSiteVec hoist = {0};
     uint32_t inline_fns[2 * 32];
     uint32_t *fns = inline_fns;
     int fn_cap = 32;
@@ -1706,7 +1767,7 @@ static void ts_collect_assign_sites(TSLSPContext *ctx, TSNode root) {
     TSTreeCursor cursor = ts_tree_cursor_new(root);
     for (bool done = false; !done && !v.failed;) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
-        ts_site_visit(ctx, &v, node, fns[2 * fn_top - 2], fns[2 * fn_top - 1]);
+        ts_site_visit(ctx, &v, &hoist, &cursor, node, fns[2 * fn_top - 2], fns[2 * fn_top - 1]);
         bool fn = ts_is_flow_function(node);
         if (fn) {
             if (fn_top == fn_cap) {
@@ -1740,6 +1801,11 @@ static void ts_collect_assign_sites(TSLSPContext *ctx, TSNode root) {
         }
     }
     ts_tree_cursor_delete(&cursor);
+    if (!v.failed && !hoist.failed && hoist.count) {
+        qsort(hoist.items, (size_t)hoist.count, sizeof(*hoist.items), ts_site_fn_cmp);
+        sites->hoisted = hoist.items;
+        sites->hoisted_count = hoist.count;
+    }
     if (v.failed)
         return; /* complete stays false: every writable binding is fixed */
 
@@ -1987,6 +2053,31 @@ static void ts_flow_enter_loop(TSLSPContext *ctx, TSNode loop) {
     }
     for (int i = lo; i < sites->count && sites->by_start[i]->start < end; i++)
         ts_flow_write(ctx, sites->by_start[i]->name, NULL, false);
+}
+
+/* Bind each name a `var` of the function being entered declares, in the
+ * function's frame and as unknown, before the walk reaches any block. */
+static void ts_hoist_vars(TSLSPContext *ctx) {
+    const struct TsAssignSites *sites = ctx->assign_sites;
+    if (!sites || !sites->hoisted_count || !ctx->fn_scope)
+        return;
+    int lo = 0;
+    int hi = sites->hoisted_count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        const TsAssignSite *h = &sites->hoisted[mid];
+        if (h->fn_start < ctx->fn_start ||
+            (h->fn_start == ctx->fn_start && h->fn_end < ctx->fn_end))
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    for (int i = lo; i < sites->hoisted_count; i++) {
+        const TsAssignSite *h = &sites->hoisted[i];
+        if (h->fn_start != ctx->fn_start || h->fn_end != ctx->fn_end)
+            break;
+        cbm_scope_bind(ctx->fn_scope, h->name, cbm_type_unknown());
+    }
 }
 
 /* ── Functions by QN ──────────────────────────────────────────────────
@@ -3409,8 +3500,8 @@ static void shadow_block_declarations(TSLSPContext *ctx, TSNode block) {
                 bind_unknown_pattern(ctx, name);
                 continue;
             }
-            if (!node_kind_is(stmt, "lexical_declaration") &&
-                !node_kind_is(stmt, "variable_declaration"))
+            /* A `var` belongs to the function (ts_hoist_vars). */
+            if (!node_kind_is(stmt, "lexical_declaration"))
                 continue;
             TSTreeCursor declarations = ts_tree_cursor_new(stmt);
             if (ts_tree_cursor_goto_first_child(&declarations)) {
@@ -3526,18 +3617,53 @@ static void ts_bind_pattern(TSLSPContext *ctx, TSNode pattern, const CBMType *ty
     ts_tree_cursor_delete(&cursor);
 }
 
+static const CBMType *ts_declarator_type(TSLSPContext *ctx, TSNode decl,
+                                         const CBMType **declared_out);
+
+/* True when the collector recorded this `var` declarator as a write of
+ * the binding its function hoists (ts_site_visit_var). */
+static bool ts_var_writes_hoisted(const TSLSPContext *ctx, TSNode decl) {
+    const struct TsAssignSites *sites = ctx->assign_sites;
+    TSNode name = ts_node_child_by_field_name(decl, "name", TS_LSP_FIELD_LEN("name"));
+    if (!sites || !sites->by_start || ts_node_is_null(name))
+        return false;
+    uint32_t start = ts_node_start_byte(name);
+    int lo = 0;
+    int hi = sites->count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (sites->by_start[mid]->start < start)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo < sites->count && sites->by_start[lo]->start < ts_node_end_byte(name);
+}
+
+/* A nested `var` declarator writes the binding of its function. A straight-
+ * line one gives the rest of its block the new type, as an assignment does. */
+static void ts_var_redeclare(TSLSPContext *ctx, TSNode decl, bool straight) {
+    TSNode name = ts_node_child_by_field_name(decl, "name", TS_LSP_FIELD_LEN("name"));
+    const CBMType *bound = ts_declarator_type(ctx, decl, NULL);
+    if (node_kind_is(name, "identifier")) {
+        ts_flow_write(ctx, node_text(ctx, name), bound, straight);
+        return;
+    }
+    ts_flow_write_pattern(ctx, name, 0);
+    if (straight)
+        ts_bind_pattern(ctx, name, bound, true, 0);
+}
+
 static bool ts_is_binding_pattern(TSNode node) {
     return node_kind_is(node, "object_pattern") || node_kind_is(node, "array_pattern") ||
            node_kind_is(node, "assignment_pattern") || node_kind_is(node, "rest_pattern");
 }
 
-static void bind_variable_declarator(TSLSPContext *ctx, TSNode decl, bool writable) {
-    TSNode name = ts_node_child_by_field_name(decl, "name", TS_LSP_FIELD_LEN("name"));
+/* The type a declarator gives its name: the annotation, else the value. */
+static const CBMType *ts_declarator_type(TSLSPContext *ctx, TSNode decl,
+                                         const CBMType **declared_out) {
     TSNode tann = ts_node_child_by_field_name(decl, "type", TS_LSP_FIELD_LEN("type"));
     TSNode value = ts_node_child_by_field_name(decl, "value", TS_LSP_FIELD_LEN("value"));
-    if (ts_node_is_null(name))
-        return;
-
     const CBMType *declared = NULL;
     if (!ts_node_is_null(tann)) {
         // type_annotation contains the actual type as a named child.
@@ -3547,7 +3673,17 @@ static void bind_variable_declarator(TSLSPContext *ctx, TSNode decl, bool writab
     }
     const CBMType *inferred =
         ts_node_is_null(value) ? cbm_type_unknown() : ts_eval_expr_type(ctx, value);
-    const CBMType *bound = (declared && !cbm_type_is_unknown(declared)) ? declared : inferred;
+    if (declared_out)
+        *declared_out = declared;
+    return (declared && !cbm_type_is_unknown(declared)) ? declared : inferred;
+}
+
+static void bind_variable_declarator(TSLSPContext *ctx, TSNode decl, bool writable) {
+    TSNode name = ts_node_child_by_field_name(decl, "name", TS_LSP_FIELD_LEN("name"));
+    if (ts_node_is_null(name))
+        return;
+    const CBMType *declared = NULL;
+    const CBMType *bound = ts_declarator_type(ctx, decl, &declared);
 
     if (node_kind_is(name, "identifier")) {
         char *nm = node_text(ctx, name);
@@ -3703,10 +3839,16 @@ void ts_process_statement(TSLSPContext *ctx, TSNode node) {
 
     if (strcmp(kind, "lexical_declaration") == 0 || strcmp(kind, "variable_declaration") == 0) {
         bool writable = ts_declaration_writable(ctx, node);
+        bool hoisted = strcmp(kind, "variable_declaration") == 0;
+        bool straight = node.id == ctx->straight_stmt;
         uint32_t nc = ts_node_named_child_count(node);
         for (uint32_t i = 0; i < nc; i++) {
             TSNode c = ts_node_named_child(node, i);
-            if (node_kind_is(c, "variable_declarator"))
+            if (!node_kind_is(c, "variable_declarator"))
+                continue;
+            if (hoisted && ts_var_writes_hoisted(ctx, c))
+                ts_var_redeclare(ctx, c, straight);
+            else
                 bind_variable_declarator(ctx, c, writable);
         }
     } else if (strcmp(kind, "for_in_statement") == 0 || strcmp(kind, "for_of_statement") == 0) {
@@ -3933,6 +4075,7 @@ static TsFnSave ts_enter_function(TSLSPContext *ctx, TSNode fn) {
     ctx->fn_scope = ctx->current_scope;
     ctx->fn_start = ts_node_start_byte(fn);
     ctx->fn_end = ts_node_end_byte(fn);
+    ts_hoist_vars(ctx);
     return saved;
 }
 
@@ -4978,6 +5121,7 @@ void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
     ctx->fn_scope = ctx->current_scope;
     ctx->fn_start = 0;
     ctx->fn_end = UINT32_MAX;
+    ts_hoist_vars(ctx);
     uint32_t count = 0;
     TSNode *children = collect_children(ctx->arena, root, &count);
     for (uint32_t i = 0; i < count; i++)
