@@ -36284,6 +36284,67 @@ TEST(pipeline_js_top_level_declaration_keeps_plain_name) {
     PASS();
 }
 
+/* `this` in an arrow function is the `this` of the method around it. A call
+ * `this.stop()` in a callback reaches the class's own method, never the
+ * same-name arrow of an object literal in another method (Adapter.handle.stop
+ * sorts before Adapter.stop, so a name-only guess picks it on a tie). In an
+ * index file the type-aware resolver gives no answer, so the name-based
+ * resolver must find the class itself. */
+TEST(pipeline_js_this_call_in_arrow_reaches_class_method) {
+    static const char *const files[] = {"main.ts", "pkg/index.ts", "pkg/index.js"};
+    static const char *const mods[] = {"main", "pkg", "pkg"};
+    bool ok = true;
+    for (int x = 0; x < 3; x++) {
+        char tmp[256] = "/tmp/cbm_js_this_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        const char *file = files[x];
+        write_temp_file(tmp, file,
+                        "export class Adapter {\n"
+                        "  start() {\n"
+                        "    const handle = { stop: async () => 1 };\n"
+                        "    return handle;\n"
+                        "  }\n"
+                        "  async stop(id) { return id; }\n"
+                        "  async shutdown() {\n"
+                        "    return [1, 2].map((id) => this.stop(id));\n"
+                        "  }\n"
+                        "  halt() { return this.stop(0); }\n"
+                        "}\n");
+        char db[512];
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        cbm_pipeline_t *p = js_twin_index(tmp, db);
+        ASSERT_NOT_NULL(p);
+        const char *project = cbm_pipeline_project_name(p);
+        char got[1024];
+        char want[256];
+        snprintf(want, sizeof(want), "%s.Adapter.handle.stop", mods[x]);
+        js_twin_qn_at(db, project, file, "stop", 3, got, sizeof(got));
+        ok = js_twin_expect(file, got, want) && ok;
+        static const int lines[] = {8, 10};
+        static const char *const callers[] = {"shutdown", "halt"};
+        for (int i = 0; i < 2; i++) {
+            snprintf(want, sizeof(want), "%s.Adapter.%s -> %s.Adapter.stop", mods[x], callers[i],
+                     mods[x]);
+            js_twin_calls_at(db, project, file, lines[i], got, sizeof(got));
+            if (!js_twin_expect(file, got, want)) {
+                ok = false;
+                js_twin_rows(db, project,
+                             "SELECT t.qualified_name, json_extract(e.properties, '$.strategy') "
+                             "FROM edges e JOIN nodes t ON t.id = e.target_id "
+                             "WHERE e.project = ?1 AND e.type = 'CALLS' "
+                             "AND json_extract(e.properties, '$.line') = ?2 AND ?3 = ?3 "
+                             "AND ?4 = ?4 ORDER BY 1",
+                             lines[i], file, NULL, true, got, sizeof(got));
+                fprintf(stderr, "  %s line %d strategy: [%s]\n", file, lines[i], got);
+            }
+        }
+        cbm_pipeline_free(p);
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 /* CBM_SEMANTIC_INDEX_VERSION 15: version 14 gave a JS/TS object method the
  * plain name of an exported function beside it and the export "#2". An index
  * it wrote is stale with no file changed, so the next run rebuilds it. */
@@ -36396,6 +36457,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_accessor_pairs_keep_their_calls);
     RUN_TEST(pipeline_js_twin_insert_incremental_equals_full);
     RUN_TEST(pipeline_js_top_level_declaration_keeps_plain_name);
+    RUN_TEST(pipeline_js_this_call_in_arrow_reaches_class_method);
     RUN_TEST(pipeline_js_twin_names_rebuild_old_index);
     RUN_TEST(pipeline_js_twin_callables_scale);
     RUN_TEST(pipeline_ts_caller_is_innermost_named_callable);

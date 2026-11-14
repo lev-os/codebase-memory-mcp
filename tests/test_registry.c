@@ -3575,6 +3575,65 @@ TEST(registry_resolve_lexical_walks_enclosing_defs_issue1548) {
     PASS();
 }
 
+/* JS/TS `this.name()` names a member of the class around the caller. With no
+ * type-aware answer, the nearest class around the caller in its own file
+ * that declares `name` holds the target, before a name-only guess that a
+ * same-name callable nested in another method wins on a tie
+ * (Adapter.handle.stop sorts before Adapter.stop). An inherited member, a
+ * longer path, a caller outside a class, an object literal on the way (its
+ * `this` can be the literal) and other languages leave the call to the
+ * other strategies. */
+TEST(registry_js_this_call_reaches_enclosing_class_member) {
+    cbm_registry_t *r = cbm_registry_new();
+    static const char *const defs[][3] = {
+        {"Adapter", "proj.pkg.Adapter", "Class"},
+        {"start", "proj.pkg.Adapter.start", "Method"},
+        {"stop", "proj.pkg.Adapter.handle.stop", "Function"},
+        {"stop", "proj.pkg.Adapter.stop", "Method"},
+        {"shutdown", "proj.pkg.Adapter.shutdown", "Method"},
+        {"helper", "proj.pkg.helper", "Function"},
+    };
+    for (size_t i = 0; i < sizeof(defs) / sizeof(defs[0]); i++) {
+        cbm_registry_add_lang(r, defs[i][0], defs[i][1], defs[i][2], CBM_LANG_TYPESCRIPT, false);
+    }
+    /* pkg/index.ts: the module QN keeps `index`, its symbols drop it. */
+    static const char *const mods[] = {"proj.pkg.index", "proj.pkg"};
+    static const CBMLanguage langs[] = {CBM_LANG_TYPESCRIPT, CBM_LANG_JAVASCRIPT, CBM_LANG_TSX};
+    for (int m = 0; m < 2; m++) {
+        for (int l = 0; l < 3; l++) {
+            cbm_resolution_t res =
+                cbm_registry_resolve_call_scoped(r, "this.stop", mods[m], NULL, NULL, 0, langs[l],
+                                                 "proj.pkg.Adapter.shutdown", false);
+            ASSERT_STR_EQ(res.qualified_name, "proj.pkg.Adapter.stop");
+            ASSERT_STR_EQ(res.strategy, "this_member");
+        }
+    }
+    static const struct {
+        const char *callee;
+        const char *caller;
+        CBMLanguage lang;
+    } others[] = {
+        {"this.missing", "proj.pkg.Adapter.shutdown", CBM_LANG_TYPESCRIPT},
+        {"this.handle.stop", "proj.pkg.Adapter.shutdown", CBM_LANG_TYPESCRIPT},
+        {"this.stop", "proj.pkg.helper", CBM_LANG_TYPESCRIPT},
+        {"this.start", "proj.pkg.Adapter.handle.stop", CBM_LANG_TYPESCRIPT},
+        {"this.stop", "proj.pkg.Adapter.shutdown", CBM_LANG_JAVA},
+        {"stop", "proj.pkg.Adapter.shutdown", CBM_LANG_TYPESCRIPT},
+    };
+    for (size_t i = 0; i < sizeof(others) / sizeof(others[0]); i++) {
+        cbm_resolution_t res =
+            cbm_registry_resolve_call_scoped(r, others[i].callee, "proj.pkg.index", NULL, NULL, 0,
+                                             others[i].lang, others[i].caller, false);
+        if (res.strategy && strcmp(res.strategy, "this_member") == 0) {
+            fprintf(stderr, "  %s from %s: this_member %s\n", others[i].callee, others[i].caller,
+                    res.qualified_name);
+            FAIL("this_member answered a call it does not own");
+        }
+    }
+    cbm_registry_free(r);
+    PASS();
+}
+
 /* A package __init__.py function can share a submodule's QN: poetry's
  * layouts/__init__.py `def layout` is proj.pkg.layout, the QN prefix of every
  * symbol in layouts/layout.py. Bounded at its own file, class Layout and its
@@ -3828,6 +3887,7 @@ SUITE(registry) {
     RUN_TEST(go_suppress_keeps_typed_and_import_aware_matches);
     RUN_TEST(registry_python_function_local_is_exact_only_issue1548);
     RUN_TEST(registry_resolve_lexical_walks_enclosing_defs_issue1548);
+    RUN_TEST(registry_js_this_call_reaches_enclosing_class_member);
     RUN_TEST(registry_python_local_bound_at_own_file_issue1548);
     RUN_TEST(fqn_symbol_prefix_len_matches_fqn_compute);
     RUN_TEST(registry_receiver_chain_filters_before_closest_pick);
