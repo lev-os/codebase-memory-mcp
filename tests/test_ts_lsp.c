@@ -5470,6 +5470,78 @@ TEST(tslsp_unknown_generic_lookup_work_is_linear) {
     PASS();
 }
 
+/* A named receiver the registry does not hold. Each call must cost a hashed
+ * probe, not a scan of every registered function: four times the
+ * declarations and calls must not multiply registry visits sixteenfold. */
+static uint64_t ts_unknown_named_work(int count, bool *no_edge) {
+    *no_edge = false;
+    size_t cap = (size_t)count * 128 + 512;
+    char *source = malloc(cap);
+    if (!source)
+        return 0;
+    int off = snprintf(source, cap, "class Decoy { deliver() {} }\n");
+    for (int i = 0; i < count; i++)
+        off += snprintf(source + off, cap - (size_t)off, "function padding%d() {}\n", i);
+    off += snprintf(source + off, cap - (size_t)off, "function probe(value: Missing) {\n");
+    for (int i = 0; i < count; i++)
+        off += snprintf(source + off, cap - (size_t)off, "value.deliver();\n");
+    snprintf(source + off, cap - (size_t)off, "}\n");
+    (void)cbm_lsp_work_take();
+    CBMFileResult *r = extract_ts(source);
+    uint64_t work = cbm_lsp_work_take();
+    if (r) {
+        *no_edge = find_resolved(r, ".probe", ".deliver") < 0;
+        cbm_free_result(r);
+    }
+    free(source);
+    return work;
+}
+
+TEST(tslsp_unknown_named_lookup_work_is_linear) {
+    bool small_unknown, large_unknown;
+    uint64_t small = ts_unknown_named_work(256, &small_unknown);
+    uint64_t large = ts_unknown_named_work(1024, &large_unknown);
+    fprintf(stderr, "unknown named registry visits: 256=%llu 1024=%llu\n",
+            (unsigned long long)small, (unsigned long long)large);
+    ASSERT_TRUE(small_unknown);
+    ASSERT_TRUE(large_unknown);
+    ASSERT_GT(small, 0);
+    ASSERT_LTE(large, small * 6);
+    PASS();
+}
+
+/* Deeply nested callbacks: the statement walk stops at the walk-depth cap
+ * instead of recursing once per level until the stack runs out. Calls
+ * outside the deep nest still resolve. */
+TEST(tslsp_nested_callback_walk_is_bounded) {
+    const int levels = 1000;
+    size_t cap = (size_t)levels * 16 + 256;
+    char *source = malloc(cap);
+    ASSERT_NOT_NULL(source);
+    int off = snprintf(source, cap,
+                       "class Port { send() {} }\n"
+                       "function run(cb: () => void): void {}\n"
+                       "const port = new Port();\n"
+                       "function outer() { port.send(); }\n");
+    for (int i = 0; i < levels; i++)
+        off += snprintf(source + off, cap - (size_t)off, "run(() => ");
+    off += snprintf(source + off, cap - (size_t)off, "port.send()");
+    for (int i = 0; i < levels; i++)
+        off += snprintf(source + off, cap - (size_t)off, ")");
+    snprintf(source + off, cap - (size_t)off, ";\n");
+    CBMFileResult *r = extract_ts(source);
+    free(source);
+    ASSERT_NOT_NULL(r);
+    int depth = cbm_ts_lsp_test_max_walk_depth();
+    fprintf(stderr, "nested callback walk depth: %d, cap %d\n", depth, cbm_lsp_max_walk_depth());
+    bool outer = find_resolved(r, ".outer", ".Port.send") >= 0;
+    cbm_free_result(r);
+    ASSERT_TRUE(outer);
+    ASSERT_GT(depth, 0);
+    ASSERT_LTE(depth, cbm_lsp_max_walk_depth());
+    PASS();
+}
+
 /* One expected `.send` record per source line: the exact target, or none.
  * A line with no expectation in `cases` is not checked. */
 typedef struct {
@@ -5681,6 +5753,8 @@ TEST(tslsp_union_receiver_needs_one_target) {
 }
 
 SUITE(ts_lsp) {
+    RUN_TEST(tslsp_unknown_named_lookup_work_is_linear);
+    RUN_TEST(tslsp_nested_callback_walk_is_bounded);
     RUN_TEST(tslsp_union_receiver_needs_one_target);
     RUN_TEST(tslsp_var_hoists_to_function_scope);
     RUN_TEST(tslsp_destructured_names_shadow_outer_receiver);

@@ -68,6 +68,7 @@ static _Thread_local bool g_ts_type_budget_warned;
 static _Thread_local unsigned long g_ts_signature_lookup_work;
 static _Thread_local int g_ts_max_member_lookup_steps;
 static _Thread_local int g_ts_max_method_lookup_steps;
+static _Thread_local int g_ts_max_walk_depth;
 #endif
 
 static void ts_type_budget_reset(size_t source_len) {
@@ -183,6 +184,10 @@ bool cbm_ts_lsp_test_budget_warned(void) {
 unsigned long cbm_ts_lsp_test_signature_lookup_work(void) {
     return g_ts_signature_lookup_work;
 }
+int cbm_ts_lsp_test_max_walk_depth(void) {
+    return g_ts_max_walk_depth;
+}
+
 int cbm_ts_lsp_test_max_member_lookup_steps(void) {
     return g_ts_max_member_lookup_steps;
 }
@@ -4632,9 +4637,25 @@ static void process_namespace_member(TSLSPContext *ctx, TSNode node) {
     process_node(ctx, node);
 }
 
+static void process_node_inner(TSLSPContext *ctx, TSNode node);
+
+/* Depth-guarded entry for the statement walk. Each nested callback, block or
+ * expression recurses once, so a deeply nested file could overflow the native
+ * stack. Past CBM_LSP_MAX_WALK_DEPTH the subtree is skipped and its calls stay
+ * unresolved (see resolve_calls_in_node in go_lsp.c). */
 static void process_node(TSLSPContext *ctx, TSNode node) {
-    if (!ctx || ts_node_is_null(node))
+    if (!ctx || ts_node_is_null(node) || ctx->walk_depth >= cbm_lsp_max_walk_depth())
         return;
+    ctx->walk_depth++;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (ctx->walk_depth > g_ts_max_walk_depth)
+        g_ts_max_walk_depth = ctx->walk_depth;
+#endif
+    process_node_inner(ctx, node);
+    ctx->walk_depth--;
+}
+
+static void process_node_inner(TSLSPContext *ctx, TSNode node) {
     const char *kind = ts_node_type(node);
 
     /* A nested statement block owns `let`/`const` declarations. Function-body
@@ -5222,6 +5243,7 @@ void ts_lsp_init(TSLSPContext *ctx, CBMArena *arena, const char *source, int sou
     g_ts_signature_lookup_work = 0;
     g_ts_max_member_lookup_steps = 0;
     g_ts_max_method_lookup_steps = 0;
+    g_ts_max_walk_depth = 0;
 #endif
     memset(ctx, 0, sizeof(TSLSPContext));
     ctx->arena = arena;
@@ -7289,7 +7311,17 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     apply_jsdoc_signatures(&ctx, root, &reg);
     infer_implicit_returns(&ctx, root, &reg);
 
+    /* Hash-index the registry before the walk. Unfinalized, each method or
+     * type lookup scanned the stdlib and every definition of the file, so a
+     * file of n calls and n definitions cost n * n. The index answers each
+     * duplicated name with its first registration, as the scan did. The
+     * index lives in a scratch arena that dies with this call. */
+    CBMArena idx_arena;
+    cbm_arena_init(&idx_arena);
+    reg.index_first_registered = true;
+    cbm_registry_finalize_into(&reg, &idx_arena);
     ts_lsp_process_file(&ctx, root);
+    cbm_arena_destroy(&idx_arena);
 }
 
 // ── Cross-file entry point (Phase 3) ──────────────────────────────────────────

@@ -92,6 +92,7 @@ typedef struct {
     const void *straight_stmt;    // statement a block loop is visiting (TSNode.id)
     unsigned long flow_reads;     // reads of flow bindings; blocks the eval memo
     bool flow_walk;               // true only during the statement walk
+    int walk_depth;               // process_node nesting (cbm_lsp_max_walk_depth)
 } TSLSPContext;
 
 #ifdef CBM_ENABLE_TEST_SEAMS
@@ -108,6 +109,8 @@ int cbm_ts_lsp_test_walk_pending_count(int top, uint32_t count);
 // including attempts rejected by the depth or visited-type guard.
 int cbm_ts_lsp_test_max_member_lookup_steps(void);
 int cbm_ts_lsp_test_max_method_lookup_steps(void);
+// Deepest statement-walk nesting during the last TS LSP run on this thread.
+int cbm_ts_lsp_test_max_walk_depth(void);
 #endif
 
 // --- Initialization ---
