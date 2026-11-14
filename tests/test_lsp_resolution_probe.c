@@ -1884,6 +1884,101 @@ TEST(lrp_ts_barrel_parallel_resolver) {
     PASS();
 }
 
+/* A value exported through a barrel. `export const init = new Builder()` and
+ * `export const svc = new Service()` live in the modules that declare their
+ * classes; barrels re-export them by `export *` and by `export { init } from`,
+ * one and two hops away. A member call `init.create()` binds through the
+ * module that defines the value, as a direct import of that module does, and
+ * reaches Builder.create. A decoy class elsewhere declares the same methods,
+ * so a name guess cannot pass. `pad` extra files push the fixture past the
+ * 50-file threshold of the parallel resolver. Returns the number of wrong
+ * counts (0 when every call binds as expected), or -1 when indexing fails. */
+static int lrp_ts_barrel_value_member_calls(int pad) {
+    enum { MAXF = 16 + 64 };
+    LRP_File f[MAXF];
+    static char names[MAXF][64];
+    static char bodies[MAXF][192];
+    int n = 0;
+#define LRP_ADD(path, ...)                                   \
+    do {                                                     \
+        snprintf(names[n], sizeof(names[n]), "%s", path);    \
+        snprintf(bodies[n], sizeof(bodies[n]), __VA_ARGS__); \
+        f[n].name = names[n];                                \
+        f[n].content = bodies[n];                            \
+        n++;                                                 \
+    } while (0)
+    LRP_ADD("src/core/init.ts", "export class Builder {\n"
+                                "  create(): number { return 1; }\n"
+                                "}\n"
+                                "export const init = new Builder();\n");
+    LRP_ADD("src/core/service.ts", "export class Service {\n"
+                                   "  run(): number { return 2; }\n"
+                                   "}\n"
+                                   "export const svc = new Service();\n");
+    LRP_ADD("src/api/index.ts", "export * from '../core/init';\n"
+                                "export * from '../core/service';\n");
+    LRP_ADD("src/api/named.ts", "export { init } from '../core/init';\n");
+    LRP_ADD("src/outer/index.ts", "export * from '../api';\n");
+    LRP_ADD("src/outer/named.ts", "export { init } from '../api/named';\n");
+    LRP_ADD("src/decoy/decoy.ts", "export class Decoy {\n"
+                                  "  create(): number { return 9; }\n"
+                                  "  run(): number { return 8; }\n"
+                                  "}\n");
+    LRP_ADD("src/app/star1.ts", "import { init } from '../api';\n"
+                                "export function viaStar(): number { return init.create(); }\n");
+    LRP_ADD("src/app/named1.ts", "import { init } from '../api/named';\n"
+                                 "export function viaNamed(): number { return init.create(); }\n");
+    LRP_ADD("src/app/star2.ts", "import { init } from '../outer';\n"
+                                "export function viaStarTwo(): number { return init.create(); }\n");
+    LRP_ADD("src/app/named2.ts",
+            "import { init } from '../outer/named';\n"
+            "export function viaNamedTwo(): number { return init.create(); }\n");
+    LRP_ADD("src/app/svc.ts", "import { svc } from '../api';\n"
+                              "export function viaSvc(): number { return svc.run(); }\n");
+    for (int i = 0; i < pad && n < MAXF; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "src/pad/p%d.ts", i);
+        LRP_ADD(path, "export function pad%d(): number { return %d; }\n", i, i);
+    }
+#undef LRP_ADD
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, n);
+    if (!store) {
+        lrp_cleanup(&lp, store);
+        return -1;
+    }
+    static const char *const callers[] = {"star1.viaStar", "named1.viaNamed", "star2.viaStarTwo",
+                                          "named2.viaNamedTwo"};
+    int wrong = 0;
+    printf("  [ts/barrel-value files=%d]", n);
+    for (size_t i = 0; i < sizeof(callers) / sizeof(callers[0]); i++) {
+        int hit = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", callers[i],
+                                              "core.init.Builder.create");
+        int decoy = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", callers[i],
+                                                "decoy.Decoy.create");
+        printf(" %s=%d/%d", callers[i], hit, decoy);
+        wrong += (hit != 1) + (decoy != 0);
+    }
+    int svc = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "svc.viaSvc",
+                                          "core.service.Service.run");
+    int svc_decoy =
+        lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "svc.viaSvc", "decoy.Decoy.run");
+    printf(" svc=%d/%d\n", svc, svc_decoy);
+    wrong += (svc != 1) + (svc_decoy != 0);
+    lrp_cleanup(&lp, store);
+    return wrong;
+}
+
+TEST(lrp_ts_barrel_value_member_calls_sequential) {
+    ASSERT_EQ(lrp_ts_barrel_value_member_calls(0), 0);
+    PASS();
+}
+
+TEST(lrp_ts_barrel_value_member_calls_parallel) {
+    ASSERT_EQ(lrp_ts_barrel_value_member_calls(60), 0);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  * ─── GROUP 7: JAVA (lsp_cross NOT WIRED) ─────────────────────────────
  * ══════════════════════════════════════════════════════════════════════
@@ -2586,6 +2681,8 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_ts_barrel_long_star_chain_binds_definition);
     RUN_TEST(lrp_ts_reexport_binds_no_local_name);
     RUN_TEST(lrp_ts_barrel_parallel_resolver);
+    RUN_TEST(lrp_ts_barrel_value_member_calls_sequential);
+    RUN_TEST(lrp_ts_barrel_value_member_calls_parallel);
 
     /* ── Java (lsp_cross NOT WIRED) — S1 GREEN, S2–S8 RED reproductions ── */
     RUN_TEST(lrp_java_s1_crossfile_call);

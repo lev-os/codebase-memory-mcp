@@ -1974,6 +1974,37 @@ static const cbm_gbuf_node_t *pxc_ts_barrel_def(const cbm_gbuf_t *gbuf, const CB
     return r && r->def_id ? cbm_gbuf_find_by_id(gbuf, r->def_id) : NULL;
 }
 
+/* The import-map value of a JS/TS binding that a barrel answers, else NULL
+ * (the binding keeps the barrel as its target). A function or a type replaces
+ * the binding: a call or an annotation names it. Any other value (`export
+ * const svc = new Service()`) binds to the module that defines it, as a
+ * direct import of that module does, so `svc.run()` resolves through that
+ * module's members. That module is the QN prefix of the value's top-level
+ * symbol (for an index file, its folder). */
+static char *pxc_ts_barrel_value_qn(const cbm_gbuf_t *gbuf, const char *project_name,
+                                    const CBMFileResult *result, const char *local,
+                                    const cbm_gbuf_node_t *target) {
+    const cbm_gbuf_node_t *def = pxc_ts_barrel_def(gbuf, result, local, target);
+    if (!def || !def->qualified_name || !def->label) {
+        return NULL;
+    }
+    if (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0 ||
+        cbm_label_is_type_like(def->label)) {
+        return strdup(def->qualified_name);
+    }
+    size_t len =
+        def->file_path ? cbm_pipeline_fqn_symbol_prefix_len(project_name, def->file_path) : 0;
+    if (len == 0 || len >= strlen(def->qualified_name) || def->qualified_name[len] != '.') {
+        return NULL;
+    }
+    char *module_qn = (char *)malloc(len + 1);
+    if (module_qn) {
+        memcpy(module_qn, def->qualified_name, len);
+        module_qn[len] = '\0';
+    }
+    return module_qn;
+}
+
 static bool pxc_import_map_has_local(const char *const *keys, int count, const char *local_name) {
     if (!keys || !local_name)
         return false;
@@ -2267,16 +2298,16 @@ int cbm_pxc_build_import_map_ex(const cbm_gbuf_t *gbuf, const char *project_name
         bool binds = include_type_only ||
                      cbm_imports_local_binds_runtime_name(result ? &result->imports : NULL, local);
         /* JS/TS: a Module that defines the member keeps its own QN; a barrel
-         * that only re-exports it stands for the definition it reaches. The
-         * answer was computed once for the pass (cbm_pxc_ts_barrels_resolve). */
-        const cbm_gbuf_node_t *value_node = target;
+         * that only re-exports it stands for what it reaches
+         * (pxc_ts_barrel_value_qn). The answer was computed once for the pass
+         * (cbm_pxc_ts_barrels_resolve). */
+        char *value = NULL;
         if (binds && pxc_is_js_family(lang)) {
-            const cbm_gbuf_node_t *def = pxc_ts_barrel_def(gbuf, result, local, target);
-            if (def) {
-                value_node = def;
-            }
+            value = pxc_ts_barrel_value_qn(gbuf, project_name, result, local, target);
         }
-        char *value = binds ? pxc_import_value_qn(lang, result, local, value_node) : NULL;
+        if (binds && !value) {
+            value = pxc_import_value_qn(lang, result, local, target);
+        }
         if (!value) {
             free(local);
             continue;
