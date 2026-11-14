@@ -10082,6 +10082,13 @@ static int pipeline_exact_inputs_migrate_metadata_and_mode(int legacy_version) {
     cbm_store_close(metadata_store);
 
     cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *exact_after_migration = cbm_pipeline_new(tmp, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(exact_after_migration);
+    ASSERT_EQ(cbm_pipeline_run(exact_after_migration), 0);
+    cbm_incremental_route_t exact_after_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(exact_after_migration);
+
+    cbm_pipeline_incremental_test_reset_faults();
     cbm_pipeline_t *mode_change = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(mode_change);
     ASSERT_EQ(cbm_pipeline_run(mode_change), 0);
@@ -10113,6 +10120,7 @@ static int pipeline_exact_inputs_migrate_metadata_and_mode(int legacy_version) {
     ASSERT_EQ(migrated_version, CBM_SEMANTIC_INDEX_VERSION);
     ASSERT_TRUE(migrated_hashes_complete);
     ASSERT_STR_EQ(migrated_mode, "fast");
+    ASSERT_EQ(exact_after_route, CBM_INCREMENTAL_ROUTE_NOOP);
     ASSERT_EQ(mode_change_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     ASSERT_EQ(full_version, CBM_SEMANTIC_INDEX_VERSION);
     ASSERT_TRUE(full_hashes_complete);
