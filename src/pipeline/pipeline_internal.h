@@ -1806,8 +1806,11 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *  20: TS type imports preserve qualification and local type shadowing;
  *      generic instances use the exact receiver method index. Unchanged
  *      files rebuild once to gain their typed-receiver call edges.
+ *  21: TS/JS receivers follow reassignment, destructuring and var hoisting,
+ *      and a union receiver needs one shared declaration. Unchanged files
+ *      rebuild once to drop unproven typed-receiver call edges.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 20 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 21 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
