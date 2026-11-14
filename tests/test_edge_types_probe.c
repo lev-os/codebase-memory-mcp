@@ -1883,7 +1883,9 @@ TEST(handles_rust_handler_in_verb_combinator_issue2883) {
          "fn post(handler: fn()) -> fn() {\n    handler\n}\n\n"
          "fn main() {\n"
          "    axum_route(\"/v1/responses\", post(api::responses::handle));\n}\n"}};
-    static const EtHandles handles[] = {{"responses.handle", "/v1/responses"}, {NULL, NULL}};
+    /* The extractor names a function of an inline `mod` by its file only
+     * (axum_app.handle); the one HANDLES edge must reach it. */
+    static const EtHandles handles[] = {{"axum_app.handle", "/v1/responses"}, {NULL, NULL}};
     for (int parallel = 0; parallel <= 1; parallel++) {
         ASSERT_TRUE(et_handles_exact(f, 1, handles, parallel));
     }
