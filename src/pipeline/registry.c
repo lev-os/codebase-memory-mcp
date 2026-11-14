@@ -2324,34 +2324,36 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
     return empty_result();
 }
 
-/* Exact same-module lookup without ever hashing a truncated candidate. The
- * long path uses the canonical short-name bucket, not heuristic name limits. */
+/* The stored exact-table key `scope[0..scope_len)`.`name`, or NULL when no
+ * definition holds it. A key longer than the stack buffer is built on the
+ * heap, so an exact lookup never falls back to a by-name bucket: a callable
+ * registered by qualified name only (a function-local twin, a generated
+ * member) is in none. */
+static const char *registry_exact_join(const cbm_registry_t *r, const char *scope, size_t scope_len,
+                                       const char *name) {
+    size_t name_len = strlen(name);
+    size_t need = scope_len + SKIP_ONE + name_len + SKIP_ONE;
+    char small[CBM_SZ_512];
+    char *key = need <= sizeof(small) ? small : malloc(need);
+    if (!key) {
+        return NULL;
+    }
+    memcpy(key, scope, scope_len);
+    key[scope_len] = '.';
+    memcpy(key + scope_len + SKIP_ONE, name, name_len + SKIP_ONE);
+    const char *stored_key = cbm_ht_get_key(r->exact, key);
+    if (key != small) {
+        free(key);
+    }
+    return stored_key;
+}
+
+/* Exact same-module lookup without ever hashing a truncated candidate. */
 static const char *same_module_candidate(const cbm_registry_t *r, const char *module_qn,
                                          size_t scope_len, const char *name) {
     if (!module_qn || !name)
         return NULL;
-    size_t name_len = strlen(name);
-    char candidate[CBM_SZ_512];
-    if (scope_len < sizeof(candidate) && name_len < sizeof(candidate) - scope_len - 1) {
-        memcpy(candidate, module_qn, scope_len);
-        candidate[scope_len] = '.';
-        memcpy(candidate + scope_len + 1, name, name_len + 1);
-        return cbm_ht_get_key(r->exact, candidate);
-    }
-    qn_array_t *arr = (qn_array_t *)cbm_ht_get(r->by_name, simple_name(name));
-    if (!arr)
-        return NULL;
-    for (int i = 0; i < arr->count; i++) {
-        const char *qn = arr->items[i];
-        if (!qn)
-            continue;
-        size_t qn_len = strlen(qn);
-        if (qn_len > scope_len && qn_len - scope_len - 1 == name_len &&
-            memcmp(qn, module_qn, scope_len) == 0 && qn[scope_len] == '.' &&
-            memcmp(qn + scope_len + 1, name, name_len) == 0)
-            return qn;
-    }
-    return NULL;
+    return registry_exact_join(r, module_qn, scope_len, name);
 }
 
 /* Strategy 2: Same-module match. Scoring elsewhere retains the raw file QN. */

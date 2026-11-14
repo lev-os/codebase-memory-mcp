@@ -391,6 +391,38 @@ TEST(resolve_same_module) {
     PASS();
 }
 
+/* A callable registered by qualified name only (a function-local JS/TS
+ * twin, a generated member) is in no by-name bucket. A call in its own module
+ * reaches it by the exact same-module key, however long module + callee is. */
+TEST(resolve_same_module_qn_only_any_length) {
+    static const size_t lens[] = {16, 600, 2000};
+    for (size_t i = 0; i < sizeof(lens) / sizeof(lens[0]); i++) {
+        size_t n = lens[i];
+        char *module_qn = malloc(n + 32);
+        char *qn = malloc(n + 64);
+        ASSERT_NOT_NULL(module_qn);
+        ASSERT_NOT_NULL(qn);
+        memcpy(module_qn, "proj.", 5);
+        memset(module_qn + 5, 'd', n);
+        memcpy(module_qn + 5 + n, ".obs", 5);
+        snprintf(qn, n + 64, "%s.observable.iterator.next", module_qn);
+        cbm_registry_t *r = cbm_registry_new();
+        cbm_registry_add_qn_only(r, qn, "Method");
+        cbm_resolution_t res =
+            cbm_registry_resolve(r, "observable.iterator.next", module_qn, NULL, NULL, 0);
+        if (!res.qualified_name || strcmp(res.qualified_name, qn) != 0) {
+            fprintf(stderr, "  module of %zu bytes: got %s\n", strlen(module_qn),
+                    res.qualified_name ? res.qualified_name : "(none)");
+        }
+        ASSERT_STR_EQ(res.qualified_name, qn);
+        ASSERT_STR_EQ(res.strategy, "same_module");
+        cbm_registry_free(r);
+        free(module_qn);
+        free(qn);
+    }
+    PASS();
+}
+
 /* #1128: these cases moved from the strategy chain to the call-site guard (the
  * review of 2026-10-19). The chain stays unchanged - it also resolves type
  * references, field types, reads/writes, SQL lineage and the cross-LSP pass for
@@ -3787,6 +3819,7 @@ SUITE(registry) {
     RUN_TEST(registry_no_duplicates);
     /* Resolution */
     RUN_TEST(resolve_same_module);
+    RUN_TEST(resolve_same_module_qn_only_any_length);
     RUN_TEST(resolve_same_module_only_on_self_receiver);
     RUN_TEST(suppress_same_module_bound_receiver_binding_facts);
     RUN_TEST(resolve_qualified_disambiguates_same_name);
