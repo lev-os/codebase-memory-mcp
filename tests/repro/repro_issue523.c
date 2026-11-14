@@ -121,6 +121,25 @@ static const RFile server_files[] = {
 };
 enum { N_SERVER_FILES = (int)(sizeof(server_files) / sizeof(server_files[0])) };
 
+/* The matcher opens both projects in one cache, just as the real MCP host
+ * does. Restore the caller's cache after each match. */
+static cbm_cross_repo_result_t cr536_match(RProj *source, RProj *target) {
+    const char *prior = getenv("CBM_CACHE_DIR");
+    char *saved = prior ? cbm_strdup(prior) : NULL;
+    if (prior && !saved)
+        return (cbm_cross_repo_result_t){0};
+    cbm_setenv("CBM_CACHE_DIR", source->cachedir, 1);
+    const char *target_project = target->project;
+    cbm_cross_repo_result_t result = cbm_cross_repo_match(source->project, &target_project, 1);
+    if (saved) {
+        cbm_setenv("CBM_CACHE_DIR", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    return result;
+}
+
 /* ── Reproduction test ───────────────────────────────────────────────────── */
 
 /*
@@ -156,7 +175,7 @@ TEST(repro_issue523_crossrepo_http_calls_edge) {
 
     /* ── Index server service ─────────────────────────────────── */
     RProj server;
-    cbm_store_t *server_store = rh_index_files(&server, server_files, N_SERVER_FILES);
+    cbm_store_t *server_store = rh_index_files_in_cache(&server, server_files, N_SERVER_FILES, client.cachedir);
     ASSERT_NOT_NULL(server_store);
 
     int server_routes = rh_count_label(server_store, server.project, "Route");
@@ -177,15 +196,14 @@ TEST(repro_issue523_crossrepo_http_calls_edge) {
     /* ── Cross-repo match ─────────────────────────────────────── */
     /*
      * cbm_cross_repo_match opens both project DBs from the cache directory
-     * (the same $HOME/.cache/codebase-memory-mcp/<project>.db paths that
-     * rh_open_indexed wrote).  It iterates HTTP_CALLS edges in the client DB
+     * (the shared private cache populated by
+     * rh_index_files_in_cache).  It iterates HTTP_CALLS edges in the client DB
      * and looks for matching Route QNs in the server DB.
      *
      * Correct: http_edges >= 1 (at least one edge for /api/orders/{id}).
      * Buggy:   http_edges == 0 (no HTTP_CALLS in client → nothing to match).
      */
-    const char *server_project = server.project;
-    cbm_cross_repo_result_t result = cbm_cross_repo_match(client.project, &server_project, 1);
+    cbm_cross_repo_result_t result = cr536_match(&client, &server);
 
     fprintf(stderr,
             "  [523] cross_repo http_edges=%d  "
@@ -193,8 +211,8 @@ TEST(repro_issue523_crossrepo_http_calls_edge) {
             result.http_edges);
 
     /* ── Cleanup ──────────────────────────────────────────────── */
-    rh_cleanup(&client, NULL);
     rh_cleanup(&server, NULL);
+    rh_cleanup(&client, NULL);
     cbm_cross_repo_result_free(&result);
 
     /*
@@ -255,7 +273,8 @@ static bool cr536_setup(RProj *client, const char *client_py, RProj *server,
     int client_http = rh_count_edges(cs, client->project, "HTTP_CALLS");
     cbm_store_close(cs);
 
-    cbm_store_t *ss = rh_index(server, "server/app.py", server_py);
+    const RFile server_file = {"server/app.py", server_py};
+    cbm_store_t *ss = rh_index_files_in_cache(server, &server_file, 1, client->cachedir);
     if (!ss) {
         return false;
     }
@@ -270,7 +289,7 @@ static bool cr536_setup(RProj *client, const char *client_py, RProj *server,
 /* Count CROSS_HTTP_CALLS rows in a project DB (re-opened from the cache dir,
  * because cbm_cross_repo_match wrote through its own store handles). */
 static int cr536_count_cross(RProj *proj) {
-    cbm_store_t *st = cbm_store_open_path(proj->dbpath);
+    cbm_store_t *st = cbm_store_open_path_query(proj->dbpath);
     if (!st) {
         return -1;
     }
@@ -305,17 +324,16 @@ TEST(repro_issue523_scheme_stripped_url_match) {
                           "    \"\"\"Return all orders.\"\"\"\n"
                           "    return jsonify({\"orders\": []})\n");
     if (!ok) {
-        rh_cleanup(&client, NULL);
         rh_cleanup(&server, NULL);
+        rh_cleanup(&client, NULL);
         FAIL("fixture precondition failed (client HTTP_CALLS / server Route missing)");
     }
 
-    const char *tgt = server.project;
-    cbm_cross_repo_result_t r = cbm_cross_repo_match(client.project, &tgt, 1);
+    cbm_cross_repo_result_t r = cr536_match(&client, &server);
     fprintf(stderr, "  [523] full-URL url_path: http_edges=%d (expected>=1)\n", r.http_edges);
 
-    rh_cleanup(&client, NULL);
     rh_cleanup(&server, NULL);
+    rh_cleanup(&client, NULL);
     cbm_cross_repo_result_free(&r);
     ASSERT_GTE(r.http_edges, 1);
     PASS();
@@ -346,17 +364,16 @@ TEST(repro_issue523_template_fuzzy_match) {
                           "    \"\"\"Return one order by id.\"\"\"\n"
                           "    return jsonify({\"id\": order_id})\n");
     if (!ok) {
-        rh_cleanup(&client, NULL);
         rh_cleanup(&server, NULL);
+        rh_cleanup(&client, NULL);
         FAIL("fixture precondition failed (client HTTP_CALLS / server Route missing)");
     }
 
-    const char *tgt = server.project;
-    cbm_cross_repo_result_t r = cbm_cross_repo_match(client.project, &tgt, 1);
+    cbm_cross_repo_result_t r = cr536_match(&client, &server);
     fprintf(stderr, "  [523] concrete-vs-template: http_edges=%d (expected>=1)\n", r.http_edges);
 
-    rh_cleanup(&client, NULL);
     rh_cleanup(&server, NULL);
+    rh_cleanup(&client, NULL);
     cbm_cross_repo_result_free(&r);
     ASSERT_GTE(r.http_edges, 1);
     PASS();
@@ -387,20 +404,19 @@ TEST(repro_issue523_reverse_direction_match) {
                           "    \"\"\"Return service status.\"\"\"\n"
                           "    return jsonify({\"status\": \"ok\"})\n");
     if (!ok) {
-        rh_cleanup(&client, NULL);
         rh_cleanup(&server, NULL);
+        rh_cleanup(&client, NULL);
         FAIL("fixture precondition failed (client HTTP_CALLS / server Route missing)");
     }
 
     /* Provider indexed the match run: server is SRC, client is TGT. */
-    const char *tgt = client.project;
-    cbm_cross_repo_result_t r = cbm_cross_repo_match(server.project, &tgt, 1);
+    cbm_cross_repo_result_t r = cr536_match(&server, &client);
     int client_cross = cr536_count_cross(&client);
     fprintf(stderr, "  [523] provider-side run: http_edges=%d client CROSS_HTTP_CALLS=%d\n",
             r.http_edges, client_cross);
 
-    rh_cleanup(&client, NULL);
     rh_cleanup(&server, NULL);
+    rh_cleanup(&client, NULL);
     cbm_cross_repo_result_free(&r);
     ASSERT_GTE(r.http_edges, 1);
     ASSERT_GTE(client_cross, 1);
@@ -437,25 +453,23 @@ TEST(repro_issue523_idempotent_cross_edges) {
                           "    \"\"\"Return health.\"\"\"\n"
                           "    return jsonify({\"health\": \"ok\"})\n");
     if (!ok) {
-        rh_cleanup(&client, NULL);
         rh_cleanup(&server, NULL);
+        rh_cleanup(&client, NULL);
         FAIL("fixture precondition failed (client HTTP_CALLS / server Route missing)");
     }
 
     /* Run 1: consumer side — creates fwd row (client DB) + rev row (server DB). */
-    const char *tgt_srv = server.project;
-    cbm_cross_repo_result_t r1 = cbm_cross_repo_match(client.project, &tgt_srv, 1);
+    cbm_cross_repo_result_t r1 = cr536_match(&client, &server);
     int client_1 = cr536_count_cross(&client);
     int server_1 = cr536_count_cross(&server);
 
     /* Run 2: provider side — must re-find the same pair, not destroy it. */
-    const char *tgt_cli = client.project;
-    cbm_cross_repo_result_t r2 = cbm_cross_repo_match(server.project, &tgt_cli, 1);
+    cbm_cross_repo_result_t r2 = cr536_match(&server, &client);
     int client_2 = cr536_count_cross(&client);
     int server_2 = cr536_count_cross(&server);
 
     /* Run 3: consumer side again — convergence, still exactly one row each. */
-    cbm_cross_repo_result_t r3 = cbm_cross_repo_match(client.project, &tgt_srv, 1);
+    cbm_cross_repo_result_t r3 = cr536_match(&client, &server);
     int client_3 = cr536_count_cross(&client);
     int server_3 = cr536_count_cross(&server);
 
@@ -466,8 +480,8 @@ TEST(repro_issue523_idempotent_cross_edges) {
             r1.http_edges, client_1, server_1, r2.http_edges, client_2, server_2, r3.http_edges,
             client_3, server_3);
 
-    rh_cleanup(&client, NULL);
     rh_cleanup(&server, NULL);
+    rh_cleanup(&client, NULL);
     cbm_cross_repo_result_free(&r1);
     cbm_cross_repo_result_free(&r2);
     cbm_cross_repo_result_free(&r3);

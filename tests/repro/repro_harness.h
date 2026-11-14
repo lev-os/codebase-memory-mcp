@@ -32,6 +32,7 @@
 typedef struct {
     char tmpdir[256];
     char cachedir[256];
+    bool owns_cache;
     char dbpath[512];
     char *project;
     cbm_mcp_server_t *srv;
@@ -77,6 +78,7 @@ static inline cbm_store_t *rh_open_indexed(RProj *lp) {
         snprintf(lp->cachedir, sizeof(lp->cachedir), "/tmp/cbm_repro_cache_XXXXXX");
         if (!cbm_mkdtemp(lp->cachedir))
             return NULL;
+        lp->owns_cache = true;
         rh_to_fwd_slashes(lp->cachedir);
     }
     snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", lp->cachedir, lp->project);
@@ -112,8 +114,14 @@ static inline void rh_cleanup(RProj *lp, cbm_store_t *store);
 
 /* Write each fixture file into a fresh temp project, index it via the MCP
  * production flow, and open the resulting graph DB. Returns store (NULL on fail). */
-static inline cbm_store_t *rh_index_files(RProj *lp, const RFile *files, int nfiles) {
+static inline cbm_store_t *rh_index_files_in_cache(RProj *lp, const RFile *files, int nfiles,
+                                                   const char *cache) {
     memset(lp, 0, sizeof(*lp));
+    if (cache) {
+        int n = snprintf(lp->cachedir, sizeof(lp->cachedir), "%s", cache);
+        if (n < 0 || (size_t)n >= sizeof(lp->cachedir))
+            return NULL;
+    }
     snprintf(lp->tmpdir, sizeof(lp->tmpdir), "/tmp/cbm_repro_XXXXXX");
     if (!cbm_mkdtemp(lp->tmpdir))
         return NULL;
@@ -142,6 +150,11 @@ static inline cbm_store_t *rh_index_files(RProj *lp, const RFile *files, int nfi
     return store;
 }
 
+/* A supplied cache is borrowed: only the helper that created it removes it. */
+static inline cbm_store_t *rh_index_files(RProj *lp, const RFile *files, int nfiles) {
+    return rh_index_files_in_cache(lp, files, nfiles, NULL);
+}
+
 static inline cbm_store_t *rh_index(RProj *lp, const char *filename, const char *content) {
     RFile f = {filename, content};
     return rh_index_files(lp, &f, 1);
@@ -157,7 +170,8 @@ static inline void rh_cleanup(RProj *lp, cbm_store_t *store) {
     free(lp->project);
     lp->project = NULL;
     th_rmtree(lp->tmpdir);
-    th_rmtree(lp->cachedir);
+    if (lp->owns_cache)
+        th_rmtree(lp->cachedir);
     if (lp->dbpath[0]) {
         unlink(lp->dbpath);
         char wal[600], shm[600];
