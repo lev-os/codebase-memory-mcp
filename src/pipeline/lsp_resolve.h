@@ -407,7 +407,10 @@ static inline bool cbm_pipeline_invocation_reason_join_strategy(const char *stra
             strcmp(strategy, "lsp_dict_dispatch") == 0 ||
             strcmp(strategy, "lsp_import_alias") == 0 ||
             strcmp(strategy, "lsp_constructor_init") == 0 ||
-            strcmp(strategy, "php_method_dynamic") == 0);
+            strcmp(strategy, "php_method_dynamic") == 0 ||
+            /* JS/TS call bound by scope to a same-name callable whose QN
+             * leaf is `name#n` (cbm_js_twin_bind_local_callees). */
+            strcmp(strategy, "lsp_ts_local_scope") == 0);
 }
 
 static inline bool cbm_pipeline_invocation_leaf_matches(const CBMResolvedCall *resolved,

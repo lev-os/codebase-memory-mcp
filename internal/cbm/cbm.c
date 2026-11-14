@@ -4230,6 +4230,9 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                     dts_mode = true;
             }
             cbm_run_ts_lsp(a, result, source, source_len, root, js_mode, jsx_mode, dts_mode);
+            /* The resolver names its caller by the function it walked (cbm.h). */
+            cbm_js_rebind_resolved_calls(result);
+            cbm_js_twin_bind_local_callees(&ctx);
         }
         if (language == CBM_LANG_CSHARP) {
             cbm_run_cs_lsp(a, result, source, source_len, root);

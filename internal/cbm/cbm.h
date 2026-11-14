@@ -292,6 +292,11 @@ typedef struct {
      * qualified_name (base QN = the first qn_sig_off bytes); 0 = no suffix.
      * Always 0 until a language enables its callable_identity mode. */
     uint32_t qn_sig_off;
+    /* Start byte of the syntax node a callable definition was built from (the
+     * function, arrow or method node). The call-scope walk computes a scope
+     * QN from that same node, so the pair names one definition exactly (JS/TS
+     * same-name twins, cbm_js_split_twin_callables). 0 when not recorded. */
+    uint32_t node_start_byte;
     /* Call matching: defaulted parameters, indexed in declaration order. */
     uint64_t param_default_mask;
     uint8_t selector_param_count;
@@ -1178,6 +1183,10 @@ typedef struct {
      * looked into (extract_calls.c), NULL until the first lookup; allocated
      * in `scratch`. */
     void *swift_bindings;
+    /* JS/TS: the members of each group of same-name callables of this file
+     * and the QN each was given (cbm_js_split_twin_callables), NULL when
+     * there is no group; allocated in `scratch`. */
+    void *js_twins;
 } CBMExtractCtx;
 
 /* Internal configured-definition seams. No declarations pointer enters a result. */
@@ -1462,6 +1471,30 @@ void cbm_extract_definitions(CBMExtractCtx *ctx);
 /* Internal companion for embedded-language trees that contribute definitions
  * to an existing host-file Module rather than minting a second Module. */
 void cbm_extract_definitions_without_module(CBMExtractCtx *ctx);
+/* JS/TS same-name callables (extract_defs.c). The graph keeps one node per QN,
+ * so two callables of one file that share a QN -- `first` in two object
+ * literals, `setup` in two test callbacks, a getter and its setter -- became
+ * one node holding the calls of both. Run once the def list of the walk is
+ * final and before the call-scope walk: in each group of two or more bodied
+ * Function/Method defs with one QN, the outermost (then the first) keeps the
+ * QN and every other takes QN + "#<n>", n = its 2-based rank in the group.
+ * Signatures stay out of the groups. */
+void cbm_js_split_twin_callables(CBMExtractCtx *ctx);
+/* The QN the split gave the callable whose syntax node starts at `start_byte`
+ * and whose unsplit QN is `base_qn` (`base_qn` itself for the member that kept
+ * it), or NULL when that callable is in no group. */
+const char *cbm_js_twin_qn(const CBMExtractCtx *ctx, const char *base_qn, uint32_t start_byte);
+/* After a JS/TS resolver ran: a resolved call takes the caller of the
+ * extracted call at its exact site -- the innermost callable that holds it
+ * (a nested arrow, a split twin, a class static block) -- so the two join by
+ * caller; then a resolver row at a site the scope binder bound takes the
+ * bound target. Idempotent. */
+void cbm_js_rebind_resolved_calls(CBMFileResult *r);
+/* After the per-file JS/TS resolver ran: a bare call `name()` whose innermost
+ * declaring block around it declares a split member `name` (a function
+ * declaration, or a variable whose value is a function) targets that member.
+ * The resolver row at the call's site is corrected, or one is added. */
+void cbm_js_twin_bind_local_callees(CBMExtractCtx *ctx);
 // dbt lineage for Jinja-templated SQL models: emits a Model def plus one usage
 // per ref()/source() call. No-op unless the file parses as SQL and actually
 // contains a dbt builtin call. Defined in extract_dbt.c.

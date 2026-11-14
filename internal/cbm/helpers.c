@@ -1620,6 +1620,13 @@ const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node) {
 
     // Cache the result: find the enclosing function's byte range
     TSNode func_node = cbm_find_enclosing_func(node, ctx->language);
+    if (!ts_node_is_null(func_node) && qn) {
+        /* A JS/TS same-name callable has a QN of its own (cbm.h). */
+        const char *twin = cbm_js_twin_qn(ctx, qn, ts_node_start_byte(func_node));
+        if (twin) {
+            qn = twin;
+        }
+    }
     if (!ts_node_is_null(func_node) && ctx->ef_cache.count < EFC_SIZE) {
         EFCEntry *e = &ctx->ef_cache.entries[ctx->ef_cache.count++];
         e->start_byte = ts_node_start_byte(func_node);
