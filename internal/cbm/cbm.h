@@ -355,6 +355,14 @@ typedef struct {
  * it (pipeline.h cbm_def_props_generated). */
 #define CBM_PROP_GENERATED "generated"
 
+/* extra_props key of a same-name JS/TS callable declared in a function body
+ * (cbm_js_split_twin_callables gives it a derived name such as
+ * observable.iterator.next): only that function's code can name it, so the
+ * pipeline registers it by qualified name only, as it does a Python
+ * function's locals (pipeline.h cbm_def_props_function_local). Value
+ * "true". */
+#define CBM_PROP_FUNCTION_LOCAL "function_local"
+
 /* Argument captured from a call expression */
 typedef struct {
     const char *expr;      // raw expression text ("payload.info", "MY_URL", "'hello'")

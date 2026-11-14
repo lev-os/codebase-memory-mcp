@@ -1387,10 +1387,11 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
         }
     }
     /* Preserve the full index's exact-only registration for TS signatures,
-     * generated members and split overloads. */
+     * generated members, function-local JS/TS twins and split overloads. */
     if (((lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) && node->properties_json &&
          strstr(node->properties_json, "\"is_abstract\":true")) ||
         cbm_node_props_generated(node->properties_json) ||
+        cbm_node_props_function_local(node->properties_json) ||
         cbm_node_is_split_overload(node->qualified_name, node->name, node->properties_json)) {
         cbm_registry_add_qn_only(seed->registry, node->qualified_name, node->label);
         return;

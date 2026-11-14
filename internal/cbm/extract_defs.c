@@ -14167,6 +14167,7 @@ typedef struct {
     const char *preferred; /* the QN it asks for */
     const char *final_qn;  /* the QN it was given; NULL when in no group */
     bool found;            /* the tree walk met its bodied node */
+    bool local;            /* declared in a function body or static block */
 } js_twin_member_t;
 
 enum {
@@ -14193,6 +14194,39 @@ static bool js_twin_bodied_kind(const char *k) {
 static bool js_twin_function_value_kind(const char *k) {
     return strcmp(k, "function_expression") == 0 || strcmp(k, "function") == 0 ||
            strcmp(k, "generator_function") == 0;
+}
+
+/* Whether a node whose ancestors are anc[0..depth) sits in a function body
+ * or a class static block, where only that code can name it. */
+static bool js_twin_in_body(const TSNode *anc, int depth) {
+    for (int i = 0; i < depth; i++) {
+        const char *k = ts_node_type(anc[i]);
+        if (js_twin_bodied_kind(k) || strcmp(k, "class_static_block") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Mark a definition as a function-local twin (CBM_PROP_FUNCTION_LOCAL),
+ * keeping the facts it already carries. */
+static void js_twin_mark_local(CBMArena *a, CBMDefinition *d) {
+    int n = 0;
+    while (d->extra_props && d->extra_props[n]) {
+        n++;
+    }
+    const char **kv =
+        (const char **)cbm_arena_alloc(a, (size_t)(n + PAIR_LEN + SKIP_ONE) * sizeof(char *));
+    if (!kv) {
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        kv[i] = d->extra_props[i];
+    }
+    kv[n] = CBM_PROP_FUNCTION_LOCAL;
+    kv[n + SKIP_ONE] = "true";
+    kv[n + PAIR_LEN] = NULL;
+    d->extra_props = kv;
 }
 
 static bool js_twin_declaration_kind(const char *k) {
@@ -14694,6 +14728,7 @@ static bool js_twin_walk(js_twin_walk_t *w) {
                 m->found = true;
                 m->rank = js_twin_rank(w->ctx, n, anc.items, anc.count, d->name);
                 m->owner = js_twin_owner(w->ctx, anc.items, anc.count);
+                m->local = js_twin_in_body(anc.items, anc.count);
             }
         }
         if (k) {
@@ -15011,6 +15046,9 @@ void cbm_js_split_twin_callables(CBMExtractCtx *ctx) {
             }
             for (int d = 0; d < m->ndefs; d++) {
                 m->defs[d]->qualified_name = qn;
+                if (m->local) {
+                    js_twin_mark_local(ctx->arena, m->defs[d]);
+                }
             }
             m->final_qn = qn;
             items[t++] = (js_twin_t){.base_qn = base, .qn = qn, .start_byte = m->start_byte};

@@ -2061,6 +2061,19 @@ bool cbm_node_props_generated(const char *properties_json) {
     return properties_json && strstr(properties_json, "\"" CBM_PROP_GENERATED "\":\"") != NULL;
 }
 
+bool cbm_def_props_function_local(const char *const *extra_props) {
+    for (const char *const *kv = extra_props; kv && kv[0] && kv[SKIP_ONE]; kv += PAIR_LEN) {
+        if (strcmp(kv[0], CBM_PROP_FUNCTION_LOCAL) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool cbm_node_props_function_local(const char *properties_json) {
+    return properties_json && strstr(properties_json, "\"" CBM_PROP_FUNCTION_LOCAL "\":\"") != NULL;
+}
+
 /* ── Lookup ──────────────────────────────────────────────────────── */
 
 bool cbm_registry_exists(const cbm_registry_t *r, const char *qn) {

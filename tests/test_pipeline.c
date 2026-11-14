@@ -36345,6 +36345,62 @@ TEST(pipeline_js_this_call_in_arrow_reaches_class_method) {
     PASS();
 }
 
+/* A same-name callable declared in a function body (`const iterator = {
+ * next() {} }` inside observable) is a local of that function: its own file
+ * reaches it by its derived name, and no name-only strategy offers it to
+ * another file, where `iterator.next()` on any value matched the derived
+ * tail iterator.next. A full and an incremental index agree. */
+TEST(pipeline_js_local_twin_stays_out_of_name_guesses) {
+    char tmp[256] = "/tmp/cbm_js_local_twin_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    XlangEnvSave saved = xlang_env_select(false);
+    write_temp_file(tmp, "lib/obs.ts",
+                    "export function observable() {\n"
+                    "  const iterator = { next() { return 1; } };\n"
+                    "  const other = { next() { return 2; } };\n"
+                    "  return iterator.next() + other.next();\n"
+                    "}\n");
+    write_temp_file(tmp, "app/use.ts",
+                    "export function drain(iterator) { return iterator.next(); }\n");
+    for (int i = 0; i < 4; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "pad%d.ts", i);
+        write_temp_file(tmp, name, "export const pad = 1;\n");
+    }
+    char db[512];
+    char use_path[512];
+    snprintf(db, sizeof(db), "%s/g.db", tmp);
+    snprintf(use_path, sizeof(use_path), "%s/app/use.ts", tmp);
+    cbm_pipeline_t *p = js_twin_index(tmp, db);
+    ASSERT_NOT_NULL(p);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    static const char *const own =
+        "lib.obs.observable -> lib.obs.iterator.next; lib.obs.observable -> lib.obs.other.next";
+    char got[1024];
+    js_twin_calls_at(db, project, "lib/obs.ts", 4, got, sizeof(got));
+    bool ok = js_twin_expect("full own file", got, own);
+    js_twin_calls_at(db, project, "app/use.ts", 1, got, sizeof(got));
+    ok = js_twin_expect("full other file", got, "") && ok;
+
+    write_temp_file(tmp, "app/use.ts",
+                    "export function drain(iterator) { return iterator.next() || 0; }\n");
+    ASSERT_EQ(pipeline_test_set_mtime(use_path, 2000000000, 0), 0);
+    cbm_pipeline_incremental_test_reset_faults();
+    p = js_twin_index(tmp, db);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_free(p);
+    xlang_env_restore(&saved);
+    js_twin_calls_at(db, project, "app/use.ts", 1, got, sizeof(got));
+    ok = js_twin_expect("incremental other file", got, "") && ok;
+    js_twin_calls_at(db, project, "lib/obs.ts", 4, got, sizeof(got));
+    ok = js_twin_expect("incremental own file", got, own) && ok;
+    th_rmtree(tmp);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 /* CBM_SEMANTIC_INDEX_VERSION 15: version 14 gave a JS/TS object method the
  * plain name of an exported function beside it and the export "#2". An index
  * it wrote is stale with no file changed, so the next run rebuilds it. */
@@ -36458,6 +36514,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_twin_insert_incremental_equals_full);
     RUN_TEST(pipeline_js_top_level_declaration_keeps_plain_name);
     RUN_TEST(pipeline_js_this_call_in_arrow_reaches_class_method);
+    RUN_TEST(pipeline_js_local_twin_stays_out_of_name_guesses);
     RUN_TEST(pipeline_js_twin_names_rebuild_old_index);
     RUN_TEST(pipeline_js_twin_callables_scale);
     RUN_TEST(pipeline_ts_caller_is_innermost_named_callable);

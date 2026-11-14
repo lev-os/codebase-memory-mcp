@@ -543,6 +543,7 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
          * compete with implementations in any short-name guess. */
         if ((def->is_abstract && (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX)) ||
             cbm_def_props_generated(def->extra_props) ||
+            cbm_def_props_function_local(def->extra_props) ||
             (lang != CBM_LANG_SWIFT && def->qn_sig_off > 0)) {
             cbm_registry_add_qn_only(ctx->registry, def->qualified_name, def->label);
         } else {
