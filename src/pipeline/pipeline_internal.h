@@ -1774,8 +1774,15 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      targets but leave the name-guess registry. Persist is_abstract so
  *      incremental proxy seeds retain that distinction. Older indexes rebuild
  *      once to remove guessed edges and populate the signature mark.
+ *  15: JS/TS import targets change for unchanged files. An alias target
+ *      keeps its own extension (src/rt.mjs, never src/rt.d.ts beside it), a
+ *      specifier extension is never read as a member name (./codec.js is not
+ *      the function js), a folder that .cbmignore re-includes keeps its
+ *      alias configs, and a call through a namespace or require() binding of
+ *      a File target reaches that file's definitions. Older indexes rebuild
+ *      once to drop the old edges.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 14 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 15 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

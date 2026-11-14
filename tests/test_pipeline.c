@@ -10141,6 +10141,12 @@ TEST(pipeline_semantic_version_13_index_is_rebuilt_once) {
     return pipeline_exact_inputs_migrate_metadata_and_mode(13);
 }
 
+/* Version 14 bound JS/TS imports to declarations beside an alias target, to
+ * extension-named members, and lost calls through File-target namespaces. */
+TEST(pipeline_semantic_version_14_index_is_rebuilt_once) {
+    return pipeline_exact_inputs_migrate_metadata_and_mode(14);
+}
+
 typedef struct {
     bool published;
     int rename_calls;
@@ -36570,6 +36576,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_semantic_version_8_index_is_rebuilt_once);
     RUN_TEST(pipeline_semantic_version_10_index_is_rebuilt_once);
     RUN_TEST(pipeline_semantic_version_13_index_is_rebuilt_once);
+    RUN_TEST(pipeline_semantic_version_14_index_is_rebuilt_once);
     RUN_TEST(pipeline_capture_failure_preserves_general_coverage_and_rebuilds);
     RUN_TEST(pipeline_non_utf8_source_keeps_surfaces_and_unresolved_capture);
     RUN_TEST(pipeline_existing_artifact_refreshes_after_default_forced_full_reindex);
