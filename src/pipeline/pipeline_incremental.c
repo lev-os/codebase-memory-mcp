@@ -1509,6 +1509,9 @@ typedef struct {
      * the arenas live exactly as long as cr.arena itself. */
     CBMArena *rehydrate_arenas;
     int rehydrate_arena_count;
+    /* Stored JS/TS re-export lines, read before the purge and restored
+     * before the barrel registry resolves the repaired files. */
+    cbm_delta_reexports_t *reexports;
 } closure_resolve_t;
 
 typedef struct {
@@ -1949,6 +1952,12 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
             return rc;
         }
         cbm_pipeline_sync_next_id(ctx->gbuf, &shared_ids);
+        /* Restore unchanged barrels' edges into freshly extracted targets
+         * before the registry answers its barrel requests. */
+        if (closure && cbm_delta_reexports_carry(closure->reexports, ctx->gbuf) < 0) {
+            free_incremental_result_cache(cache, ci);
+            return CBM_NOT_FOUND;
+        }
 
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
         rc = cbm_build_registry_from_cache(ctx, changed_files, ci, cache);
@@ -2473,9 +2482,9 @@ static bool closure_is_alias_config(const cbm_path_alias_collection_t *aliases,
 
 /* Every discovered file under the config's directory joins the closure:
  * their RESOLUTION consumed the config even though their bytes (and thus
- * surfaces) are unchanged, so they re-extract and re-resolve but never
- * propagate further. Over-inclusion (nested scopes) is safe; the budget
- * still bounds the total. */
+ * surfaces) are unchanged, so they re-extract and re-resolve. A re-export
+ * can change an answer outside this scope; the plan declines that case below.
+ * Over-inclusion (nested scopes) is safe; the budget still bounds the total. */
 static void closure_seed_governed(CBMHashTable *closure_set, const cbm_file_info_t *files,
                                   int file_count, const char *config_rel_path) {
     const char *slash = strrchr(config_rel_path, '/');
@@ -2488,6 +2497,32 @@ static void closure_seed_governed(CBMHashTable *closure_set, const cbm_file_info
             cbm_ht_set(closure_set, files[i].rel_path, (void *)files[i].rel_path);
         }
     }
+}
+
+/* A config-only change keeps the TS scope bytes but can redirect a barrel's
+ * exports. Its importers outside the closure would keep their old calls.
+ * Read the stored syntax, not only IMPORTS edges: a previously unresolved
+ * re-export can start resolving too. A/F/S are the re-export records in
+ * doclink_ts.c's persisted ts1 scope. Changed syntax already declines through
+ * doc_scope_repairable; no transitive importer walk is needed on this path. */
+static const char *closure_alias_barrel_decline(const cbm_lsp_surface_row_t *rows, int count,
+                                                const CBMHashTable *closure_set) {
+    for (int i = 0; i < count; i++) {
+        CBMLanguage lang = cbm_language_for_filename(rows[i].rel_path);
+        if ((lang != CBM_LANG_JAVASCRIPT && lang != CBM_LANG_TYPESCRIPT && lang != CBM_LANG_TSX) ||
+            !cbm_ht_get(closure_set, rows[i].rel_path)) {
+            continue;
+        }
+        char *scope = NULL;
+        bool readable = surface_dl_scope(rows[i].defs_json, &scope) && scope;
+        bool reexports = readable && (strstr(scope, "\nA\t") || strstr(scope, "\nF\t") ||
+                                      strstr(scope, "\nS\t"));
+        cbm_free(CBM_MEM_CLASS_OTHER, scope);
+        if (!readable || reexports) {
+            return readable ? "alias_config_reexports" : "alias_scope_missing";
+        }
+    }
+    return NULL;
 }
 
 static bool closure_path_listed(char **paths, int count, const char *path) {
@@ -3372,6 +3407,12 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
         cbm_ht_foreach(row_deps, row_dep_visitor, &walk);
         n_row_dependents = walk.added;
     }
+    if (governed_seeded) {
+        decline = closure_alias_barrel_decline(plan->stored_rows, plan->stored_count, closure_set);
+        if (decline) {
+            goto done;
+        }
+    }
     /* closure_count == 0 is legitimate: a deleted-only delta with no
      * dependents has nothing to re-parse, but the purge itself still needs
      * the executor. */
@@ -3455,6 +3496,22 @@ static bool incremental_coverage_rows_available(int count, const cbm_coverage_ro
 static bool incremental_capture_complete(bool rows_available, bool run_complete,
                                          bool retained_complete) {
     return rows_available && run_complete && retained_complete;
+}
+
+/* A JS/TS file among the re-parsed ones: only such a file asks the barrel
+ * walk (cbm_pxc_ts_barrels_request), so only then does the repair read the
+ * re-export lines back (cbm_delta_reexports_capture). Stored IMPORTS cannot
+ * safely narrow this further: a changed scoped alias can now select a barrel
+ * outside the closure even when its old target was an ordinary module. Fresh
+ * targets are bound after the purge, during extraction/registry construction. */
+static bool closure_has_js_family(const cbm_file_info_t *files, int count) {
+    for (int i = 0; i < count; i++) {
+        CBMLanguage lang = cbm_language_for_filename(files[i].rel_path);
+        if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* ── Delta-repair orchestration (closure route) ──────────────────
@@ -3545,6 +3602,11 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     for (int i = 0; i < deleted_count; i++) {
         purge_paths[ci + i] = deleted[i];
     }
+    /* Capture before purging edges into files that will be re-parsed. */
+    if (closure_has_js_family(changed_files, ci) &&
+        cbm_delta_reexports_capture(staging, project, &cr.reexports) != 0) {
+        goto out;
+    }
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     if (cbm_delta_snapshot_inbound(staging, project, purge_paths, purge_count, &snapshot,
                                    &snapshot_count) != 0) {
@@ -3563,7 +3625,8 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         goto out;
     }
     int64_t max_db_id = cbm_delta_preseed(staging, project, gbuf);
-    if (max_db_id < 0 || cbm_delta_envjoin_base(staging, project, &envjoin_base) != 0) {
+    if (max_db_id < 0 || cbm_delta_reexports_preseed(cr.reexports, staging, project, gbuf) < 0 ||
+        cbm_delta_envjoin_base(staging, project, &envjoin_base) != 0) {
         goto out;
     }
     registry = cbm_registry_new();
@@ -4013,6 +4076,7 @@ out:
 #endif
     }
     cbm_delta_free_snapshot(snapshot, snapshot_count);
+    cbm_delta_reexports_free(cr.reexports);
     cbm_arena_destroy(&decl_arena);
     cbm_stem_marks_free(&stem_marks);
     cbm_envjoin_base_free(&envjoin_base);

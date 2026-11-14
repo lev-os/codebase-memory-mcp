@@ -1523,7 +1523,7 @@ static bool pxc_rx_key(char *buf, size_t cap, int64_t id, const char *name) {
 
 /* The File node an IMPORTS target stands for: a Module's file, a Folder's
  * index file, a File itself. NULL for a definition or an unknown target. */
-static const cbm_gbuf_node_t *pxc_barrel_file_of(const cbm_gbuf_t *gbuf, const char *project_name,
+const cbm_gbuf_node_t *cbm_pxc_ts_barrel_file_of(const cbm_gbuf_t *gbuf, const char *project_name,
                                                  const cbm_gbuf_node_t *target) {
     if (!target || !target->label || !target->file_path) {
         return NULL;
@@ -1725,7 +1725,7 @@ static const pxc_rx_file_t *pxc_rx_index(pxc_rx_ctx_t *c, const cbm_gbuf_node_t 
             }
             pxc_rx_prepend(c, c->named, file->id, public_name, target->id, imported);
         } else if (strcmp(kind, "star") == 0) {
-            const cbm_gbuf_node_t *star = pxc_barrel_file_of(c->gbuf, c->project, target);
+            const cbm_gbuf_node_t *star = cbm_pxc_ts_barrel_file_of(c->gbuf, c->project, target);
             if (!star || star->id == file->id || !star->file_path) {
                 continue;
             }
@@ -1780,7 +1780,7 @@ static void pxc_rx_enqueue(pxc_rx_ctx_t *c, const cbm_gbuf_node_t *target, const
         }
         return;
     }
-    const cbm_gbuf_node_t *file = pxc_barrel_file_of(c->gbuf, c->project, target);
+    const cbm_gbuf_node_t *file = cbm_pxc_ts_barrel_file_of(c->gbuf, c->project, target);
     if (file && file->file_path) {
         pxc_rx_enqueue_file(c, file, name);
     }

@@ -1915,6 +1915,21 @@ int cbm_delta_drop_edges_from_label(cbm_store_t *store, const char *project, con
 /* Pre-seed proxy nodes with their REAL database ids and move the gbuf id
  * watermark above MAX(id); returns that max id, or -1 on failure. */
 int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf);
+/* The stored JS/TS re-export lines (`export ... from`) of a closure repair,
+ * which the barrel walk reads from the delta graph (pipeline_delta.c).
+ * capture, before the purge: 0, or CBM_NOT_FOUND on a read/allocation error.
+ * preseed, after cbm_delta_preseed: the edges between proxies and the
+ * DEFINES edges of every proxied star target; the count, or CBM_NOT_FOUND.
+ * carry, after extraction and before the walk: the edges of unchanged
+ * barrels into re-parsed files, by QN; the count, or CBM_NOT_FOUND.
+ * Both restore stages fail on a read/allocation error so the caller rebuilds. */
+typedef struct cbm_delta_reexports cbm_delta_reexports_t;
+int cbm_delta_reexports_capture(cbm_store_t *store, const char *project,
+                                cbm_delta_reexports_t **out);
+int64_t cbm_delta_reexports_preseed(cbm_delta_reexports_t *rx, cbm_store_t *store,
+                                    const char *project, cbm_gbuf_t *gbuf);
+int64_t cbm_delta_reexports_carry(const cbm_delta_reexports_t *rx, cbm_gbuf_t *gbuf);
+void cbm_delta_reexports_free(cbm_delta_reexports_t *rx);
 int cbm_delta_patch(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf, int64_t max_db_id,
                     const cbm_delta_saved_edge_t *snapshot, int snapshot_count);
 /* discard helper shared with the delta executor (unlink stage + sidecars). */

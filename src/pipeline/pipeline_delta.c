@@ -30,6 +30,7 @@
  */
 #include "foundation/constants.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "callable_overload.h"
 
 #include <stdint.h> /* intptr_t — SQLITE_TRANSIENT wrapper */
@@ -624,43 +625,6 @@ static char *delta_with_prop(const char *props, const char *key, const char *val
     return out;
 }
 
-/* Load the stored JS/TS re-export IMPORTS edges (`export { a as b } from`,
- * `export * from`) between proxies into the delta gbuf. A re-resolved caller
- * that imports through a barrel follows the BARREL's edges to the defining
- * file (pass_lsp_cross.c barrel registry), and an unchanged barrel is a
- * proxy with no edges of its own; without these rows the walk stopped at the
- * barrel and the call fell back to a name guess. Only the re-export rows,
- * with their stored properties (local_name/imported/reexport): a small set.
- * Both endpoints are pre-existing rows, so cbm_delta_patch never writes them
- * back. Returns the edge count, or -1 on a database error. */
-static int64_t delta_preseed_reexports(sqlite3 *db, const char *project, cbm_gbuf_t *gbuf) {
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db,
-                           "SELECT source_id, target_id, properties FROM edges"
-                           " WHERE project = ?1 AND type = 'IMPORTS'"
-                           " AND instr(properties, '\"reexport\":\"') > 0",
-                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        return -1;
-    }
-    sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-    int64_t loaded = 0;
-    int step_rc;
-    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        int64_t src = sqlite3_column_int64(stmt, 0);
-        int64_t tgt = sqlite3_column_int64(stmt, 1);
-        const char *props = (const char *)sqlite3_column_text(stmt, 2);
-        /* An endpoint the preseed did not proxy is no walk step. */
-        if (!cbm_gbuf_find_by_id(gbuf, src) || !cbm_gbuf_find_by_id(gbuf, tgt)) {
-            continue;
-        }
-        if (cbm_gbuf_insert_edge(gbuf, src, tgt, "IMPORTS", props ? props : "{}") > 0) {
-            loaded++;
-        }
-    }
-    sqlite3_finalize(stmt);
-    return step_rc == SQLITE_DONE ? loaded : -1;
-}
-
 /* `props` (a JSON object) with the extractor's test verdict added as
  * `"is_test":true` (CBM_MEM_CLASS_OTHER; the caller frees), NULL on allocation
  * failure. The incremental registry seed reads the verdict back
@@ -848,17 +812,210 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
     if (step_rc != SQLITE_DONE) {
         return -1;
     }
-    int64_t reexports = delta_preseed_reexports(db, project, gbuf);
-    if (reexports < 0) {
-        return -1;
-    }
     cbm_gbuf_set_next_id(gbuf, max_id + 1);
     char seeded_buf[32];
-    char reexport_buf[32];
     snprintf(seeded_buf, sizeof(seeded_buf), "%lld", (long long)seeded);
-    snprintf(reexport_buf, sizeof(reexport_buf), "%lld", (long long)reexports);
-    cbm_log_info("delta.preseed", "proxies", seeded_buf, "reexport_edges", reexport_buf);
+    cbm_log_info("delta.preseed", "proxies", seeded_buf);
     return max_id;
+}
+
+/* ── JS/TS re-export lines on the closure repair ──
+ *
+ * A re-parsed file whose named import lands on a barrel binds what the barrel
+ * walk answers (pass_lsp_cross.c cbm_pxc_ts_barrels_resolve). The walk reads a
+ * barrel's re-export IMPORTS edges (`export { a as b } from`, `export * from`),
+ * the DEFINES edges of a plain star target, and nodes by QN. A proxy carries
+ * only the last, so every request answered nothing, and the call was lost or
+ * fell to a name guess. The plan declines changed re-export lines and alias
+ * config changes that govern re-exporting files, so the stored lines are the
+ * new generation's. They are read before the purge and put
+ * back in two steps:
+ *  - after the preseed: the edges between unchanged files, and the DEFINES
+ *    edges of every unchanged star target, a re-parsed barrel's too
+ *    (cbm_delta_reexports_preseed);
+ *  - after extraction: the edges of unchanged barrels into re-parsed files,
+ *    by the target's QN (cbm_delta_reexports_carry).
+ * A re-parsed barrel draws its own edges. An edge between proxies is never
+ * written back (cbm_delta_patch skips it); an edge into a re-parsed file is
+ * the one the snapshot relink restores as well. */
+
+typedef struct {
+    int64_t source_id;
+    int64_t target_id;
+    char *target_qn;
+    char *props;
+    bool star;
+    bool carry; /* unchanged source, re-parsed target: carried by QN */
+} delta_reexport_t;
+
+struct cbm_delta_reexports {
+    delta_reexport_t *items;
+    int count;
+};
+
+void cbm_delta_reexports_free(cbm_delta_reexports_t *rx) {
+    if (!rx) {
+        return;
+    }
+    for (int i = 0; i < rx->count; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, rx->items[i].target_qn);
+        cbm_free(CBM_MEM_CLASS_OTHER, rx->items[i].props);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, rx->items);
+    cbm_free(CBM_MEM_CLASS_OTHER, rx);
+}
+
+int cbm_delta_reexports_capture(cbm_store_t *store, const char *project,
+                                cbm_delta_reexports_t **out) {
+    *out = NULL;
+    sqlite3 *db = cbm_store_get_db(store);
+    cbm_delta_reexports_t *rx =
+        db ? (cbm_delta_reexports_t *)cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*rx)) : NULL;
+    sqlite3_stmt *stmt = NULL;
+    if (!rx || sqlite3_prepare_v2(db,
+                                  "SELECT e.source_id, e.target_id, t.qualified_name, e.properties"
+                                  " FROM edges e JOIN nodes t ON t.id = e.target_id"
+                                  " WHERE e.project = ?1 AND e.type = 'IMPORTS'"
+                                  " AND instr(e.properties, '\"reexport\":\"') > 0",
+                                  CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        cbm_free(CBM_MEM_CLASS_OTHER, rx);
+        return CBM_NOT_FOUND;
+    }
+    /* A failed bind leaves ?1 NULL: the read would end clean with no rows. */
+    if (sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        cbm_free(CBM_MEM_CLASS_OTHER, rx);
+        return CBM_NOT_FOUND;
+    }
+    int cap = 0;
+    bool ok = true;
+    int step_rc = SQLITE_DONE;
+    while (ok && (step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char *qn = (const char *)sqlite3_column_text(stmt, 2);
+        const char *props = (const char *)sqlite3_column_text(stmt, 3);
+        if (!qn || !props) {
+            continue;
+        }
+        if (rx->count == cap) {
+            int ncap = cap ? cap * PAIR_LEN : CBM_SZ_64;
+            delta_reexport_t *grown = (delta_reexport_t *)cbm_realloc(
+                CBM_MEM_CLASS_OTHER, rx->items, (size_t)ncap * sizeof(*grown));
+            if (!grown) {
+                ok = false;
+                break;
+            }
+            rx->items = grown;
+            cap = ncap;
+        }
+        delta_reexport_t *r = &rx->items[rx->count++];
+        r->source_id = sqlite3_column_int64(stmt, 0);
+        r->target_id = sqlite3_column_int64(stmt, 1);
+        r->target_qn = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, qn);
+        r->props = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, props);
+        r->star = strstr(props, "\"reexport\":\"star\"") != NULL;
+        r->carry = false;
+        ok = r->target_qn && r->props;
+    }
+    sqlite3_finalize(stmt);
+    if (!ok || step_rc != SQLITE_DONE) {
+        cbm_delta_reexports_free(rx);
+        return CBM_NOT_FOUND;
+    }
+    *out = rx;
+    return 0;
+}
+
+/* The stored DEFINES edges of the unchanged File `file`, once per file: the
+ * definitions of a plain star target, which the star lookup indexes by name
+ * (pass_lsp_cross.c pxc_rx_index_defs). false on a read or allocation error. */
+static bool delta_preseed_defines(sqlite3_stmt *defs, cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *file,
+                                  int64_t *loaded) {
+    const cbm_gbuf_edge_t **have = NULL;
+    int have_count = 0;
+    if (cbm_gbuf_find_edges_by_source_type(gbuf, file->id, "DEFINES", &have, &have_count) == 0 &&
+        have_count > 0) {
+        return true; /* another star line named this file */
+    }
+    sqlite3_reset(defs);
+    if (sqlite3_bind_int64(defs, 2, file->id) != SQLITE_OK) {
+        return false;
+    }
+    int step_rc;
+    while ((step_rc = sqlite3_step(defs)) == SQLITE_ROW) {
+        int64_t tgt = sqlite3_column_int64(defs, 0);
+        const char *props = (const char *)sqlite3_column_text(defs, 1);
+        if (cbm_gbuf_find_by_id(gbuf, tgt)) {
+            if (cbm_gbuf_insert_edge(gbuf, file->id, tgt, "DEFINES", props ? props : "{}") <= 0) {
+                return false;
+            }
+            (*loaded)++;
+        }
+    }
+    return step_rc == SQLITE_DONE;
+}
+
+int64_t cbm_delta_reexports_preseed(cbm_delta_reexports_t *rx, cbm_store_t *store,
+                                    const char *project, cbm_gbuf_t *gbuf) {
+    if (!rx || rx->count == 0) {
+        return 0;
+    }
+    sqlite3 *db = cbm_store_get_db(store);
+    sqlite3_stmt *defs = NULL;
+    if (!db || sqlite3_prepare_v2(db,
+                                  "SELECT target_id, properties FROM edges"
+                                  " WHERE project = ?1 AND source_id = ?2 AND type = 'DEFINES'",
+                                  CBM_NOT_FOUND, &defs, NULL) != SQLITE_OK) {
+        return CBM_NOT_FOUND;
+    }
+    if (sqlite3_bind_text(defs, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT) != SQLITE_OK) {
+        sqlite3_finalize(defs);
+        return CBM_NOT_FOUND;
+    }
+    int64_t edges = 0;
+    int64_t defines = 0;
+    bool ok = true;
+    for (int i = 0; i < rx->count && ok; i++) {
+        delta_reexport_t *r = &rx->items[i];
+        /* Only proxies are resident yet: a missing id is a purged row. */
+        bool source = cbm_gbuf_find_by_id(gbuf, r->source_id) != NULL;
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gbuf, r->target_id);
+        r->carry = source && !target;
+        if (!target) {
+            continue;
+        }
+        if (source) {
+            if (cbm_gbuf_insert_edge(gbuf, r->source_id, r->target_id, "IMPORTS", r->props) <= 0) {
+                ok = false;
+                break;
+            }
+            edges++;
+        }
+        const cbm_gbuf_node_t *file =
+            r->star ? cbm_pxc_ts_barrel_file_of(gbuf, project, target) : NULL;
+        ok = !file || delta_preseed_defines(defs, gbuf, file, &defines);
+    }
+    sqlite3_finalize(defs);
+    char edges_buf[CBM_SZ_32];
+    char defines_buf[CBM_SZ_32];
+    snprintf(edges_buf, sizeof(edges_buf), "%lld", (long long)edges);
+    snprintf(defines_buf, sizeof(defines_buf), "%lld", (long long)defines);
+    cbm_log_info("delta.preseed_reexports", "edges", edges_buf, "defines", defines_buf);
+    return ok ? edges + defines : CBM_NOT_FOUND;
+}
+
+int64_t cbm_delta_reexports_carry(const cbm_delta_reexports_t *rx, cbm_gbuf_t *gbuf) {
+    int64_t carried = 0;
+    for (int i = 0; rx && i < rx->count; i++) {
+        const delta_reexport_t *r = &rx->items[i];
+        const cbm_gbuf_node_t *target = r->carry ? cbm_gbuf_find_by_qn(gbuf, r->target_qn) : NULL;
+        if (target) {
+            if (cbm_gbuf_insert_edge(gbuf, r->source_id, target->id, "IMPORTS", r->props) <= 0) {
+                return CBM_NOT_FOUND;
+            }
+            carried++;
+        }
+    }
+    return carried;
 }
 
 /* Patch visitor state: inserts everything above the id watermark. */
