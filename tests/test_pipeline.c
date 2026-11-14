@@ -36507,50 +36507,134 @@ TEST(pipeline_js_twin_names_rebuild_old_index) {
     PASS();
 }
 
-/* 20,000 callables of one name in one file, each called from its owner,
- * index inside a few seconds: grouping and scope binding are near-linear. */
-TEST(pipeline_js_twin_callables_scale) {
-    enum { JS_TWIN_SCALE_N = 20000, JS_TWIN_SCALE_MS = 15000 };
-    char tmp[256] = "/tmp/cbm_js_twin_scale_XXXXXX";
-    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-    size_t cap = (size_t)JS_TWIN_SCALE_N * 80 + 256;
-    char *src = malloc(cap);
-    ASSERT_NOT_NULL(src);
-    size_t off = (size_t)snprintf(src, cap, "export function run() { return 0; }\n");
-    for (int i = 0; i < JS_TWIN_SCALE_N; i++) {
-        off += (size_t)snprintf(src + off, cap - off,
-                                "function f%d() { function run() { return %d; } return run(); }\n",
-                                i, i);
+/* The number of CALLS edges whose caller sits in the file ending in `file`
+ * and that `sql_where` (over s, the caller, and t, the target) admits. */
+static int js_twin_count_calls(const char *db_path, const char *project, const char *file,
+                               const char *sql_where) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return -1;
     }
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "SELECT count(*) FROM edges e JOIN nodes s ON s.id = e.source_id "
+             "JOIN nodes t ON t.id = e.target_id WHERE e.project = ?1 AND e.type = 'CALLS' "
+             "AND substr(s.file_path, -length(?2)) = ?2 AND (%s)",
+             sql_where);
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, file, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            n = sqlite3_column_int(st, 0);
+        }
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return n;
+}
+
+/* Index the one file `src` as main.js; the wall time in ms, or -1. */
+static long js_twin_scale_index(const char *tmp, const char *src, const char *db, char *project,
+                                size_t project_cap) {
     write_temp_file(tmp, "main.js", src);
-    free(src);
     XlangEnvSave saved = xlang_env_select(false);
-    char db[512];
-    snprintf(db, sizeof(db), "%s/g.db", tmp);
     struct timespec t0;
     struct timespec t1;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
     cbm_pipeline_t *p = js_twin_index(tmp, db);
     cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
     xlang_env_restore(&saved);
-    ASSERT_NOT_NULL(p);
-    long ms = (long)(t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
-    fprintf(stderr, "  js twin scale: %d callables indexed in %ld ms\n", JS_TWIN_SCALE_N, ms);
-    const char *project = cbm_pipeline_project_name(p);
+    if (!p) {
+        return -1;
+    }
+    snprintf(project, project_cap, "%s", cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    return (long)(t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+}
+
+/* Two large JS files index in well under a minute with every call bound:
+ * 20,000 callables of one name, each called from its owner (20,000 callers
+ * with one call each), and one caller with 20,000 calls. Grouping, scope
+ * binding and the resolver-row join are near-linear. */
+TEST(pipeline_js_twin_callables_scale) {
+    enum { JS_TWIN_SCALE_N = 20000, JS_TWIN_SCALE_MS = 60000 };
+    char tmp[256] = "/tmp/cbm_js_twin_scale_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    size_t cap = (size_t)JS_TWIN_SCALE_N * 80 + 256;
+    char *src = malloc(cap);
+    ASSERT_NOT_NULL(src);
+    char project[256];
+    char db[512];
     char got[1024];
-    js_twin_qn_at(db, project, "main.js", "run", 1, got, sizeof(got));
-    bool ok = js_twin_expect("scale export", got, "main.run");
-    js_twin_calls_at(db, project, "main.js", 2, got, sizeof(got));
-    ok = js_twin_expect("scale first", got, "main.f0 -> main.f0.run") && ok;
     char want[128];
+    bool ok = true;
+
+    /* Shape 1: 20,000 callers, one call each. */
+    size_t off = (size_t)snprintf(src, cap, "export function run() { return 0; }\n");
+    for (int i = 0; i < JS_TWIN_SCALE_N; i++) {
+        off += (size_t)snprintf(src + off, cap - off,
+                                "function f%d() { function run() { return %d; } return run(); }\n",
+                                i, i);
+    }
+    snprintf(db, sizeof(db), "%s/g1.db", tmp);
+    long ms_callers = js_twin_scale_index(tmp, src, db, project, sizeof(project));
+    fprintf(stderr, "  js twin scale: %d callers, one call each: %ld ms\n", JS_TWIN_SCALE_N,
+            ms_callers);
+    js_twin_qn_at(db, project, "main.js", "run", 1, got, sizeof(got));
+    ok = js_twin_expect("callers export", got, "main.run") && ok;
+    js_twin_calls_at(db, project, "main.js", 2, got, sizeof(got));
+    ok = js_twin_expect("callers first", got, "main.f0 -> main.f0.run") && ok;
     snprintf(want, sizeof(want), "main.f%d -> main.f%d.run", JS_TWIN_SCALE_N - 1,
              JS_TWIN_SCALE_N - 1);
     js_twin_calls_at(db, project, "main.js", JS_TWIN_SCALE_N + 1, got, sizeof(got));
-    ok = js_twin_expect("scale last", got, want) && ok;
-    cbm_pipeline_free(p);
+    ok = js_twin_expect("callers last", got, want) && ok;
+    int all = js_twin_count_calls(db, project, "main.js", "1");
+    int own = js_twin_count_calls(db, project, "main.js",
+                                  "t.qualified_name = s.qualified_name || '.run'");
+    if (all != JS_TWIN_SCALE_N || own != JS_TWIN_SCALE_N) {
+        fprintf(stderr, "  callers: %d calls edges, %d to the caller's own run; want %d\n", all,
+                own, JS_TWIN_SCALE_N);
+        ok = false;
+    }
+
+    /* Shape 2: one caller, 20,000 calls to 20,000 functions. */
+    th_rmtree(tmp);
+    snprintf(tmp, sizeof(tmp), "%s", "/tmp/cbm_js_twin_scale_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    off = 0;
+    for (int i = 0; i < JS_TWIN_SCALE_N; i++) {
+        off += (size_t)snprintf(src + off, cap - off, "function g%d() { return %d; }\n", i, i);
+    }
+    off += (size_t)snprintf(src + off, cap - off, "export function big() {\n");
+    for (int i = 0; i < JS_TWIN_SCALE_N; i++) {
+        off += (size_t)snprintf(src + off, cap - off, "  g%d();\n", i);
+    }
+    snprintf(src + off, cap - off, "}\n");
+    snprintf(db, sizeof(db), "%s/g2.db", tmp);
+    long ms_calls = js_twin_scale_index(tmp, src, db, project, sizeof(project));
+    free(src);
+    fprintf(stderr, "  js twin scale: one caller, %d calls: %ld ms\n", JS_TWIN_SCALE_N, ms_calls);
+    all = js_twin_count_calls(db, project, "main.js", "1");
+    own = js_twin_count_calls(db, project, "main.js", "s.name = 'big'");
+    /* g<i> is called on line N + 2 + i */
+    char where[128];
+    snprintf(where, sizeof(where), "t.name = 'g' || (json_extract(e.properties, '$.line') - %d)",
+             JS_TWIN_SCALE_N + 2);
+    int named = js_twin_count_calls(db, project, "main.js", where);
+    if (all != JS_TWIN_SCALE_N || own != JS_TWIN_SCALE_N || named != JS_TWIN_SCALE_N) {
+        fprintf(stderr,
+                "  one caller: %d calls edges, %d from big, %d to the g of their line; "
+                "want %d\n",
+                all, own, named, JS_TWIN_SCALE_N);
+        ok = false;
+    }
     th_rmtree(tmp);
     ASSERT_TRUE(ok);
-    ASSERT_TRUE(ms < JS_TWIN_SCALE_MS);
+    ASSERT_TRUE(ms_callers >= 0 && ms_callers < JS_TWIN_SCALE_MS);
+    ASSERT_TRUE(ms_calls >= 0 && ms_calls < JS_TWIN_SCALE_MS);
     PASS();
 }
 
