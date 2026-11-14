@@ -323,6 +323,9 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def,
      * squeezed out. */
     append_json_raw(buf, bufsize, &pos, "variants", def->variants);
     append_json_string(buf, bufsize, &pos, "variant_key", def->variant_key);
+    if (def->is_abstract && (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX)) {
+        append_json_raw(buf, bufsize, &pos, "is_abstract", "true");
+    }
     append_json_string(buf, bufsize, &pos, "signature", def->signature);
     append_json_string(buf, bufsize, &pos, "return_type", def->return_type);
     append_json_string(buf, bufsize, &pos, "parent_class", def->parent_class);
@@ -536,7 +539,10 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
         /* A split overload member 2..n (callable_overload.h) too: resolution
          * keeps landing on the group's base QN, and the overload choice
          * happens once the target is known (cbm_pipeline_overload_targets). */
-        if (cbm_def_props_generated(def->extra_props) ||
+        /* TS signatures remain exact targets for typed receivers, but cannot
+         * compete with implementations in any short-name guess. */
+        if ((def->is_abstract && (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX)) ||
+            cbm_def_props_generated(def->extra_props) ||
             (lang != CBM_LANG_SWIFT && def->qn_sig_off > 0)) {
             cbm_registry_add_qn_only(ctx->registry, def->qualified_name, def->label);
         } else {
