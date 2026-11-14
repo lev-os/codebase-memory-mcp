@@ -1770,8 +1770,12 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      `g.GET("/x", handler(deps))`, axum
  *      `.route("/x", post(api::responses::handle))`), and a Rust/C++ qualified
  *      handler path is no longer sent through the PHP `::` branch (#2883).
+ *  14: TypeScript interface and abstract method signatures remain qualified
+ *      targets but leave the name-guess registry. Persist is_abstract so
+ *      incremental proxy seeds retain that distinction. Older indexes rebuild
+ *      once to remove guessed edges and populate the signature mark.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 13 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 14 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

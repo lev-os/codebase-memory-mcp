@@ -1379,19 +1379,21 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
     if (!incr_label_is_registry_symbol(node->label)) {
         return;
     }
-    /* A generated member stays out of the short-name index here as in the
-     * full index (pass_definitions.c); its node carries the mark. */
-    if (cbm_node_props_generated(node->properties_json) ||
-        cbm_node_is_split_overload(node->qualified_name, node->name, node->properties_json)) {
-        cbm_registry_add_qn_only(seed->registry, node->qualified_name, node->label);
-        return;
-    }
     CBMLanguage lang = cbm_registry_synthetic_path_language(node->file_path);
     if (lang == CBM_LANG_COUNT && seed->lang_by_path && node->file_path) {
         void *v = cbm_ht_get(seed->lang_by_path, node->file_path);
         if (v) {
             lang = (CBMLanguage)((uintptr_t)v - SKIP_ONE);
         }
+    }
+    /* Preserve the full index's exact-only registration for TS signatures,
+     * generated members and split overloads. */
+    if (((lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) && node->properties_json &&
+         strstr(node->properties_json, "\"is_abstract\":true")) ||
+        cbm_node_props_generated(node->properties_json) ||
+        cbm_node_is_split_overload(node->qualified_name, node->name, node->properties_json)) {
+        cbm_registry_add_qn_only(seed->registry, node->qualified_name, node->label);
+        return;
     }
     /* Same per-file bound as the full index (pass_definitions.c). */
     size_t prefix_len = lang == CBM_LANG_PYTHON
