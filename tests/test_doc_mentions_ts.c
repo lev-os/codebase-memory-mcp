@@ -278,6 +278,48 @@ TEST(doc_mentions_ts_resolution) {
     PASS();
 }
 
+/* Two declarations of one name that start on one line (line 4): a reference
+ * from the body around the nested one takes the node its scope and their
+ * extent pick (the module helper of split.ts runs past the body's last line),
+ * and stays a graph gap when they pick none (same.ts: both end on that line,
+ * inside the body's lines). */
+TEST(doc_mentions_ts_nested_same_line) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dlts_line_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char repo[512];
+    char db[512];
+    snprintf(repo, sizeof(repo), "%s/repo", tmp);
+    snprintf(db, sizeof(db), "%s/g.db", tmp);
+    th_write_file(
+        TH_PATH(repo, "src/same.ts"),
+        "export function outer() {\n"
+        "  /** Calls {@link helper}. */\n"
+        "  function inside() {}\n"
+        "  function helper() { return 2; } return inside; } export function helper() {}\n");
+    th_write_file(TH_PATH(repo, "src/split.ts"),
+                  "export function outer() {\n"
+                  "  /** Calls {@link helper}. */\n"
+                  "  function inside() {}\n"
+                  "  function helper() { return 2; } return inside; } export function helper() {\n"
+                  "  return 1;\n"
+                  "}\n");
+    ASSERT_EQ(dm_index(repo, db, NULL), 0);
+    char reason[64];
+    dm_row(db, "src/same.ts", "helper", reason, sizeof(reason), NULL, 0);
+    if (strcmp(reason, "graph_gap") != 0) {
+        char *state = dm_doclink_state(db);
+        printf("  doc links:\n%s\n", state ? state : "(none)");
+        free(state);
+    }
+    ASSERT_STR_EQ(reason, "graph_gap");
+    ASSERT_EQ(dm_mentions_from(db, "src.same.inside"), 0);
+    ASSERT_TRUE(ts_edge(db, "src.split.inside", "src.split.outer.helper"));
+    ASSERT_EQ(dm_mentions_from(db, "src.split.inside"), 1);
+    th_cleanup(tmp);
+    PASS();
+}
+
 /* ── incremental == full; one worker == several ──────────────────── */
 
 TEST(doc_mentions_ts_incremental_equals_full) {
@@ -357,6 +399,7 @@ SUITE(doc_mentions_ts) {
     RUN_TEST(doc_mentions_ts_tokens);
     RUN_TEST(doc_mentions_ts_scope_blob);
     RUN_TEST(doc_mentions_ts_resolution);
+    RUN_TEST(doc_mentions_ts_nested_same_line);
     RUN_TEST(doc_mentions_ts_incremental_equals_full);
     RUN_TEST(doc_mentions_ts_workers_agree);
 }
