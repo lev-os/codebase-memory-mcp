@@ -1944,13 +1944,13 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
             if (aliased) {
                 char *qn = alias_module_qn(ctx, module_path, aliased);
                 if (js) {
-                    /* `aliased` lost its extension. The target as its mapping
-                     * spells it ("@rt": ["src/rt.mjs"]) picks the family. */
+                    /* A mapping with an extension picks the family. Otherwise
+                     * keep the import's spelling ("@rt.mjs": ["src/rt"]). */
                     char target[CBM_PATH_ALIAS_RESULT_MAX];
                     bool mapping_ext = false;
                     const char *spelling =
                         cbm_path_alias_target_into(amap, module_path, target, sizeof(target),
-                                                   &mapping_ext)
+                                                   &mapping_ext) && mapping_ext
                             ? target
                             : module_path;
                     char *exact_qn = js_indexed_file_qn(ctx, aliased, spelling, mapping_ext);

@@ -531,6 +531,61 @@ TEST(ei_typescript_named_relative_import) {
     PASS();
 }
 
+/* Verify the driver actually used, even under an inherited single-thread
+ * override. Restore the environment before reporting fixture failures. */
+static int ei_sequential_runs;
+static int ei_parallel_runs;
+
+static void ei_observe_mode(const char *line) {
+    if (strstr(line, "msg=pipeline.mode mode=sequential ")) {
+        ei_sequential_runs++;
+    }
+    if (strstr(line, "msg=pipeline.mode mode=parallel ")) {
+        ei_parallel_runs++;
+    }
+}
+
+static int ei_both_drivers(int (*run_case)(int)) {
+    const char *keys[] = {"CBM_WORKERS", "CBM_INDEX_SINGLE_THREAD"};
+    char *saved[2] = {0};
+    for (int i = 0; i < 2; i++) {
+        const char *old = getenv(keys[i]);
+        saved[i] = old ? strdup(old) : NULL;
+        if (old && !saved[i]) {
+            free(saved[0]);
+            free(saved[1]);
+            return 0;
+        }
+    }
+    CBMLogLevel level = cbm_log_get_level();
+    CBMLogFormat format = cbm_log_get_format();
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    cbm_log_set_sink_ex(ei_observe_mode, CBM_LOG_SINK_REPLACE);
+    int ok = 1;
+    for (int parallel = 0; parallel < 2; parallel++) {
+        int set_rc = cbm_setenv(keys[0], parallel ? "4" : "1", 1);
+        set_rc |= parallel ? cbm_unsetenv(keys[1]) : cbm_setenv(keys[1], "1", 1);
+        ei_sequential_runs = ei_parallel_runs = 0;
+        int case_ok = set_rc == 0 && run_case(parallel ? 60 : 0);
+        int mode_ok = ei_parallel_runs == parallel && ei_sequential_runs == !parallel;
+        if (!mode_ok) {
+            fprintf(stderr, "  [driver] wanted %s; observed sequential=%d parallel=%d\n",
+                    parallel ? "parallel" : "sequential", ei_sequential_runs, ei_parallel_runs);
+        }
+        ok &= case_ok && mode_ok;
+    }
+    cbm_log_set_sink(NULL);
+    cbm_log_set_format(format);
+    cbm_log_set_level(level);
+    for (int i = 0; i < 2; i++) {
+        int rc = saved[i] ? cbm_setenv(keys[i], saved[i], 1) : cbm_unsetenv(keys[i]);
+        ok &= rc == 0;
+        free(saved[i]);
+    }
+    return ok;
+}
+
 /* Literal import() dependencies use the same exact targets as static imports.
  * Computed paths and a string in the options argument must not create edges.
  * Padding crosses the parallel pipeline threshold without changing the fixture. */
@@ -605,10 +660,7 @@ static int ei_dynamic_import_case(int pad) {
 }
 
 TEST(ei_dynamic_imports_resolve_exact_modules) {
-    int sequential_ok = ei_dynamic_import_case(0);
-    int parallel_ok = ei_dynamic_import_case(60);
-    ASSERT_TRUE(sequential_ok);
-    ASSERT_TRUE(parallel_ok);
+    ASSERT_TRUE(ei_both_drivers(ei_dynamic_import_case));
     PASS();
 }
 
@@ -653,10 +705,7 @@ static int ei_hidden_directory_import_case(int pad) {
 }
 
 TEST(ei_hidden_directory_imports_resolve_exact_modules) {
-    int sequential_ok = ei_hidden_directory_import_case(0);
-    int parallel_ok = ei_hidden_directory_import_case(60);
-    ASSERT_TRUE(sequential_ok);
-    ASSERT_TRUE(parallel_ok);
+    ASSERT_TRUE(ei_both_drivers(ei_hidden_directory_import_case));
     PASS();
 }
 
@@ -683,12 +732,14 @@ static int ei_count_files(const EILangFile *files) {
  * (.mjs: .mts, .d.mts, .mjs; .cjs: .cts, .d.cts, .cjs; .js: .ts, .tsx, .d.ts,
  * .js, .jsx). A declaration file beside the target is not the target. */
 static int ei_alias_target_extension_case(int pad) {
-    EILangFile files[80] = {
+    EILangFile files[128] = {
         {"tsconfig.json",
          "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{"
          "\"@runtime\":[\"src/runtime.mjs\"],\"@legacy\":[\"src/legacy.cjs\"],"
          "\"@source\":[\"src/source.js\"],\"@generated\":[\"src/generated.js\"],"
-         "\"@typed/*\":[\"src/typed/*.js\"]}}}\n"},
+         "\"@typed/*\":[\"src/typed/*.js\"],"
+         "\"@esm-source\":[\"src/esm-source.mjs\"],\"@esm-decl\":[\"src/esm-decl.mjs\"],"
+         "\"@cjs-source\":[\"src/cjs-source.cjs\"],\"@cjs-decl\":[\"src/cjs-decl.cjs\"]}}}\n"},
         {"src/runtime.mjs", "export function start() { return 1; }\n"},
         {"src/runtime.d.ts", "export declare function start(): number;\n"},
         {"src/legacy.cjs", "module.exports = { stop() { return 1; } };\n"},
@@ -698,6 +749,24 @@ static int ei_alias_target_extension_case(int pad) {
         {"src/generated.ts", "export function make() { return 1; }\n"},
         {"src/typed/model.js", "export const model = 1;\n"},
         {"src/typed/model.ts", "export const model = 2;\n"},
+        {"src/runtime.mts", "export const alternate = 2;\n"},
+        {"src/runtime.d.mts", "export declare const alternate: number;\n"},
+        {"src/legacy.cts", "export const alternate = 2;\n"},
+        {"src/legacy.d.cts", "export declare const alternate: number;\n"},
+        {"src/esm-source.mts", "export const value = 1;\n"},
+        {"src/esm-source.d.mts", "export declare const value: number;\n"},
+        {"src/esm-source.ts", "export const value = 99;\n"},
+        {"src/esm-decl.d.mts", "export declare const value: number;\n"},
+        {"src/esm-decl.ts", "export const value = 99;\n"},
+        {"src/cjs-source.cts", "export const value = 1;\n"},
+        {"src/cjs-source.d.cts", "export declare const value: number;\n"},
+        {"src/cjs-source.ts", "export const value = 99;\n"},
+        {"src/cjs-decl.d.cts", "export declare const value: number;\n"},
+        {"src/cjs-decl.ts", "export const value = 99;\n"},
+        {"app/esm-source.ts", "import '@esm-source';\n"},
+        {"app/esm-decl.ts", "import '@esm-decl';\n"},
+        {"app/cjs-source.ts", "import '@cjs-source';\n"},
+        {"app/cjs-decl.ts", "import '@cjs-decl';\n"},
         {"app/runtime.ts", "import '@runtime';\n"},
         {"app/legacy.ts", "import '@legacy';\n"},
         {"app/source.ts", "import '@source';\n"},
@@ -708,6 +777,8 @@ static int ei_alias_target_extension_case(int pad) {
         {"app/runtime.ts", "src/runtime.mjs"},     {"app/legacy.ts", "src/legacy.cjs"},
         {"app/source.ts", "src/source.js"},        {"app/generated.ts", "src/generated.ts"},
         {"app/typed.ts", "src/typed/model.js"},
+        {"app/esm-source.ts", "src/esm-source.mts"}, {"app/esm-decl.ts", "src/esm-decl.d.mts"},
+        {"app/cjs-source.ts", "src/cjs-source.cts"}, {"app/cjs-decl.ts", "src/cjs-decl.d.cts"},
     };
     char names[60][32];
     int count = ei_pad_files(files, ei_count_files(files), names, pad);
@@ -716,51 +787,127 @@ static int ei_alias_target_extension_case(int pad) {
 }
 
 TEST(ei_alias_target_keeps_its_extension) {
-    int sequential_ok = ei_alias_target_extension_case(0);
-    int parallel_ok = ei_alias_target_extension_case(60);
-    ASSERT_TRUE(sequential_ok);
-    ASSERT_TRUE(parallel_ok);
+    ASSERT_TRUE(ei_both_drivers(ei_alias_target_extension_case));
     PASS();
 }
 
-/* CALLS edges from the function `caller` to the definition `callee` in
- * `callee_file`; -1 when the caller is missing. */
-static int ei_calls_into(cbm_store_t *store, const char *project, const char *caller,
-                         const char *callee, const char *callee_file) {
+/* An extensionless mapping retains the import's substitution family. */
+static int ei_alias_import_extension_case(int pad) {
+    EILangFile files[80] = {
+        {"tsconfig.json", "{\"compilerOptions\":{\"paths\":{\"@runtime.mjs\":[\"src/runtime\"],"
+                          "\"@legacy.cjs\":[\"src/legacy\"]}}}\n"},
+        {"src/runtime.ts", "export const value = 1;\n"},
+        {"src/runtime.mts", "export const value = 2;\n"},
+        {"src/legacy.ts", "export const value = 1;\n"},
+        {"src/legacy.cts", "export const value = 2;\n"},
+        {"app/runtime.ts", "import '@runtime.mjs';\n"},
+        {"app/legacy.ts", "import '@legacy.cjs';\n"},
+    };
+    static const EIFileEdgeExpect want[] = {
+        {"app/runtime.ts", "src/runtime.mts"}, {"app/legacy.ts", "src/legacy.cts"},
+    };
+    char names[60][32];
+    int count = ei_pad_files(files, ei_count_files(files), names, pad);
+    return ei_file_edges_match_properties(files, count, want, 2, 2, NULL, NULL, true);
+}
+
+TEST(ei_alias_without_target_extension_keeps_import_extension) {
+    ASSERT_TRUE(ei_both_drivers(ei_alias_import_extension_case));
+    PASS();
+}
+
+/* Match the complete outgoing set, including target identity and cardinality. */
+static int ei_calls_match(cbm_store_t *store, const char *project, const char *caller,
+                          const char *callee, const char *callee_file, int expected) {
     cbm_node_t *nodes = NULL;
     int count = 0;
     if (cbm_store_find_nodes_by_name(store, project, caller, &nodes, &count) != CBM_STORE_OK) {
-        return -1;
+        return 0;
     }
     int64_t source_id = 0;
+    int sources = 0;
     for (int i = 0; i < count; i++) {
         if (nodes[i].label && strcmp(nodes[i].label, "Function") == 0) {
             source_id = nodes[i].id;
+            sources++;
         }
     }
     cbm_store_free_nodes(nodes, count);
     cbm_edge_t *edges = NULL;
     int n = 0;
-    if (source_id == 0 ||
-        cbm_store_find_edges_by_source_type(store, source_id, "CALLS", &edges, &n) !=
-            CBM_STORE_OK) {
-        return -1;
+    if (sources != 1 ||
+        cbm_store_find_edges_by_source_type(store, source_id, "CALLS", &edges, &n) != CBM_STORE_OK) {
+        return 0;
     }
-    int hits = 0;
+    int ok = n == expected;
     for (int i = 0; i < n; i++) {
-        cbm_node_t target;
-        memset(&target, 0, sizeof(target));
-        if (cbm_store_find_node_by_id(store, edges[i].target_id, &target) != CBM_STORE_OK) {
-            continue;
-        }
-        if (target.name && strcmp(target.name, callee) == 0 && target.file_path &&
-            strcmp(target.file_path, callee_file) == 0) {
-            hits++;
+        cbm_node_t target = {0};
+        int rc = cbm_store_find_node_by_id(store, edges[i].target_id, &target);
+        if (rc != CBM_STORE_OK || !target.name || strcmp(target.name, callee) != 0 ||
+            !target.file_path || strcmp(target.file_path, callee_file) != 0 ||
+            !target.label || strcmp(target.label, "Function") != 0) {
+            fprintf(stderr, "  [CALLS] %s -> %s in %s (want %s in %s)\n", caller,
+                    target.name ? target.name : "?", target.file_path ? target.file_path : "?",
+                    callee, callee_file);
+            ok = 0;
         }
         cbm_node_free_fields(&target);
     }
+    if (n != expected) {
+        fprintf(stderr, "  [CALLS] %s: %d outgoing edges (want %d)\n", caller, n, expected);
+    }
     cbm_store_free_edges(edges, n);
-    return hits;
+    return ok;
+}
+
+/* Sibling exports currently share a QN. Whichever definition survives, a
+ * missing edge is preferable to a call into the other file. An explicit
+ * alias also selects the JS file without relative .js -> .ts substitution. */
+static int ei_sibling_export_case(int pad) {
+    EILangFile files[80] = {
+        {"tsconfig.json", "{\"compilerOptions\":{\"paths\":{\"@js\":[\"src/service.js\"]}}}\n"},
+        {"src/service.js", "export function run() { return 0; }\n"},
+        {"src/service.ts", "export function run() { return 1; }\n"},
+        {"src/typed.ts", "import * as api from './service.ts';\n"
+                         "export function viaTyped() { return api.run(); }\n"},
+        {"src/script.ts", "import * as api from '@js';\n"
+                          "export function viaScript() { return api.run(); }\n"},
+        {"src/relative.ts", "import * as api from './service.js';\n"
+                            "export function viaRelative() { return api.run(); }\n"},
+    };
+    char names[60][32];
+    int count = ei_pad_files(files, ei_count_files(files), names, pad);
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, files, count);
+    int ok = store != NULL;
+    static const char *const callers[] = {"viaTyped", "viaScript", "viaRelative"};
+    static const char *const targets[] = {"src/service.ts", "src/service.js", "src/service.ts"};
+    int retained = 0;
+    for (size_t i = 0; store && i < sizeof(callers) / sizeof(callers[0]); i++) {
+        cbm_node_t *nodes = NULL;
+        int n = 0, definitions = 0;
+        int rc = cbm_store_find_nodes_by_file(store, lp.project, targets[i], &nodes, &n);
+        for (int j = 0; j < n; j++) {
+            if (nodes[j].name && strcmp(nodes[j].name, "run") == 0 && nodes[j].label &&
+                strcmp(nodes[j].label, "Function") == 0) {
+                definitions++;
+            }
+        }
+        cbm_store_free_nodes(nodes, n);
+        if (i < 2) {
+            retained += definitions;
+        }
+        ok &= rc == CBM_STORE_OK && definitions <= 1 &&
+              ei_calls_match(store, lp.project, callers[i], "run", targets[i], definitions);
+    }
+    ok &= retained > 0;
+    ei_cleanup(&lp, store);
+    return ok;
+}
+
+TEST(ei_sibling_exports_never_bind_another_file) {
+    ASSERT_TRUE(ei_both_drivers(ei_sibling_export_case));
+    PASS();
 }
 
 /* service.js owns the module name that service.ts shares, so an import of
@@ -785,23 +932,14 @@ static int ei_file_target_namespace_case(int pad) {
     cbm_store_t *store = ei_index_files(&lp, files, count);
     int ok = store != NULL;
     for (size_t i = 0; store && i < sizeof(callers) / sizeof(callers[0]); i++) {
-        int hit = ei_calls_into(store, lp.project, callers[i], "run", "src/service.ts");
-        int decoy = ei_calls_into(store, lp.project, callers[i], "run", "decoy/run.ts");
-        if (hit != 1 || decoy != 0) {
-            fprintf(stderr, "  [CALLS pad=%d] %s -> run: service.ts=%d decoy=%d (want 1/0)\n",
-                    pad, callers[i], hit, decoy);
-            ok = 0;
-        }
+        ok &= ei_calls_match(store, lp.project, callers[i], "run", "src/service.ts", 1);
     }
     ei_cleanup(&lp, store);
     return ok;
 }
 
 TEST(ei_file_target_namespace_calls_reach_its_definitions) {
-    int sequential_ok = ei_file_target_namespace_case(0);
-    int parallel_ok = ei_file_target_namespace_case(60);
-    ASSERT_TRUE(sequential_ok);
-    ASSERT_TRUE(parallel_ok);
+    ASSERT_TRUE(ei_both_drivers(ei_file_target_namespace_case));
     PASS();
 }
 
@@ -825,10 +963,7 @@ static int ei_reincluded_folder_alias_case(int pad) {
 }
 
 TEST(ei_reincluded_folder_keeps_its_aliases) {
-    int sequential_ok = ei_reincluded_folder_alias_case(0);
-    int parallel_ok = ei_reincluded_folder_alias_case(60);
-    ASSERT_TRUE(sequential_ok);
-    ASSERT_TRUE(parallel_ok);
+    ASSERT_TRUE(ei_both_drivers(ei_reincluded_folder_alias_case));
     PASS();
 }
 
@@ -854,10 +989,7 @@ static int ei_module_extension_not_member_case(int pad) {
 }
 
 TEST(ei_module_extension_is_not_a_member) {
-    int sequential_ok = ei_module_extension_not_member_case(0);
-    int parallel_ok = ei_module_extension_not_member_case(60);
-    ASSERT_TRUE(sequential_ok);
-    ASSERT_TRUE(parallel_ok);
+    ASSERT_TRUE(ei_both_drivers(ei_module_extension_not_member_case));
     PASS();
 }
 
@@ -1481,10 +1613,7 @@ static int ei_py_external_import_case(int pad) {
 
 TEST(ei_py_external_import_never_binds_project_symbol) {
     /* Both legs run before asserting so a failure diagnoses both drivers. */
-    int sequential_ok = ei_py_external_import_case(0);
-    int parallel_ok = ei_py_external_import_case(60);
-    ASSERT_TRUE(sequential_ok);
-    ASSERT_TRUE(parallel_ok);
+    ASSERT_TRUE(ei_both_drivers(ei_py_external_import_case));
     PASS();
 }
 
@@ -1549,10 +1678,7 @@ static int ei_ts_bare_specifier_case(int pad) {
 }
 
 TEST(ei_ts_bare_specifier_never_binds_project_symbol) {
-    int sequential_ok = ei_ts_bare_specifier_case(0);
-    int parallel_ok = ei_ts_bare_specifier_case(60);
-    ASSERT_TRUE(sequential_ok);
-    ASSERT_TRUE(parallel_ok);
+    ASSERT_TRUE(ei_both_drivers(ei_ts_bare_specifier_case));
     PASS();
 }
 
@@ -1647,10 +1773,7 @@ static int ei_ts_workspace_package_case(int pad) {
 }
 
 TEST(ei_ts_workspace_packages_resolve_exact_source_files) {
-    int sequential_ok = ei_ts_workspace_package_case(0);
-    int parallel_ok = ei_ts_workspace_package_case(60);
-    ASSERT_TRUE(sequential_ok);
-    ASSERT_TRUE(parallel_ok);
+    ASSERT_TRUE(ei_both_drivers(ei_ts_workspace_package_case));
     PASS();
 }
 
@@ -1815,10 +1938,7 @@ static int ei_py_external_base_case(int pad) {
 
 TEST(ei_py_external_base_never_inherits_project_class) {
     /* Both legs run before asserting so a failure diagnoses both drivers. */
-    int sequential_ok = ei_py_external_base_case(0);
-    int parallel_ok = ei_py_external_base_case(60);
-    ASSERT_TRUE(sequential_ok);
-    ASSERT_TRUE(parallel_ok);
+    ASSERT_TRUE(ei_both_drivers(ei_py_external_base_case));
     PASS();
 }
 
@@ -3297,6 +3417,8 @@ SUITE(edge_imports) {
     RUN_TEST(ei_dynamic_imports_resolve_exact_modules);
     RUN_TEST(ei_hidden_directory_imports_resolve_exact_modules);
     RUN_TEST(ei_alias_target_keeps_its_extension);
+    RUN_TEST(ei_alias_without_target_extension_keeps_import_extension);
+    RUN_TEST(ei_sibling_exports_never_bind_another_file);
     RUN_TEST(ei_file_target_namespace_calls_reach_its_definitions);
     RUN_TEST(ei_reincluded_folder_keeps_its_aliases);
     RUN_TEST(ei_module_extension_is_not_a_member);
