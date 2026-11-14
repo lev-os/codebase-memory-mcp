@@ -36041,6 +36041,138 @@ TEST(pipeline_ts_imported_generic_receivers_keep_type_identity) {
     PASS();
 }
 
+static int ts_fingerprint_row_cmp(const void *a, const void *b) {
+    const char *x = *(char *const *)a;
+    const char *y = *(char *const *)b;
+    return strcmp(x ? x : "", y ? y : "");
+}
+
+/* Every CALLS edge of a project as "caller -> target @line", sorted and
+ * joined, so two graphs compare as one string. NULL on a store error. */
+static char *ts_calls_fingerprint(const char *db, const char *project, int *out_nodes) {
+    *out_nodes = -1;
+    cbm_store_t *store = cbm_store_open_path(db);
+    if (!store)
+        return NULL;
+    *out_nodes = cbm_store_count_nodes(store, project);
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    cbm_store_find_edges_by_type(store, project, "CALLS", &edges, &count);
+    char **rows = calloc((size_t)count + 1, sizeof(*rows));
+    size_t total = 1;
+    for (int i = 0; rows && i < count; i++) {
+        cbm_node_t src = {0};
+        cbm_node_t tgt = {0};
+        const char *props = edges[i].properties_json;
+        const char *at = props ? strstr(props, "\"line\":") : NULL;
+        int line = at ? atoi(at + strlen("\"line\":")) : 0;
+        bool found = cbm_store_find_node_by_id(store, edges[i].source_id, &src) == CBM_STORE_OK &&
+                     cbm_store_find_node_by_id(store, edges[i].target_id, &tgt) == CBM_STORE_OK;
+        char row[1024];
+        snprintf(row, sizeof(row), "%s -> %s @%d",
+                 found && src.qualified_name ? src.qualified_name : "?",
+                 found && tgt.qualified_name ? tgt.qualified_name : "?", line);
+        rows[i] = strdup(row);
+        total += strlen(row) + 1;
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+    if (edges)
+        cbm_store_free_edges(edges, count);
+    cbm_store_close(store);
+    if (!rows)
+        return NULL;
+    qsort(rows, (size_t)count, sizeof(*rows), ts_fingerprint_row_cmp);
+    char *out = malloc(total);
+    if (out) {
+        out[0] = '\0';
+        for (int i = 0; i < count; i++) {
+            if (rows[i]) {
+                strcat(out, rows[i]);
+                strcat(out, "\n");
+            }
+        }
+    }
+    for (int i = 0; i < count; i++)
+        free(rows[i]);
+    free(rows);
+    return out;
+}
+
+/* An incremental run after an edit of real code (a reassignment that
+ * changes a receiver, a new function with a typed receiver) must leave the
+ * graph a fresh full index of the same tree builds: the same node count and
+ * the same CALLS edges, in both execution paths. */
+TEST(pipeline_ts_incremental_code_edit_equals_fresh_full) {
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        char tmp[256] = "/tmp/cbm_ts_incr_code_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        write_temp_file(tmp, "lib.ts",
+                        "export class Port { send(): void {} }\n"
+                        "export class Decoy { send(): void {} }\n");
+        write_temp_file(tmp, "main.ts",
+                        "import { Port, Decoy } from './lib';\n"
+                        "export function run() { let p = new Port(); p.send(); }\n"
+                        "export function keep(d: Decoy) { d.send(); }\n");
+        for (int i = 0; mode && i < 50; i++) {
+            char name[64];
+            snprintf(name, sizeof(name), "pad%d.ts", i);
+            write_temp_file(tmp, name, "export {};\n");
+        }
+        XlangEnvSave saved = xlang_env_select(mode != 0);
+        char db[512], fresh[512], path[512];
+        snprintf(db, sizeof(db), "%s/graph.db", tmp);
+        snprintf(fresh, sizeof(fresh), "%s/fresh.db", tmp);
+        snprintf(path, sizeof(path), "%s/main.ts", tmp);
+        cbm_pipeline_t *first = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(first);
+        ASSERT_EQ(cbm_pipeline_run(first), 0);
+        char project[256];
+        snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(first));
+        cbm_pipeline_free(first);
+
+        write_temp_file(tmp, "main.ts",
+                        "import { Port, Decoy } from './lib';\n"
+                        "export function run() { let p = new Port(); p = new Decoy(); p.send(); }\n"
+                        "export function keep(d: Decoy) { d.send(); }\n"
+                        "export function added(q: Port) { q.send(); }\n");
+        ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000, 0), 0);
+        cbm_pipeline_t *incr = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(incr);
+        ASSERT_EQ(cbm_pipeline_run(incr), 0);
+        cbm_pipeline_free(incr);
+
+        cbm_pipeline_t *full = cbm_pipeline_new(tmp, fresh, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(full);
+        ASSERT_EQ(cbm_pipeline_run(full), 0);
+        cbm_pipeline_free(full);
+
+        int incr_nodes = 0;
+        int fresh_nodes = 0;
+        char *incr_calls = ts_calls_fingerprint(db, project, &incr_nodes);
+        char *fresh_calls = ts_calls_fingerprint(fresh, project, &fresh_nodes);
+        bool same = incr_calls && fresh_calls && strcmp(incr_calls, fresh_calls) == 0 &&
+                    incr_nodes == fresh_nodes && incr_nodes > 0;
+        bool edited = fresh_calls && strstr(fresh_calls, ".run -> ") &&
+                      strstr(fresh_calls, ".added -> ");
+        if (!same || !edited) {
+            fprintf(stderr, "incremental code edit mode=%d: nodes %d vs fresh %d\n"
+                            "incremental calls:\n%s"
+                            "fresh calls:\n%s",
+                    mode, incr_nodes, fresh_nodes, incr_calls ? incr_calls : "(null)\n",
+                    fresh_calls ? fresh_calls : "(null)\n");
+            ok = false;
+        }
+        free(incr_calls);
+        free(fresh_calls);
+        xlang_env_restore(&saved);
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 /* A call is recorded under the nearest named callable that holds it: an
  * object-literal method or arrow property, a class field arrow, a const
  * arrow inside a method, a nested function. Two callables of one file that
@@ -37290,6 +37422,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_twin_names_rebuild_old_index);
     RUN_TEST(pipeline_js_twin_callables_scale);
     RUN_TEST(pipeline_ts_imported_generic_receivers_keep_type_identity);
+    RUN_TEST(pipeline_ts_incremental_code_edit_equals_fresh_full);
     RUN_TEST(pipeline_ts_module_typed_receivers_keep_scope_and_caller);
     RUN_TEST(pipeline_ts_caller_is_innermost_named_callable);
     RUN_TEST(pipeline_ts_signature_targets_require_owner);
