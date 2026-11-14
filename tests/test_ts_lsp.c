@@ -5361,7 +5361,13 @@ TEST(tslsp_module_receiver_occurrences_and_scopes) {
         "port.send();\n"
         "try {} catch (port) { port.send(); }\n"
         "port.send();\n"
-        "describe('later', () => { const f = () => port.send(); const port = new Decoy(); });\n";
+        "describe('later', () => { const f = () => port.send(); const port = new Decoy(); });\n"
+        "switch (0) { case 0: const port = new Decoy(); port.send(); }\n"
+        "port.send();\n"
+        "let leak: any;\n"
+        "namespace Nested { class Port { send() {} } const leak = new Port(); }\n"
+        "leak.send();\n"
+        "describe('constructor', (Port: any) => { const item = new Port(); item.send(); });\n";
     CBMFileResult *r = extract_ts(source);
     ASSERT_NOT_NULL(r);
     const struct { int line; const char *target; } cases[] = {
@@ -5371,7 +5377,8 @@ TEST(tslsp_module_receiver_occurrences_and_scopes) {
         {12, "test.main.Port.send"}, {13, "test.main.Port.send"},
         {14, "test.main.Port.send"}, {15, NULL}, {16, NULL},
         {17, "test.main.Port.send"}, {18, NULL}, {19, "test.main.Port.send"},
-        {20, NULL},
+        {20, NULL}, {21, "test.main.Decoy.send"}, {22, "test.main.Port.send"},
+        {25, NULL}, {26, NULL},
     };
     bool ok = true;
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
