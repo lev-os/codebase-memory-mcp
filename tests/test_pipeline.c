@@ -36502,6 +36502,10 @@ TEST(pipeline_ts_index_file_resolver_matches_main) {
         cbm_pipeline_free(p);
     }
     th_rmtree(tmp);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 /* The CALLS edges at `line` of `file` are exactly `want`; on a mismatch the
  * strategy of each edge there is printed. */
 static bool js_this_calls_are(const char *db, const char *project, const char *file, int line,
