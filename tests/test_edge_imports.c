@@ -723,6 +723,25 @@ TEST(ei_alias_target_keeps_its_extension) {
     PASS();
 }
 
+/* An extensionless mapping retains the import's substitution family. */
+TEST(ei_alias_without_target_extension_keeps_import_extension) {
+    EILangFile files[] = {
+        {"tsconfig.json", "{\"compilerOptions\":{\"paths\":{\"@runtime.mjs\":[\"src/runtime\"],"
+                          "\"@legacy.cjs\":[\"src/legacy\"]}}}\n"},
+        {"src/runtime.ts", "export const value = 1;\n"},
+        {"src/runtime.mts", "export const value = 2;\n"},
+        {"src/legacy.ts", "export const value = 1;\n"},
+        {"src/legacy.cts", "export const value = 2;\n"},
+        {"app/runtime.ts", "import '@runtime.mjs';\n"},
+        {"app/legacy.ts", "import '@legacy.cjs';\n"},
+    };
+    static const EIFileEdgeExpect want[] = {
+        {"app/runtime.ts", "src/runtime.mts"}, {"app/legacy.ts", "src/legacy.cts"},
+    };
+    ASSERT_TRUE(ei_file_edges_match_properties(files, 7, want, 2, 2, NULL, NULL, true));
+    PASS();
+}
+
 /* Match the complete outgoing set, including target identity and cardinality. */
 static int ei_calls_match(cbm_store_t *store, const char *project, const char *caller,
                           const char *callee, const char *callee_file, int expected) {
@@ -3389,6 +3408,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_dynamic_imports_resolve_exact_modules);
     RUN_TEST(ei_hidden_directory_imports_resolve_exact_modules);
     RUN_TEST(ei_alias_target_keeps_its_extension);
+    RUN_TEST(ei_alias_without_target_extension_keeps_import_extension);
     RUN_TEST(ei_sibling_exports_never_bind_another_file);
     RUN_TEST(ei_file_target_namespace_calls_reach_its_definitions);
     RUN_TEST(ei_reincluded_folder_keeps_its_aliases);
