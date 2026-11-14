@@ -576,7 +576,8 @@ TEST(repro_grammar_config_ini) {
  * Dims 7-8 SKIPPED: hcl_func_types = empty_types so no Function node exists
  *   to source the call against; running the pipeline would vacuously fail dim 7
  *   with 0 callable-sourced edges.
- * Expected: dims 1-4 GREEN; dim 6 likely GREEN (tomap maps to function_call).
+ * The .hcl fixture must retain tomap. The same source in a Terraform/OpenTofu
+ * module must omit generic calls; that language uses module-scoped references.
  */
 TEST(repro_grammar_config_hcl) {
     static const char src[] =
@@ -594,10 +595,21 @@ TEST(repro_grammar_config_hcl) {
         "  default = \"us-east-1\"\n"
         "}\n";
     static const char bad[] = "resource \"aws_instance\" \"main\" {\n  ami = ";
-    if (config_callable_battery("HCL", src, CBM_LANG_HCL, "main.tf",
+    if (config_callable_battery("HCL", src, CBM_LANG_HCL, "main.hcl",
                                 NULL, "tomap") != 0)
         return 1;
-    return config_robustness("HCL", bad, CBM_LANG_HCL, "main.tf");
+    /* Generic HCL preserves function calls. Terraform/OpenTofu module files
+     * resolve references in their module scope and must not link built-ins to
+     * unrelated same-named functions in the repository. */
+    const char *modules[] = {"main.tf", "main.tofu"};
+    for (size_t i = 0; i < sizeof(modules) / sizeof(modules[0]); i++) {
+        CBMFileResult *module = inv_rx(src, CBM_LANG_HCL, modules[i]);
+        ASSERT_NOT_NULL(module);
+        ASSERT_FALSE(module->has_error);
+        ASSERT_FALSE(inv_has_call(module, "tomap"));
+        cbm_free_result(module);
+    }
+    return config_robustness("HCL", bad, CBM_LANG_HCL, "main.hcl");
 }
 
 /* ── XML ──────────────────────────────────────────────────────────────────────
