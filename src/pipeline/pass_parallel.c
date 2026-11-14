@@ -1934,7 +1934,10 @@ static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *re
                 char esc_ln[CBM_SZ_128];
                 cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
                 char imp_props[CBM_SZ_256];
-                if (imp->reexport == CBM_REEXPORT_NAMED && imp->member) {
+                if (imp->is_dynamic) {
+                    snprintf(imp_props, sizeof(imp_props),
+                             "{\"local_name\":\"%s\",\"dynamic\":true}", esc_ln);
+                } else if (imp->reexport == CBM_REEXPORT_NAMED && imp->member) {
                     char esc_member[CBM_SZ_128];
                     cbm_json_escape(esc_member, sizeof(esc_member), imp->member);
                     snprintf(imp_props, sizeof(imp_props),

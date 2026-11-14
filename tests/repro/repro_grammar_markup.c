@@ -579,6 +579,7 @@ TEST(repro_grammar_markup_bibtex) {
  *
  * Dims asserted: 1-4 + R.
  * Dims 5-8 SKIPPED: no def/call types in spec.
+ * Also require one Diagram and five DiagramElement definitions.
  * Expected GREEN: dims 1-4. extract-clean RED would indicate the Mermaid grammar
  * misparses standard flowchart syntax.
  */
@@ -591,6 +592,14 @@ TEST(repro_grammar_markup_mermaid) {
         "    C --> E[End]\n"
         "    D --> E\n";
     static const char bad[] = "flowchart TD\n    A[Start] --> ";
+    CBMFileResult *diagram = inv_rx(src, CBM_LANG_MERMAID, "diagram.mmd");
+    ASSERT_NOT_NULL(diagram);
+    int diagrams = inv_count_label(diagram, "Diagram");
+    int elements = inv_count_label(diagram, "DiagramElement");
+    cbm_free_result(diagram);
+    ASSERT_EQ(diagrams, 1);
+    ASSERT_EQ(elements, 5);
+    ASSERT_FALSE(inv_label_valid("UnknownDiagramLabel"));
     if (markup_base_battery("Mermaid", src, CBM_LANG_MERMAID, "diagram.mmd") != 0)
         return 1;
     return markup_robustness("Mermaid", bad, CBM_LANG_MERMAID, "diagram.mmd");

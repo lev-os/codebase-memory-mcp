@@ -42,7 +42,8 @@ static inline int inv_label_valid(const char *label) {
         "Function",  "Method",   "Class",     "Interface", "Struct",   "Enum",    "EnumMember",
         "Module",    "Variable", "Constant",  "Field",     "Trait",    "Type",    "TypeAlias",
         "Namespace", "Property", "Route",     "Macro",     "Union",    "Protocol","Mixin",
-        "Package",   "Object",   "Section",   "Impl",      "Annotation", "Resource", NULL};
+        "Package",   "Object",   "Section",   "Impl",      "Annotation", "Resource",
+        "Diagram",   "DiagramElement", NULL};
     if (!label)
         return 0;
     for (const char **v = valid; *v; v++)

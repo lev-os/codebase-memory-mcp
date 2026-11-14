@@ -100,4 +100,12 @@ enum { CBM_PATH_ALIAS_RESULT_MAX = 4096 };
 bool cbm_path_alias_resolve_into(const cbm_path_alias_map_t *map, const char *module_path,
                                  char *out, size_t cap);
 
+/* The alias target before any extension is removed, as the matched mapping
+ * spells it ("@rt": ["src/rt.mjs"] gives "src/rt.mjs"). *mapping_ext (may be
+ * NULL) is set when the mapping itself names a module extension
+ * ("src/rt.mjs", or a wildcard target that ends in ".js"); TypeScript then
+ * reads that exact file before it tries extension substitution. */
+bool cbm_path_alias_target_into(const cbm_path_alias_map_t *map, const char *module_path, char *out,
+                                size_t cap, bool *mapping_ext);
+
 #endif /* CBM_PATH_ALIAS_H */

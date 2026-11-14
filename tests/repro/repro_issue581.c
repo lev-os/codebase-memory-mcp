@@ -228,7 +228,7 @@ TEST(repro_issue581_query_rss_stable) {
     size_t rss_end = 0;
 
     for (int i = 0; i < ITER_TOTAL; i++) {
-        char *resp = cbm_mcp_handle_tool(lp.srv, "search_graph", args);
+        char *resp = rh_call(&lp, "search_graph", args);
         // The response must be freed on every call -- verifying the MCP layer
         // does not itself accumulate the result (it doesn't; the leak is lower).
         if (resp) {

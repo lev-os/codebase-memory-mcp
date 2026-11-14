@@ -134,7 +134,50 @@ TEST(repro_harness_cleanup_empty_dbpath_preserves_relative_sidecars) {
     PASS();
 }
 
+/* A query must reach the indexed fixture even after indexing restored the
+ * caller's cache. Both a configured cache and an unset override must survive. */
+TEST(repro_harness_query_uses_fixture_cache_and_restores_environment) {
+    RProj project;
+    cbm_store_t *store = rh_index(&project, "query_fixture.py",
+                                 "def fixture_answer(): return 42\n");
+    ASSERT_NOT_NULL(store);
+    const char *prior = getenv("CBM_CACHE_DIR");
+    char *saved = prior ? cbm_strdup(prior) : NULL;
+    ASSERT_TRUE(!prior || saved);
+    char args[512];
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"name_pattern\":\"fixture_answer\",\"format\":\"json\"}",
+             project.project);
+    int queries_found_fixture = 0;
+    int environments_restored = 0;
+    for (int configured = 0; configured < 2; configured++) {
+        if (configured)
+            cbm_setenv("CBM_CACHE_DIR", project.tmpdir, 1);
+        else
+            cbm_unsetenv("CBM_CACHE_DIR");
+        char *response = rh_call(&project, "search_graph", args);
+        if (response && !strstr(response, "\"isError\":true") &&
+            strstr(response, "query_fixture.py") && strstr(response, "fixture_answer"))
+            queries_found_fixture++;
+        free(response);
+        const char *after = getenv("CBM_CACHE_DIR");
+        if (configured ? (after && strcmp(after, project.tmpdir) == 0) : !after)
+            environments_restored++;
+    }
+    if (saved) {
+        cbm_setenv("CBM_CACHE_DIR", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    rh_cleanup(&project, store);
+    ASSERT_EQ(queries_found_fixture, 2);
+    ASSERT_EQ(environments_restored, 2);
+    PASS();
+}
+
 SUITE(repro_harness_cleanup) {
+    RUN_TEST(repro_harness_query_uses_fixture_cache_and_restores_environment);
     RUN_TEST(repro_harness_cleans_temp_project_after_fixture_write_failure);
     RUN_TEST(repro_harness_cleanup_empty_dbpath_preserves_relative_sidecars);
 }

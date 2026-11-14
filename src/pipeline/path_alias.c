@@ -19,6 +19,7 @@
  */
 
 #include "pipeline/path_alias.h"
+#include "discover/discover.h"
 
 #include "pipeline/pipeline_internal.h"
 
@@ -50,20 +51,28 @@ enum {
 /* Strip an explicit JS/TS module extension in place, keeping dotted
  * basenames such as "cat.service". Same set as the relative resolver in
  * fqn.c. Returns its argument. */
-static char *strip_resolved_ext(char *path) {
-    if (!path) {
-        return path;
-    }
-    static const char *const extensions[] = {
-        ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".json",
-    };
-    size_t len = strlen(path);
-    for (size_t i = 0; i < sizeof(extensions) / sizeof(extensions[0]); i++) {
-        size_t ext_len = strlen(extensions[i]);
-        if (len > ext_len && strcmp(path + len - ext_len, extensions[i]) == 0) {
-            path[len - ext_len] = '\0';
-            break;
+static const char *const RESOLVED_EXTS[] = {
+    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".json",
+};
+
+/* Length of the module extension `path` ends with, else 0. With `whole`
+ * the extension may be all of `path` (a mapping suffix such as ".js"). */
+static size_t resolved_ext_len(const char *path, bool whole) {
+    size_t len = path ? strlen(path) : 0;
+    for (size_t i = 0; i < sizeof(RESOLVED_EXTS) / sizeof(RESOLVED_EXTS[0]); i++) {
+        size_t ext_len = strlen(RESOLVED_EXTS[i]);
+        if ((len > ext_len || (whole && len == ext_len)) &&
+            strcmp(path + len - ext_len, RESOLVED_EXTS[i]) == 0) {
+            return ext_len;
         }
+    }
+    return 0;
+}
+
+static char *strip_resolved_ext(char *path) {
+    size_t ext_len = resolved_ext_len(path, false);
+    if (ext_len > 0) {
+        path[strlen(path) - ext_len] = '\0';
     }
     return path;
 }
@@ -329,13 +338,17 @@ void cbm_path_alias_collection_free(cbm_path_alias_collection_t *coll) {
     free(coll);
 }
 
-bool cbm_path_alias_resolve_into(const cbm_path_alias_map_t *map, const char *module_path,
-                                 char *out, size_t cap) {
+bool cbm_path_alias_target_into(const cbm_path_alias_map_t *map, const char *module_path, char *out,
+                                size_t cap, bool *mapping_ext) {
+    if (mapping_ext) {
+        *mapping_ext = false;
+    }
     if (!map || !module_path || !out || cap == 0) {
         return false;
     }
     size_t mod_len = strlen(module_path);
     int n = CBM_NOT_FOUND;
+    bool spelled = false;
 
     for (int i = 0; i < map->count; i++) {
         const cbm_path_alias_t *e = &map->entries[i];
@@ -356,11 +369,13 @@ bool cbm_path_alias_resolve_into(const cbm_path_alias_map_t *map, const char *mo
             int wild_len = (int)(mod_len - prefix_len - suffix_len);
             n = snprintf(out, cap, "%s%.*s%s", e->target_prefix, wild_len, module_path + prefix_len,
                          e->target_suffix);
+            spelled = resolved_ext_len(e->target_suffix, true) > 0;
             break;
         }
 
         if (strcmp(module_path, e->alias_prefix) == 0) {
             n = snprintf(out, cap, "%s", e->target_prefix);
+            spelled = resolved_ext_len(e->target_prefix, false) > 0;
             break;
         }
     }
@@ -373,6 +388,17 @@ bool cbm_path_alias_resolve_into(const cbm_path_alias_map_t *map, const char *mo
         n = snprintf(out, cap, "%s/%s", map->base_url, module_path);
     }
     if (n < 0 || (size_t)n >= cap) {
+        return false;
+    }
+    if (mapping_ext) {
+        *mapping_ext = spelled;
+    }
+    return true;
+}
+
+bool cbm_path_alias_resolve_into(const cbm_path_alias_map_t *map, const char *module_path,
+                                 char *out, size_t cap) {
+    if (!cbm_path_alias_target_into(map, module_path, out, cap, NULL)) {
         return false;
     }
     strip_resolved_ext(out);
@@ -397,7 +423,7 @@ enum { TS_CONFIG_NAMES_COUNT = 2 };
 
 static void find_alias_files(const char *abs_dir, const char *rel_dir, alias_config_hit_t *out,
                              int *count, int max_count, int depth, char **excluded_dirs,
-                             int excluded_count) {
+                             int excluded_count, const cbm_gitignore_t *cbmignore) {
     if (*count >= max_count || depth > CBM_PATH_ALIAS_MAX_DEPTH) {
         return;
     }
@@ -436,9 +462,7 @@ static void find_alias_files(const char *abs_dir, const char *rel_dir, alias_con
             continue;
         }
         const char *name = ent->name;
-        if (name[0] == '.' || strcmp(name, "node_modules") == 0 || strcmp(name, "dist") == 0 ||
-            strcmp(name, "build") == 0 || strcmp(name, ".next") == 0 ||
-            strcmp(name, "coverage") == 0 || strcmp(name, "target") == 0 /* Rust */) {
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 || strcmp(name, "build") == 0) {
             continue;
         }
         char child_abs[CBM_SZ_512];
@@ -449,7 +473,11 @@ static void find_alias_files(const char *abs_dir, const char *rel_dir, alias_con
         } else {
             snprintf(child_rel, sizeof(child_rel), "%s/%s", rel_dir, name);
         }
-        if (cbm_pipeline_relpath_is_excluded(child_rel, excluded_dirs, excluded_count)) {
+        /* Discovery's own decision: a hidden source directory can own a
+         * tsconfig, and a skipped one (vendor) that .cbmignore re-includes
+         * keeps its configs, as it keeps its files. */
+        if (cbm_discover_dir_excluded(name, child_rel, CBM_MODE_FULL, cbmignore) ||
+            cbm_pipeline_relpath_is_excluded(child_rel, excluded_dirs, excluded_count)) {
             continue;
         }
         /* A link is not followed, as discovery does not follow one. is_dir is
@@ -462,7 +490,7 @@ static void find_alias_files(const char *abs_dir, const char *rel_dir, alias_con
             continue;
         }
         find_alias_files(child_abs, child_rel, out, count, max_count, depth + 1, excluded_dirs,
-                         excluded_count);
+                         excluded_count, cbmignore);
     }
     cbm_closedir(d);
 }
@@ -478,8 +506,13 @@ cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_pat
         return NULL;
     }
     int count = 0;
+    /* The pipeline's discovery reads the repository's own .cbmignore. */
+    char ignore_path[CBM_SZ_4K];
+    snprintf(ignore_path, sizeof(ignore_path), "%s/.cbmignore", repo_path);
+    cbm_gitignore_t *cbmignore = cbm_gitignore_load(ignore_path);
     find_alias_files(repo_path, "", hits, &count, CBM_PATH_ALIAS_MAX_FILES, 0, excluded_dirs,
-                     excluded_count);
+                     excluded_count, cbmignore);
+    cbm_gitignore_free(cbmignore);
     if (count >= CBM_PATH_ALIAS_MAX_FILES) {
         cbm_log_warn("path_alias.files.cap_hit", "repo", repo_path, "kept", "256_of_more");
     }

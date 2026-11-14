@@ -2086,9 +2086,12 @@ static const char *pxc_js_namespace_member(const char *callee, const char *local
     return callee + local_len + SKIP_ONE;
 }
 
+/* A namespace binding names a module object: a Module, a Folder entry, or a
+ * File whose module name a sibling owns (service.ts beside service.js). The
+ * barrel registry answers `local.member` from that file's own definitions,
+ * so the call never looks under the File QN. */
 static bool pxc_js_namespace_target(const cbm_gbuf_node_t *target) {
-    return target && target->label &&
-           (strcmp(target->label, "Module") == 0 || strcmp(target->label, "Folder") == 0);
+    return target && pxc_label_is_container(target->label);
 }
 
 /* Record a barrel request for each call `local.member()` through a JS/TS

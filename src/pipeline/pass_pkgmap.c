@@ -24,6 +24,7 @@
 #include "foundation/str_util.h"
 #include "foundation/win_utf8.h"
 #include "foundation/yaml.h"
+#include "helpers.h"
 
 #include <yyjson/yyjson.h>
 
@@ -1721,6 +1722,102 @@ static char *alias_module_qn(const cbm_pipeline_ctx_t *ctx, const char *module_p
     return stripped;
 }
 
+/* The name of the indexed file at exactly `candidate`: its Module when that
+ * Module belongs to this file, else its File. NULL when no such file. */
+static char *js_indexed_candidate_qn(const cbm_pipeline_ctx_t *ctx, const char *candidate) {
+    const cbm_gbuf_node_t *file = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, candidate);
+    if (!file || !file->file_path || strcmp(file->file_path, candidate) != 0) {
+        return NULL;
+    }
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    const char *module_qn = cbm_fqn_module(&arena, ctx->project_name, candidate);
+    const cbm_gbuf_node_t *module = module_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, module_qn) : NULL;
+    bool exact = module && module->label && strcmp(module->label, "Module") == 0 &&
+                 module->file_path && strcmp(module->file_path, candidate) == 0;
+    char *qn = strdup(exact ? module->qualified_name : file->qualified_name);
+    cbm_arena_destroy(&arena);
+    return qn;
+}
+
+/* A resolved path can name a file whose extracted module has a different QN
+ * (hidden directory markers are removed during extraction), or no Module at
+ * all. Find the exact indexed file before using its extraction-owned name.
+ * A same-named file elsewhere must never satisfy this lookup. `spelling` is
+ * the path as written before the resolver removed its extension: the import
+ * specifier, or the alias target as its mapping spells it. With
+ * `exact_first` (the alias mapping itself names the extension) the file as
+ * spelled comes before extension substitution, as in TypeScript. */
+static char *js_indexed_file_qn(const cbm_pipeline_ctx_t *ctx, const char *path,
+                                const char *spelling, bool exact_first) {
+    static const char *const implicit_exts[] = {
+        ".ts", ".tsx", ".d.ts", ".js", ".jsx", ".mts", ".cts", ".d.mts", ".d.cts", ".mjs",
+        ".cjs", ".json",
+    };
+    static const char *const js_exts[] = {".ts", ".tsx", ".d.ts", ".js", ".jsx"};
+    static const char *const jsx_exts[] = {".tsx", ".d.ts", ".jsx"};
+    static const char *const mjs_exts[] = {".mts", ".d.mts", ".mjs"};
+    static const char *const cjs_exts[] = {".cts", ".d.cts", ".cjs"};
+    if (!ctx->gbuf || !path || !path[0]) {
+        return NULL;
+    }
+    /* The path resolver already removed an explicit module extension. Honor
+     * that spelling: x.css.ts must not bind x.css, and x.mjs substitutes an
+     * .mts source rather than an unrelated .ts file with the same stem. */
+    const char *ext = spelling ? strrchr(spelling, '.') : NULL;
+    const char *single_ext[] = {ext};
+    const char *const *extensions = implicit_exts;
+    size_t extension_count = sizeof(implicit_exts) / sizeof(implicit_exts[0]);
+    bool spelled = true;
+    if (ext && strcmp(ext, ".js") == 0) {
+        extensions = js_exts;
+        extension_count = sizeof(js_exts) / sizeof(js_exts[0]);
+    } else if (ext && strcmp(ext, ".jsx") == 0) {
+        extensions = jsx_exts;
+        extension_count = sizeof(jsx_exts) / sizeof(jsx_exts[0]);
+    } else if (ext && strcmp(ext, ".mjs") == 0) {
+        extensions = mjs_exts;
+        extension_count = sizeof(mjs_exts) / sizeof(mjs_exts[0]);
+    } else if (ext && strcmp(ext, ".cjs") == 0) {
+        extensions = cjs_exts;
+        extension_count = sizeof(cjs_exts) / sizeof(cjs_exts[0]);
+    } else if (ext && (strcmp(ext, ".ts") == 0 || strcmp(ext, ".tsx") == 0 ||
+                       strcmp(ext, ".mts") == 0 || strcmp(ext, ".cts") == 0 ||
+                       strcmp(ext, ".json") == 0)) {
+        extensions = single_ext;
+        extension_count = 1;
+    } else {
+        spelled = false;
+    }
+    if (spelled && exact_first) {
+        char candidate[PKGMAP_PATH_BUF];
+        int n = snprintf(candidate, sizeof(candidate), "%s%s", path, ext);
+        char *qn = n > 0 && (size_t)n < sizeof(candidate) ? js_indexed_candidate_qn(ctx, candidate)
+                                                          : NULL;
+        if (qn) {
+            return qn;
+        }
+    }
+    for (int pass = 0; pass < (spelled ? 1 : 3); pass++) {
+        bool direct = !spelled && pass == 0;
+        const char *entry = !spelled && pass == 2 ? "/index" : "";
+        size_t count = direct ? 1 : extension_count;
+        for (size_t i = 0; i < count; i++) {
+            char candidate[PKGMAP_PATH_BUF];
+            int n = snprintf(candidate, sizeof(candidate), "%s%s%s", path, entry,
+                             direct ? "" : extensions[i]);
+            if (n < 0 || (size_t)n >= sizeof(candidate)) {
+                continue;
+            }
+            char *qn = js_indexed_candidate_qn(ctx, candidate);
+            if (qn) {
+                return qn;
+            }
+        }
+    }
+    return NULL;
+}
+
 /* A JS directory import names its indexed entry module, never the Folder.
  * Package targets, including output-to-source mappings, must name a module
  * that exists in the graph. */
@@ -1824,8 +1921,17 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
          * dotted extensionless basename such as `featureX.engine` is not
          * stripped a second time by cbm_pipeline_fqn_module. */
         char *qn = cbm_pipeline_fqn_folder(ctx->project_name, resolved);
+        if (js) {
+            char *exact_qn = js_indexed_file_qn(ctx, resolved, module_path, false);
+            if (exact_qn) {
+                free(qn);
+                qn = exact_qn;
+            } else {
+                qn = js_module_qn(ctx, qn, false);
+            }
+        }
         free(resolved);
-        return js ? js_module_qn(ctx, qn, false) : qn;
+        return qn;
     }
 
     /* 1b. Try build-tool path aliases (tsconfig/jsconfig paths today;
@@ -1837,8 +1943,26 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
             char *aliased = cbm_path_alias_resolve(amap, module_path);
             if (aliased) {
                 char *qn = alias_module_qn(ctx, module_path, aliased);
+                if (js) {
+                    /* `aliased` lost its extension. The target as its mapping
+                     * spells it ("@rt": ["src/rt.mjs"]) picks the family. */
+                    char target[CBM_PATH_ALIAS_RESULT_MAX];
+                    bool mapping_ext = false;
+                    const char *spelling =
+                        cbm_path_alias_target_into(amap, module_path, target, sizeof(target),
+                                                   &mapping_ext)
+                            ? target
+                            : module_path;
+                    char *exact_qn = js_indexed_file_qn(ctx, aliased, spelling, mapping_ext);
+                    if (exact_qn) {
+                        free(qn);
+                        qn = exact_qn;
+                    } else {
+                        qn = js_module_qn(ctx, qn, false);
+                    }
+                }
                 free(aliased);
-                return js ? js_module_qn(ctx, qn, false) : qn;
+                return qn;
             }
         }
     }
@@ -2219,44 +2343,6 @@ static bool python_external_hit_rejected(const CBMImport *imp, const char *name,
  * `import com.example.Foo`, Rust `use crate::ops::helper`) keep it. */
 bool cbm_import_symbol_fallback_allowed(CBMLanguage lang) {
     return lang != CBM_LANG_GO;
-}
-
-/* A JS/TS import specifier always names a module, never a symbol: the
- * imported names live in local_name. A bare specifier (`path`, `node:fs`,
- * `@scope/pkg/sub`) that Strategy 1 (relative path, tsconfig paths, package
- * manifests) did not resolve is a Node built-in or a dependency outside the
- * graph, and the correct result is NO edge. The name-guess fallbacks instead
- * matched a path segment against any project symbol (`path` -> Router.path(),
- * `@acme/config` -> a test's local `config`), and the import map then sent
- * every call of the imported name there at import_map confidence. */
-static bool js_external_bare_specifier(CBMLanguage lang, const char *module_path) {
-    if (lang != CBM_LANG_JAVASCRIPT && lang != CBM_LANG_TYPESCRIPT && lang != CBM_LANG_TSX) {
-        return false;
-    }
-    if (!module_path || !module_path[0]) {
-        return false;
-    }
-    if (strncmp(module_path, "node:", strlen("node:")) == 0) {
-        return true;
-    }
-    /* Only an npm package-name shape: `pkg[/sub]` or `@scope/pkg[/sub]`.
-     * Bundler aliases (`@/x`, `~/x`) and `#x` subpath imports keep the
-     * fallbacks, since no package name spells them. */
-    const char *s = module_path;
-    if (*s == '@') {
-        s++;
-        if (!isalnum((unsigned char)*s)) {
-            return false;
-        }
-        while (*s && *s != '/') {
-            s++;
-        }
-        if (*s != '/') {
-            return false;
-        }
-        s++;
-    }
-    return isalnum((unsigned char)*s) != 0;
 }
 
 /* A Python def or class declared inside a function body -- a closure, a
@@ -3313,13 +3399,17 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
     char *target_qn = cbm_pipeline_resolve_module(ctx, source_rel, imp->module_path);
     const cbm_gbuf_node_t *target = target_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, target_qn) : NULL;
     free(target_qn);
+    /* JS/TS specifiers name modules: the last dotted part of `./codec.js` is
+     * an extension, never a member, even when the module exports `js`. */
+    bool js_specifier = src_lang == CBM_LANG_JAVASCRIPT || src_lang == CBM_LANG_TYPESCRIPT ||
+                        src_lang == CBM_LANG_TSX;
     if (target && (!php_only || node_in_php_file(target))) {
-        /* Python/TS from-import of a member: module_path is often
+        /* Python from-import of a member: module_path is often
          * "pkg.mod.symbol" while resolve_module lands on the Module node
          * "pkg.mod". Prefer the member Function/Class when it exists —
          * required for `from M import f as g` so CALLS can import_map to f
          * (local_name g ≠ f). */
-        if (target->label &&
+        if (!js_specifier && target->label &&
             (strcmp(target->label, "Module") == 0 || strcmp(target->label, "File") == 0)) {
             char symbuf[256];
             const char *sym = import_candidate_symbol(imp->module_path, symbuf, sizeof(symbuf));
@@ -3342,8 +3432,9 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
         return target;
     }
 
-    /* A bare JS/TS specifier Strategy 1 missed is external: no edge. */
-    if (js_external_bare_specifier(src_lang, imp->module_path)) {
+    /* A path not found above must not fall through to an unrelated
+     * same-named function, folder or namespace. */
+    if (js_specifier) {
         return NULL;
     }
 
