@@ -5457,7 +5457,88 @@ TEST(tslsp_unknown_generic_lookup_work_is_linear) {
     PASS();
 }
 
+/* One expected `.send` record per source line: the exact target, or none.
+ * A line with no expectation in `cases` is not checked. */
+typedef struct {
+    int line;
+    const char *target;
+} TsLineTarget;
+
+static bool ts_check_line_targets(const char *label, const char *source,
+                                  const TsLineTarget *cases, size_t count) {
+    CBMFileResult *r = extract_ts(source);
+    if (!r)
+        return false;
+    bool ok = true;
+    for (size_t i = 0; i < count; i++) {
+        const char *line = source;
+        for (int n = 1; n < cases[i].line && line; n++) {
+            line = strchr(line, '\n');
+            line = line ? line + 1 : NULL;
+        }
+        const char *end = line ? strchr(line, '\n') : NULL;
+        if (!line || !end) {
+            fprintf(stderr, "%s line %d: no such line\n", label, cases[i].line);
+            ok = false;
+            continue;
+        }
+        int hits = 0;
+        for (int j = 0; j < r->resolved_calls.count; j++) {
+            const CBMResolvedCall *rc = &r->resolved_calls.items[j];
+            if (rc->kind != CBM_RESOLVED_INVOCATION || rc->confidence <= 0 ||
+                rc->site_start_byte < (uint32_t)(line - source) ||
+                rc->site_start_byte >= (uint32_t)(end - source) || !rc->callee_qn ||
+                !strstr(rc->callee_qn, ".send"))
+                continue;
+            hits++;
+            if (!cases[i].target || strcmp(rc->callee_qn, cases[i].target) != 0) {
+                fprintf(stderr, "%s line %d: unexpected target %s\n", label, cases[i].line,
+                        rc->callee_qn);
+                ok = false;
+            }
+        }
+        int want = cases[i].target ? 1 : 0;
+        if (hits != want) {
+            fprintf(stderr, "%s line %d: %d records, want %d\n", label, cases[i].line, hits,
+                    want);
+            ok = false;
+        }
+    }
+    cbm_free_result(r);
+    return ok;
+}
+
+/* An assignment replaces the receiver type in straight-line code. A branch,
+ * a loop or a closure leaves only the declared type, or none. */
+TEST(tslsp_reassignment_replaces_receiver_type) {
+    const char *source =
+        "class Port { send() {} }\n"
+        "class Decoy { send() {} }\n"
+        "let p = new Port(); p = new Decoy(); p.send();\n"
+        "let q = new Port(); if (Math.random()) q = new Decoy(); q.send();\n"
+        "let r = new Port(); r.send(); r = new Decoy();\n"
+        "let s = new Port(); const f = () => s.send(); s = new Decoy();\n"
+        "let t = new Port(); while (Math.random()) { t.send(); t = new Decoy(); }\n"
+        "let u = new Port(); later(); u.send(); function later() { u = new Decoy(); }\n"
+        "function g(w: Port) { w = new Decoy(); w.send(); }\n"
+        "let x: Port = new Port(); if (Math.random()) x = new Decoy(); x.send();\n"
+        "function h() { let k = new Port(); k = new Decoy(); k.send(); }\n"
+        "let v = new Port(); { v = new Decoy(); v.send(); }\n"
+        "let m = new Port(); try { m = new Decoy(); } catch (e) { m.send(); }\n"
+        "const c = new Port(); const cf = () => c.send();\n";
+    const TsLineTarget cases[] = {
+        {3, "test.main.Decoy.send"}, {4, NULL}, {5, "test.main.Port.send"}, {6, NULL},
+        {7, NULL}, {8, NULL}, {9, "test.main.Decoy.send"}, {10, "test.main.Port.send"},
+        {11, "test.main.Decoy.send"}, {12, "test.main.Decoy.send"}, {13, NULL},
+        {14, "test.main.Port.send"},
+    };
+    ASSERT_TRUE(ts_check_line_targets("reassignment", source, cases,
+                                      sizeof(cases) / sizeof(cases[0])));
+    PASS();
+}
+
 SUITE(ts_lsp) {
+    RUN_TEST(tslsp_reassignment_replaces_receiver_type);
     RUN_TEST(tslsp_unknown_generic_lookup_work_is_linear);
     RUN_TEST(tslsp_module_receiver_occurrences_and_scopes);
     RUN_TEST(ts_lsp_index_file_local_scope);

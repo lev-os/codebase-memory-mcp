@@ -1545,6 +1545,450 @@ static bool ts_scope_has_binding(const CBMScope *scope, const char *name) {
     return ts_scope_binding_owner(scope, name) != NULL;
 }
 
+/* ── Reassigned locals ─────────────────────────────────────────────────
+ *
+ * A `let`, a `var` or a parameter can hold another object after an
+ * assignment. One walk of the file records each name that an assignment
+ * writes, with the function that holds the write. A binding whose name a
+ * nested function writes is fixed to its annotation (or unknown): the closure
+ * can run at any time. A binding written only in its own function is a flow
+ * binding. The statement walk replaces its type at a straight-line
+ * assignment, makes it unknown at any other write and at a loop that writes
+ * it, and a nested function or a pass outside the walk reads its annotation
+ * (or unknown). A `const` is never a flow binding. */
+typedef struct {
+    const char *name;
+    uint32_t start;
+    uint32_t fn_start;
+    uint32_t fn_end;
+} TsAssignSite;
+
+struct TsAssignSites {
+    TsAssignSite *by_name;   /* sorted by (name, start) */
+    TsAssignSite **by_start; /* the same sites, sorted by start */
+    int count;
+    bool complete; /* false: a write may be missing, so every write is a closure write */
+};
+
+typedef struct {
+    const CBMVarBinding *binding; /* NULL: empty slot */
+    const CBMType *declared;      /* the annotation, or NULL */
+    bool fixed;                   /* a closure writes it: the walk never updates it */
+} TsFlowBinding;
+
+struct TsFlowBindings {
+    TsFlowBinding *slots;
+    uint32_t cap; /* power of two */
+    uint32_t count;
+};
+
+static bool ts_is_flow_function(TSNode node) {
+    return ts_is_function_declaration(node) || ts_is_function_value(node) ||
+           node_kind_is(node, "method_definition") || node_kind_is(node, "class_static_block") ||
+           node_kind_is(node, "internal_module");
+}
+
+typedef struct {
+    TsAssignSite *items;
+    int count;
+    int cap;
+    bool failed;
+} TsSiteVec;
+
+static void ts_site_push(TSLSPContext *ctx, TsSiteVec *v, TSNode name, uint32_t fs, uint32_t fe) {
+    if (v->failed)
+        return;
+    if (v->count == v->cap) {
+        int cap = v->cap ? v->cap * 2 : 64;
+        TsAssignSite *items =
+            (TsAssignSite *)cbm_arena_alloc(ctx->arena, (size_t)cap * sizeof(*items));
+        if (!items) {
+            v->failed = true;
+            return;
+        }
+        if (v->count)
+            memcpy(items, v->items, (size_t)v->count * sizeof(*items));
+        v->items = items;
+        v->cap = cap;
+    }
+    char *text = node_text(ctx, name);
+    if (!text) {
+        v->failed = true;
+        return;
+    }
+    v->items[v->count++] = (TsAssignSite){
+        .name = text, .start = ts_node_start_byte(name), .fn_start = fs, .fn_end = fe};
+}
+
+/* Every identifier a destructuring target writes. Nesting past 64 levels
+ * marks the set incomplete, which fails closed. */
+static void ts_site_push_pattern(TSLSPContext *ctx, TsSiteVec *v, TSNode pattern, uint32_t fs,
+                                 uint32_t fe, int depth) {
+    if (ts_node_is_null(pattern))
+        return;
+    if (depth > 64) {
+        v->failed = true;
+        return;
+    }
+    const char *kind = ts_node_type(pattern);
+    if (strcmp(kind, "identifier") == 0 ||
+        strcmp(kind, "shorthand_property_identifier_pattern") == 0) {
+        ts_site_push(ctx, v, pattern, fs, fe);
+    } else if (strcmp(kind, "pair_pattern") == 0) {
+        TSNode value = ts_node_child_by_field_name(pattern, "value", TS_LSP_FIELD_LEN("value"));
+        ts_site_push_pattern(ctx, v, value, fs, fe, depth + 1);
+    } else if (strcmp(kind, "assignment_pattern") == 0 ||
+               strcmp(kind, "object_assignment_pattern") == 0) {
+        ts_site_push_pattern(ctx, v,
+                             ts_node_child_by_field_name(pattern, "left", TS_LSP_FIELD_LEN("left")),
+                             fs, fe, depth + 1);
+    } else if (strcmp(kind, "object_pattern") == 0 || strcmp(kind, "array_pattern") == 0 ||
+               strcmp(kind, "rest_pattern") == 0 ||
+               strcmp(kind, "parenthesized_expression") == 0) {
+        uint32_t count = ts_node_named_child_count(pattern);
+        for (uint32_t i = 0; i < count; i++)
+            ts_site_push_pattern(ctx, v, ts_node_named_child(pattern, i), fs, fe, depth + 1);
+    }
+}
+
+static void ts_site_visit(TSLSPContext *ctx, TsSiteVec *v, TSNode node, uint32_t fs, uint32_t fe) {
+    const char *kind = ts_node_type(node);
+    if (kind[0] == 'a' && (strcmp(kind, "assignment_expression") == 0 ||
+                           strcmp(kind, "augmented_assignment_expression") == 0)) {
+        ts_site_push_pattern(ctx, v,
+                             ts_node_child_by_field_name(node, "left", TS_LSP_FIELD_LEN("left")),
+                             fs, fe, 0);
+    } else if (kind[0] == 'f' && strcmp(kind, "for_in_statement") == 0) {
+        /* `for (x of xs)` writes an existing binding. A header with a
+         * `kind` (`for (const x of xs)`) declares x instead. */
+        TSNode left = ts_node_child_by_field_name(node, "left", TS_LSP_FIELD_LEN("left"));
+        TSNode decl_kind = ts_node_child_by_field_name(node, "kind", TS_LSP_FIELD_LEN("kind"));
+        if (ts_node_is_null(decl_kind) && !node_kind_is(left, "lexical_declaration") &&
+            !node_kind_is(left, "variable_declaration"))
+            ts_site_push_pattern(ctx, v, left, fs, fe, 0);
+    }
+}
+
+static int ts_site_name_cmp(const void *pa, const void *pb) {
+    const TsAssignSite *a = (const TsAssignSite *)pa;
+    const TsAssignSite *b = (const TsAssignSite *)pb;
+    int by_name = strcmp(a->name, b->name);
+    if (by_name)
+        return by_name;
+    return (a->start > b->start) - (a->start < b->start);
+}
+
+static int ts_site_start_cmp(const void *pa, const void *pb) {
+    const TsAssignSite *a = *(const TsAssignSite *const *)pa;
+    const TsAssignSite *b = *(const TsAssignSite *const *)pb;
+    return (a->start > b->start) - (a->start < b->start);
+}
+
+/* One cursor walk of the file; no recursion over the tree. */
+static void ts_collect_assign_sites(TSLSPContext *ctx, TSNode root) {
+    if (ctx->assign_sites || !ctx->arena || ts_node_is_null(root))
+        return;
+    struct TsAssignSites *sites =
+        (struct TsAssignSites *)cbm_arena_alloc(ctx->arena, sizeof(*sites));
+    if (!sites)
+        return;
+    memset(sites, 0, sizeof(*sites));
+    ctx->assign_sites = sites;
+
+    TsSiteVec v = {0};
+    uint32_t inline_fns[2 * 32];
+    uint32_t *fns = inline_fns;
+    int fn_cap = 32;
+    int fn_top = 0;
+    fns[0] = 0;
+    fns[1] = UINT32_MAX;
+    fn_top = 1;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    for (bool done = false; !done && !v.failed;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        ts_site_visit(ctx, &v, node, fns[2 * fn_top - 2], fns[2 * fn_top - 1]);
+        bool fn = ts_is_flow_function(node);
+        if (fn) {
+            if (fn_top == fn_cap) {
+                uint32_t *grown = (uint32_t *)cbm_arena_alloc(
+                    ctx->arena, (size_t)fn_cap * 4 * sizeof(*grown));
+                if (!grown) {
+                    v.failed = true;
+                    break;
+                }
+                memcpy(grown, fns, (size_t)fn_cap * 2 * sizeof(*fns));
+                fns = grown;
+                fn_cap *= 2;
+            }
+            fns[2 * fn_top] = ts_node_start_byte(node);
+            fns[2 * fn_top + 1] = ts_node_end_byte(node);
+            fn_top++;
+        }
+        if (ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        if (fn)
+            fn_top--;
+        for (;;) {
+            if (ts_tree_cursor_goto_next_sibling(&cursor))
+                break;
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                done = true;
+                break;
+            }
+            if (ts_is_flow_function(ts_tree_cursor_current_node(&cursor)))
+                fn_top--;
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    if (v.failed)
+        return; /* complete stays false: every writable binding is fixed */
+
+    TsAssignSite **by_start = NULL;
+    if (v.count) {
+        qsort(v.items, (size_t)v.count, sizeof(*v.items), ts_site_name_cmp);
+        by_start =
+            (TsAssignSite **)cbm_arena_alloc(ctx->arena, (size_t)v.count * sizeof(*by_start));
+        if (!by_start)
+            return;
+        for (int i = 0; i < v.count; i++)
+            by_start[i] = &v.items[i];
+        qsort(by_start, (size_t)v.count, sizeof(*by_start), ts_site_start_cmp);
+    }
+    sites->by_name = v.items;
+    sites->by_start = by_start;
+    sites->count = v.count;
+    sites->complete = true;
+}
+
+/* 0: nothing writes name in the function being walked; 1: only that function
+ * writes it; 2: a nested function writes it (or the site set is incomplete). */
+static int ts_assign_writes(const TSLSPContext *ctx, const char *name) {
+    const struct TsAssignSites *sites = ctx->assign_sites;
+    if (!sites || !name)
+        return 0;
+    if (!sites->complete)
+        return 2;
+    int lo = 0;
+    int hi = sites->count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        const TsAssignSite *s = &sites->by_name[mid];
+        int c = strcmp(s->name, name);
+        if (c < 0 || (c == 0 && s->start < ctx->fn_start))
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    int writes = 0;
+    for (int i = lo; i < sites->count; i++) {
+        const TsAssignSite *s = &sites->by_name[i];
+        if (strcmp(s->name, name) != 0 || s->start >= ctx->fn_end)
+            break;
+        if (s->fn_start != ctx->fn_start || s->fn_end != ctx->fn_end)
+            return 2;
+        writes = 1;
+    }
+    return writes;
+}
+
+static uint32_t ts_flow_slot(const struct TsFlowBindings *set, const CBMVarBinding *b) {
+    uint64_t x = (uint64_t)(uintptr_t)b;
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    uint32_t i = (uint32_t)x & (set->cap - 1);
+    while (set->slots[i].binding && set->slots[i].binding != b)
+        i = (i + 1) & (set->cap - 1);
+    return i;
+}
+
+static const TsFlowBinding *ts_flow_find(const TSLSPContext *ctx, const CBMVarBinding *b) {
+    const struct TsFlowBindings *set = ctx->flow_bindings;
+    if (!set || !set->cap || !b)
+        return NULL;
+    const TsFlowBinding *slot = &set->slots[ts_flow_slot(set, b)];
+    return slot->binding ? slot : NULL;
+}
+
+static bool ts_flow_put(TSLSPContext *ctx, const CBMVarBinding *b, const CBMType *declared,
+                        bool fixed) {
+    struct TsFlowBindings *set = ctx->flow_bindings;
+    if (!set) {
+        set = (struct TsFlowBindings *)cbm_arena_alloc(ctx->arena, sizeof(*set));
+        if (!set)
+            return false;
+        memset(set, 0, sizeof(*set));
+        ctx->flow_bindings = set;
+    }
+    if (!set->cap || (set->count + 1) * 10 >= set->cap * 7) {
+        uint32_t cap = set->cap ? set->cap * 2 : 64;
+        TsFlowBinding *slots =
+            (TsFlowBinding *)cbm_arena_alloc(ctx->arena, (size_t)cap * sizeof(*slots));
+        if (!slots)
+            return false;
+        memset(slots, 0, (size_t)cap * sizeof(*slots));
+        struct TsFlowBindings grown = {.slots = slots, .cap = cap, .count = set->count};
+        for (uint32_t i = 0; i < set->cap; i++) {
+            if (set->slots[i].binding)
+                grown.slots[ts_flow_slot(&grown, set->slots[i].binding)] = set->slots[i];
+        }
+        *set = grown;
+    }
+    TsFlowBinding *slot = &set->slots[ts_flow_slot(set, b)];
+    if (!slot->binding)
+        set->count++;
+    *slot = (TsFlowBinding){.binding = b, .declared = declared, .fixed = fixed};
+    return true;
+}
+
+/* Bind name as a flow binding; one that cannot be recorded fails closed. */
+static void ts_bind_flow(TSLSPContext *ctx, CBMScope *frame, const char *name,
+                         const CBMType *type, const CBMType *declared, bool fixed) {
+    const CBMType *floor = declared ? declared : cbm_type_unknown();
+    cbm_scope_bind(frame, name, fixed ? floor : type);
+    const CBMVarBinding *b = cbm_scope_lookup_local(frame, name);
+    if (!b || !ts_flow_put(ctx, b, declared, fixed))
+        cbm_scope_bind(frame, name, floor);
+}
+
+/* Bind one declared name in frame. `writable` is false for a `const`. */
+static void ts_bind_local(TSLSPContext *ctx, CBMScope *frame, const char *name,
+                          const CBMType *type, const CBMType *declared, bool writable) {
+    if (!ctx || !frame || !name)
+        return;
+    if (!type)
+        type = cbm_type_unknown();
+    if (declared && cbm_type_is_unknown(declared))
+        declared = NULL;
+    int writes = writable ? ts_assign_writes(ctx, name) : 0;
+    if (writes == 0) {
+        cbm_scope_bind(frame, name, type);
+        return;
+    }
+    ts_bind_flow(ctx, frame, name, type, declared, writes == 2);
+}
+
+/* True when owner is a frame of the function being walked. */
+static bool ts_scope_in_function(const TSLSPContext *ctx, const CBMScope *owner) {
+    for (const CBMScope *s = ctx->current_scope; s; s = s->parent) {
+        if (s == owner)
+            return true;
+        if (s == ctx->fn_scope)
+            return false;
+    }
+    return false;
+}
+
+/* The type a binding has at this point of the walk (see TsAssignSites). */
+static const CBMType *ts_binding_type(TSLSPContext *ctx, const CBMScope *owner,
+                                      const CBMVarBinding *b) {
+    const CBMType *t = b->type ? b->type : cbm_type_unknown();
+    const TsFlowBinding *flow = ts_flow_find(ctx, b);
+    if (!flow || flow->fixed)
+        return t;
+    ctx->flow_reads++;
+    if (ctx->flow_walk && ts_scope_in_function(ctx, owner))
+        return t;
+    return flow->declared ? flow->declared : cbm_type_unknown();
+}
+
+/* The nearest binding's type, or NULL when name is unbound. */
+static const CBMType *ts_lookup_binding_type(TSLSPContext *ctx, const char *name) {
+    if (!name)
+        return NULL;
+    for (const CBMScope *s = ctx->current_scope; s; s = s->parent) {
+        const CBMVarBinding *b = cbm_scope_lookup_local(s, name);
+        if (b)
+            return ts_binding_type(ctx, s, b);
+    }
+    return NULL;
+}
+
+/* A write to an existing binding. A straight-line write in the frame that
+ * owns the binding replaces its type. Any other write leaves the owner with
+ * its annotation (or unknown); a straight-line write in a nearer frame also
+ * binds the new type there, for the rest of that block. */
+static void ts_flow_write(TSLSPContext *ctx, const char *name, const CBMType *value,
+                          bool straight) {
+    CBMScope *owner = (CBMScope *)ts_scope_binding_owner(ctx->current_scope, name);
+    if (!owner)
+        return; /* an import, a module callable or a global */
+    const CBMVarBinding *b = cbm_scope_lookup_local(owner, name);
+    const TsFlowBinding *flow = ts_flow_find(ctx, b);
+    if (!flow) {
+        /* Bound without a write check (a catch or loop variable, a reserved
+         * name): a write from a nested function fixes it now. */
+        int writes = ts_scope_in_function(ctx, owner) ? ts_assign_writes(ctx, name) : 2;
+        if (writes == 2) {
+            cbm_scope_bind(owner, name, cbm_type_unknown());
+            b = cbm_scope_lookup_local(owner, name);
+            if (b)
+                (void)ts_flow_put(ctx, b, NULL, true);
+            return;
+        }
+    }
+    if (flow && flow->fixed)
+        return;
+    const CBMType *declared = flow ? flow->declared : NULL;
+    const CBMType *floor = declared ? declared : cbm_type_unknown();
+    const CBMType *next = (straight && value && !cbm_type_is_unknown(value)) ? value : floor;
+    if (straight && owner == ctx->current_scope) {
+        cbm_scope_bind(owner, name, next);
+        if (!flow && !ts_flow_put(ctx, b, NULL, false))
+            cbm_scope_bind(owner, name, floor);
+        return;
+    }
+    cbm_scope_bind(owner, name, floor);
+    if (straight)
+        ts_bind_flow(ctx, ctx->current_scope, name, next, declared, false);
+}
+
+/* Every name a destructuring write targets loses its proof. */
+static void ts_flow_write_pattern(TSLSPContext *ctx, TSNode pattern, int depth) {
+    if (ts_node_is_null(pattern) || depth > 64)
+        return;
+    const char *kind = ts_node_type(pattern);
+    if (strcmp(kind, "identifier") == 0 ||
+        strcmp(kind, "shorthand_property_identifier_pattern") == 0) {
+        ts_flow_write(ctx, node_text(ctx, pattern), NULL, false);
+    } else if (strcmp(kind, "pair_pattern") == 0) {
+        ts_flow_write_pattern(
+            ctx, ts_node_child_by_field_name(pattern, "value", TS_LSP_FIELD_LEN("value")),
+            depth + 1);
+    } else if (strcmp(kind, "assignment_pattern") == 0 ||
+               strcmp(kind, "object_assignment_pattern") == 0) {
+        ts_flow_write_pattern(
+            ctx, ts_node_child_by_field_name(pattern, "left", TS_LSP_FIELD_LEN("left")),
+            depth + 1);
+    } else if (strcmp(kind, "object_pattern") == 0 || strcmp(kind, "array_pattern") == 0 ||
+               strcmp(kind, "rest_pattern") == 0 ||
+               strcmp(kind, "parenthesized_expression") == 0) {
+        uint32_t count = ts_node_named_child_count(pattern);
+        for (uint32_t i = 0; i < count; i++)
+            ts_flow_write_pattern(ctx, ts_node_named_child(pattern, i), depth + 1);
+    }
+}
+
+/* Before a loop: a name the loop writes holds no single type in it. */
+static void ts_flow_enter_loop(TSLSPContext *ctx, TSNode loop) {
+    const struct TsAssignSites *sites = ctx->assign_sites;
+    if (!sites || !sites->count)
+        return;
+    uint32_t start = ts_node_start_byte(loop);
+    uint32_t end = ts_node_end_byte(loop);
+    int lo = 0;
+    int hi = sites->count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (sites->by_start[mid]->start < start)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    for (int i = lo; i < sites->count && sites->by_start[i]->start < end; i++)
+        ts_flow_write(ctx, sites->by_start[i]->name, NULL, false);
+}
+
 /* ── Functions by QN ──────────────────────────────────────────────────
  *
  * The per-file registry has no hash index, so cbm_registry_lookup_func scans
@@ -1768,10 +2212,10 @@ static const CBMType *type_of_identifier(TSLSPContext *ctx, const char *name) {
     if (!ctx || !name)
         return cbm_type_unknown();
 
-    // Scope lookup (params, locals).
-    const CBMType *t = cbm_scope_lookup(ctx->current_scope, name);
-    if (ts_scope_has_binding(ctx->current_scope, name))
-        return t ? t : cbm_type_unknown();
+    // Scope lookup (params, locals), with reassigned locals at this point.
+    const CBMType *bound = ts_lookup_binding_type(ctx, name);
+    if (bound)
+        return bound;
 
     // Imports: bare identifier matching an import binding. Compute the full symbol QN
     // and look it up in the registry. If it's a registered func, return its signature;
@@ -2546,8 +2990,10 @@ const CBMType *ts_eval_expr_type(TSLSPContext *ctx, TSNode node) {
     }
     ctx->eval_depth++;
     /* Snapshot for the memo-store guard: any degraded return in this subtree
-     * bumps the counter and blocks the store below. */
+     * bumps the counter and blocks the store below. A read of a reassigned
+     * local depends on the point of the walk, not on the node alone. */
     unsigned long degraded_before = g_ts_eval_degraded;
+    unsigned long flow_before = ctx->flow_reads;
 
     const CBMType *result = cbm_type_unknown();
     const char *kind = ts_node_type(node);
@@ -2799,7 +3245,7 @@ const CBMType *ts_eval_expr_type(TSLSPContext *ctx, TSNode node) {
     /* Store only completed, non-degraded evaluations (see g_ts_eval_degraded);
      * result is never NULL here (initialized to unknown), so NULL stays the
      * empty-slot sentinel. */
-    if (result && g_ts_eval_degraded == degraded_before)
+    if (result && g_ts_eval_degraded == degraded_before && ctx->flow_reads == flow_before)
         ts_memo_put(ctx, node.id, result);
     return result;
 }
@@ -2958,7 +3404,16 @@ static void shadow_block_declarations(TSLSPContext *ctx, TSNode block) {
     ts_tree_cursor_delete(&statements);
 }
 
-static void bind_variable_declarator(TSLSPContext *ctx, TSNode decl) {
+/* A `var` or `let` declaration can be written again; a `const` cannot. */
+static bool ts_declaration_writable(TSLSPContext *ctx, TSNode declaration) {
+    if (node_kind_is(declaration, "variable_declaration"))
+        return true;
+    TSNode kind = ts_node_child_by_field_name(declaration, "kind", TS_LSP_FIELD_LEN("kind"));
+    const char *text = ts_node_is_null(kind) ? NULL : node_text(ctx, kind);
+    return text && strcmp(text, "let") == 0;
+}
+
+static void bind_variable_declarator(TSLSPContext *ctx, TSNode decl, bool writable) {
     TSNode name = ts_node_child_by_field_name(decl, "name", TS_LSP_FIELD_LEN("name"));
     TSNode tann = ts_node_child_by_field_name(decl, "type", TS_LSP_FIELD_LEN("type"));
     TSNode value = ts_node_child_by_field_name(decl, "value", TS_LSP_FIELD_LEN("value"));
@@ -2978,8 +3433,7 @@ static void bind_variable_declarator(TSLSPContext *ctx, TSNode decl) {
 
     if (node_kind_is(name, "identifier")) {
         char *nm = node_text(ctx, name);
-        if (nm)
-            cbm_scope_bind(ctx->current_scope, nm, bound);
+        ts_bind_local(ctx, ctx->current_scope, nm, bound, declared, writable);
     } else if (node_kind_is(name, "object_pattern")) {
         // Destructure object: `const { a, b } = obj` — bind a and b to obj.a and obj.b types.
         uint32_t nc = ts_node_named_child_count(name);
@@ -2991,7 +3445,8 @@ static void bind_variable_declarator(TSLSPContext *ctx, TSNode decl) {
             if (strcmp(pk, "shorthand_property_identifier_pattern") == 0) {
                 char *pnm = node_text(ctx, pn);
                 if (pnm)
-                    cbm_scope_bind(ctx->current_scope, pnm, lookup_member_type(ctx, bound, pnm));
+                    ts_bind_local(ctx, ctx->current_scope, pnm,
+                                  lookup_member_type(ctx, bound, pnm), NULL, writable);
             } else if (strcmp(pk, "pair_pattern") == 0) {
                 TSNode key = ts_node_child_by_field_name(pn, "key", TS_LSP_FIELD_LEN("key"));
                 TSNode val = ts_node_child_by_field_name(pn, "value", TS_LSP_FIELD_LEN("value"));
@@ -3000,8 +3455,8 @@ static void bind_variable_declarator(TSLSPContext *ctx, TSNode decl) {
                     char *knm = node_text(ctx, key);
                     char *vnm = node_text(ctx, val);
                     if (knm && vnm) {
-                        cbm_scope_bind(ctx->current_scope, vnm,
-                                       lookup_member_type(ctx, bound, knm));
+                        ts_bind_local(ctx, ctx->current_scope, vnm,
+                                      lookup_member_type(ctx, bound, knm), NULL, writable);
                     }
                 }
             }
@@ -3025,7 +3480,7 @@ static void bind_variable_declarator(TSLSPContext *ctx, TSNode decl) {
                        (int)i < bound->data.tuple.count) {
                 et = bound->data.tuple.elems[i];
             }
-            cbm_scope_bind(ctx->current_scope, pnm, et);
+            ts_bind_local(ctx, ctx->current_scope, pnm, et, NULL, writable);
         }
     }
 }
@@ -3036,8 +3491,7 @@ static void bind_parameter(TSLSPContext *ctx, TSNode param) {
     const char *pk = ts_node_type(param);
     if (strcmp(pk, "identifier") == 0) {
         char *name = node_text(ctx, param);
-        if (name)
-            cbm_scope_bind(ctx->current_scope, name, cbm_type_unknown());
+        ts_bind_local(ctx, ctx->current_scope, name, cbm_type_unknown(), NULL, true);
         return;
     }
     if (strcmp(pk, "required_parameter") != 0 && strcmp(pk, "optional_parameter") != 0 &&
@@ -3135,8 +3589,7 @@ static void bind_parameter(TSLSPContext *ctx, TSNode param) {
 
     if (node_kind_is(pattern, "identifier")) {
         char *nm = node_text(ctx, pattern);
-        if (nm)
-            cbm_scope_bind(ctx->current_scope, nm, t);
+        ts_bind_local(ctx, ctx->current_scope, nm, t, t, true);
     } else if (node_kind_is(pattern, "object_pattern")) {
         uint32_t nc = ts_node_named_child_count(pattern);
         for (uint32_t i = 0; i < nc; i++) {
@@ -3183,11 +3636,12 @@ void ts_process_statement(TSLSPContext *ctx, TSNode node) {
     const char *kind = ts_node_type(node);
 
     if (strcmp(kind, "lexical_declaration") == 0 || strcmp(kind, "variable_declaration") == 0) {
+        bool writable = ts_declaration_writable(ctx, node);
         uint32_t nc = ts_node_named_child_count(node);
         for (uint32_t i = 0; i < nc; i++) {
             TSNode c = ts_node_named_child(node, i);
             if (node_kind_is(c, "variable_declarator"))
-                bind_variable_declarator(ctx, c);
+                bind_variable_declarator(ctx, c, writable);
         }
     } else if (strcmp(kind, "for_in_statement") == 0 || strcmp(kind, "for_of_statement") == 0) {
         TSNode left = ts_node_child_by_field_name(node, "left", TS_LSP_FIELD_LEN("left"));
@@ -3207,8 +3661,8 @@ void ts_process_statement(TSLSPContext *ctx, TSNode node) {
                     TSNode nm = ts_node_child_by_field_name(v, "name", TS_LSP_FIELD_LEN("name"));
                     if (node_kind_is(nm, "identifier")) {
                         char *s = node_text(ctx, nm);
-                        if (s)
-                            cbm_scope_bind(ctx->current_scope, s, elem);
+                        ts_bind_local(ctx, ctx->current_scope, s, elem, NULL,
+                                      ts_declaration_writable(ctx, left));
                     }
                 }
             } else if (node_kind_is(left, "identifier")) {
@@ -3406,6 +3860,92 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
     }
 }
 
+typedef struct {
+    CBMScope *scope;
+    uint32_t start;
+    uint32_t end;
+} TsFnSave;
+
+/* The frame just pushed is the function's: its own writes are flow, and a
+ * read through it of an outer reassigned local is not proven. */
+static TsFnSave ts_enter_function(TSLSPContext *ctx, TSNode fn) {
+    TsFnSave saved = {ctx->fn_scope, ctx->fn_start, ctx->fn_end};
+    ctx->fn_scope = ctx->current_scope;
+    ctx->fn_start = ts_node_start_byte(fn);
+    ctx->fn_end = ts_node_end_byte(fn);
+    return saved;
+}
+
+static void ts_leave_function(TSLSPContext *ctx, TsFnSave saved) {
+    ctx->fn_scope = saved.scope;
+    ctx->fn_start = saved.start;
+    ctx->fn_end = saved.end;
+}
+
+/* Walk one statement of a block whose frame is current: an assignment it
+ * makes directly is straight-line code of that frame. */
+static void process_block_statement(TSLSPContext *ctx, TSNode stmt) {
+    ctx->straight_stmt = stmt.id;
+    process_node(ctx, stmt);
+}
+
+static void ts_process_assignment(TSLSPContext *ctx, TSNode node, bool straight) {
+    TSNode left = ts_node_child_by_field_name(node, "left", TS_LSP_FIELD_LEN("left"));
+    TSNode right = ts_node_child_by_field_name(node, "right", TS_LSP_FIELD_LEN("right"));
+    if (node_kind_is(node, "augmented_assignment_expression"))
+        straight = false; /* `x ??= y` keeps x or takes y */
+    if (!ts_node_is_null(right))
+        process_node(ctx, right);
+    while (node_kind_is(left, "parenthesized_expression") && ts_node_named_child_count(left) == 1)
+        left = ts_node_named_child(left, 0);
+    if (node_kind_is(left, "identifier")) {
+        const CBMType *value = straight ? ts_eval_expr_type(ctx, right) : NULL;
+        ts_flow_write(ctx, node_text(ctx, left), value, straight);
+    } else if (node_kind_is(left, "object_pattern") || node_kind_is(left, "array_pattern")) {
+        process_node(ctx, left); /* default values can call */
+        ts_flow_write_pattern(ctx, left, 0);
+    } else if (!ts_node_is_null(left)) {
+        process_node(ctx, left);
+    }
+}
+
+/* The expression of a straight-line statement: a comma list runs in order. */
+static void ts_walk_straight_expression(TSLSPContext *ctx, TSNode expr) {
+    for (;;) {
+        while (node_kind_is(expr, "parenthesized_expression") &&
+               ts_node_named_child_count(expr) == 1)
+            expr = ts_node_named_child(expr, 0);
+        if (node_kind_is(expr, "assignment_expression")) {
+            ts_process_assignment(ctx, expr, true);
+            return;
+        }
+        if (!node_kind_is(expr, "sequence_expression")) {
+            process_node(ctx, expr);
+            return;
+        }
+        /* The last operand may be the rest of the list: continue with it
+         * instead of recursing, so a long minified list stays flat. */
+        TSNode last = {0};
+        bool have_last = false;
+        TSTreeCursor cursor = ts_tree_cursor_new(expr);
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            do {
+                TSNode child = ts_tree_cursor_current_node(&cursor);
+                if (!ts_node_is_named(child))
+                    continue;
+                if (have_last)
+                    ts_walk_straight_expression(ctx, last);
+                last = child;
+                have_last = true;
+            } while (ts_tree_cursor_goto_next_sibling(&cursor));
+        }
+        ts_tree_cursor_delete(&cursor);
+        if (!have_last)
+            return;
+        expr = last;
+    }
+}
+
 // Process an arrow_function or function_expression as a callback whose param types are
 // contextually typed by the enclosing call (e.g. `arr.map(x => x.length)` — `x` should
 // be bound to `arr`'s element type via Array<T>.map's `(x: T) => U` signature). The
@@ -3416,6 +3956,7 @@ static void process_callback_arrow(TSLSPContext *ctx, TSNode arrow, const CBMTyp
 
     CBMScope *saved = ctx->current_scope;
     ctx->current_scope = cbm_scope_push(ctx->arena, saved);
+    TsFnSave fn_saved = ts_enter_function(ctx, arrow);
 
     // Tree-sitter typescript shapes for arrow functions:
     //   `(x, y) => body`  → parameters: formal_parameters
@@ -3434,8 +3975,7 @@ static void process_callback_arrow(TSLSPContext *ctx, TSNode arrow, const CBMTyp
                 (expected->data.func.param_types && expected->data.func.param_types[0])
                     ? expected->data.func.param_types[0]
                     : cbm_type_unknown();
-            if (nm)
-                cbm_scope_bind(ctx->current_scope, nm, pt);
+            ts_bind_local(ctx, ctx->current_scope, nm, pt, pt, true);
         }
     } else if (!ts_node_is_null(params)) {
         uint32_t pc = ts_node_named_child_count(params);
@@ -3476,8 +4016,8 @@ static void process_callback_arrow(TSLSPContext *ctx, TSNode arrow, const CBMTyp
                 }
             }
             if (pname) {
-                cbm_scope_bind(ctx->current_scope, pname,
-                               expected_pt ? expected_pt : cbm_type_unknown());
+                ts_bind_local(ctx, ctx->current_scope, pname,
+                              expected_pt ? expected_pt : cbm_type_unknown(), expected_pt, true);
             }
             idx++;
         }
@@ -3490,7 +4030,7 @@ static void process_callback_arrow(TSLSPContext *ctx, TSNode arrow, const CBMTyp
             TSTreeCursor cursor = ts_tree_cursor_new(body);
             if (ts_tree_cursor_goto_first_child(&cursor)) {
                 do {
-                    process_node(ctx, ts_tree_cursor_current_node(&cursor));
+                    process_block_statement(ctx, ts_tree_cursor_current_node(&cursor));
                 } while (ts_tree_cursor_goto_next_sibling(&cursor));
             }
             ts_tree_cursor_delete(&cursor);
@@ -3499,6 +4039,7 @@ static void process_callback_arrow(TSLSPContext *ctx, TSNode arrow, const CBMTyp
         }
     }
 
+    ts_leave_function(ctx, fn_saved);
     ctx->current_scope = saved;
 }
 
@@ -3631,7 +4172,7 @@ static const CBMType *narrow_discriminated_union(TSLSPContext *ctx, TSNode condi
         lit++;
     }
 
-    const CBMType *var_type = cbm_scope_lookup(ctx->current_scope, var_name);
+    const CBMType *var_type = ts_lookup_binding_type(ctx, var_name);
     if (!var_type || var_type->kind != CBM_TYPE_UNION)
         return NULL;
     if (!var_type->data.union_type.members)
@@ -3804,7 +4345,7 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
         TSTreeCursor cursor = ts_tree_cursor_new(node);
         if (ts_tree_cursor_goto_first_child(&cursor)) {
             do {
-                process_node(ctx, ts_tree_cursor_current_node(&cursor));
+                process_block_statement(ctx, ts_tree_cursor_current_node(&cursor));
             } while (ts_tree_cursor_goto_next_sibling(&cursor));
         }
         ts_tree_cursor_delete(&cursor);
@@ -3816,6 +4357,8 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
      * surrounding module/function. Unknown catch parameters still shadow it. */
     if (strcmp(kind, "for_statement") == 0 || strcmp(kind, "for_in_statement") == 0 ||
         strcmp(kind, "for_of_statement") == 0 || strcmp(kind, "catch_clause") == 0) {
+        if (strcmp(kind, "catch_clause") != 0)
+            ts_flow_enter_loop(ctx, node);
         CBMScope *saved = ctx->current_scope;
         ctx->current_scope = cbm_scope_push(ctx->arena, saved);
         if (strcmp(kind, "catch_clause") == 0) {
@@ -3832,6 +4375,27 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
         }
         ts_tree_cursor_delete(&cursor);
         ctx->current_scope = saved;
+        return;
+    }
+
+    if (strcmp(kind, "while_statement") == 0 || strcmp(kind, "do_statement") == 0)
+        ts_flow_enter_loop(ctx, node); /* then the default walk below */
+
+    if (strcmp(kind, "expression_statement") == 0 && node.id == ctx->straight_stmt) {
+        TSTreeCursor cursor = ts_tree_cursor_new(node);
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            do {
+                TSNode child = ts_tree_cursor_current_node(&cursor);
+                if (ts_node_is_named(child))
+                    ts_walk_straight_expression(ctx, child);
+            } while (ts_tree_cursor_goto_next_sibling(&cursor));
+        }
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    if (strcmp(kind, "assignment_expression") == 0 ||
+        strcmp(kind, "augmented_assignment_expression") == 0) {
+        ts_process_assignment(ctx, node, false);
         return;
     }
 
@@ -3929,7 +4493,7 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
                     disc_var = node_text(ctx, obj);
                     disc_prop = node_text(ctx, prop);
                     if (disc_var) {
-                        const CBMType *t = cbm_scope_lookup(ctx->current_scope, disc_var);
+                        const CBMType *t = ts_lookup_binding_type(ctx, disc_var);
                         if (t && t->kind == CBM_TYPE_UNION)
                             var_union = t;
                     }
@@ -4109,6 +4673,7 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
         // their enclosing_func_qn via process_function_body.
         CBMScope *saved = ctx->current_scope;
         ctx->current_scope = cbm_scope_push(ctx->arena, saved);
+        TsFnSave fn_saved = ts_enter_function(ctx, node);
         TSNode params =
             ts_node_child_by_field_name(node, "parameters", TS_LSP_FIELD_LEN("parameters"));
         if (!ts_node_is_null(params)) {
@@ -4127,6 +4692,7 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
             // process_node(body) so resolve_call_at fires for that expression.
             process_node(ctx, body);
         }
+        ts_leave_function(ctx, fn_saved);
         ctx->current_scope = saved;
         return;
     }
@@ -4136,6 +4702,7 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
         const char *saved_module_qn = ctx->module_qn;
         CBMScope *saved_scope = ctx->current_scope;
         ctx->current_scope = cbm_scope_push(ctx->arena, saved_scope);
+        TsFnSave fn_saved = ts_enter_function(ctx, node);
         if (!ts_node_is_null(name) && saved_module_qn) {
             char *namespace_name = node_text(ctx, name);
             if (namespace_name && namespace_name[0]) {
@@ -4147,10 +4714,14 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
         if (!ts_node_is_null(body)) {
             shadow_block_declarations(ctx, body);
             uint32_t count = ts_node_named_child_count(body);
-            for (uint32_t i = 0; i < count; i++)
-                process_namespace_member(ctx, ts_node_named_child(body, i));
+            for (uint32_t i = 0; i < count; i++) {
+                TSNode member = ts_node_named_child(body, i);
+                ctx->straight_stmt = member.id;
+                process_namespace_member(ctx, member);
+            }
         }
         ctx->module_qn = saved_module_qn;
+        ts_leave_function(ctx, fn_saved);
         ctx->current_scope = saved_scope;
         return;
     }
@@ -4204,6 +4775,7 @@ static void process_function_body(TSLSPContext *ctx, TSNode func_node, const cha
     const char *saved_class = ctx->enclosing_class_qn;
 
     ctx->current_scope = cbm_scope_push(ctx->arena, saved_scope);
+    TsFnSave fn_saved = ts_enter_function(ctx, func_node);
     ctx->enclosing_func_qn = func_qn;
     ctx->enclosing_class_qn = class_qn ? class_qn : saved_class;
 
@@ -4236,7 +4808,7 @@ static void process_function_body(TSLSPContext *ctx, TSNode func_node, const cha
                     const CBMType *existing = cbm_scope_lookup(ctx->current_scope, pname);
                     if (existing && !cbm_type_is_unknown(existing))
                         continue;
-                    cbm_scope_bind(ctx->current_scope, pname, ptype);
+                    ts_bind_local(ctx, ctx->current_scope, pname, ptype, ptype, true);
                 }
             }
         }
@@ -4257,7 +4829,7 @@ static void process_function_body(TSLSPContext *ctx, TSNode func_node, const cha
             TSTreeCursor cursor = ts_tree_cursor_new(body);
             if (ts_tree_cursor_goto_first_child(&cursor)) {
                 do {
-                    process_node(ctx, ts_tree_cursor_current_node(&cursor));
+                    process_block_statement(ctx, ts_tree_cursor_current_node(&cursor));
                 } while (ts_tree_cursor_goto_next_sibling(&cursor));
             }
             ts_tree_cursor_delete(&cursor);
@@ -4266,6 +4838,7 @@ static void process_function_body(TSLSPContext *ctx, TSNode func_node, const cha
         }
     }
 
+    ts_leave_function(ctx, fn_saved);
     ctx->enclosing_class_qn = saved_class;
     ctx->enclosing_func_qn = saved_func;
     ctx->current_scope = saved_scope;
@@ -4290,7 +4863,7 @@ static void bind_module_declaration(TSLSPContext *ctx, TSNode node) {
              * them as unknown locals would hide JSX tags and direct calls. */
             if (ts_is_function_value(value))
                 continue;
-            bind_variable_declarator(ctx, decl);
+            bind_variable_declarator(ctx, decl, ts_declaration_writable(ctx, node));
         }
     }
 }
@@ -4332,6 +4905,10 @@ void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
         return;
 
     ts_prepare_module_callables(ctx, root);
+    ts_collect_assign_sites(ctx, root);
+    ctx->fn_scope = ctx->current_scope;
+    ctx->fn_start = 0;
+    ctx->fn_end = UINT32_MAX;
     uint32_t count = 0;
     TSNode *children = collect_children(ctx->arena, root, &count);
     for (uint32_t i = 0; i < count; i++)
@@ -4343,8 +4920,12 @@ void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
      * registration callbacks; there is no second generic root walk. */
     const char *saved_func = ctx->enclosing_func_qn;
     ctx->enclosing_func_qn = ctx->module_qn;
-    for (uint32_t i = 0; i < count; i++)
+    ctx->flow_walk = true;
+    for (uint32_t i = 0; i < count; i++) {
+        ctx->straight_stmt = children[i].id;
         process_module_statement(ctx, children[i]);
+    }
+    ctx->flow_walk = false;
     ctx->enclosing_func_qn = saved_func;
 }
 
@@ -4371,6 +4952,9 @@ void ts_lsp_init(TSLSPContext *ctx, CBMArena *arena, const char *source, int sou
     ctx->jsx_mode = jsx_mode;
     ctx->dts_mode = dts_mode;
     ctx->current_scope = arena ? cbm_scope_push(arena, NULL) : NULL;
+    ctx->fn_scope = ctx->current_scope;
+    ctx->fn_start = 0;
+    ctx->fn_end = UINT32_MAX;
 
     const char *debug_env = getenv("CBM_LSP_DEBUG");
     ctx->debug = (debug_env && debug_env[0]);

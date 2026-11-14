@@ -79,6 +79,19 @@ typedef struct {
     // The registry's functions sorted by QN, so a lookup in a registry with no
     // hash index is a search, not a scan (TsFuncOrder in ts_lsp.c).
     struct TsFuncOrder *func_order;
+
+    // Flow state for reassigned locals (TsAssignSites in ts_lsp.c). A let, var
+    // or parameter that is the target of an assignment holds its type only in
+    // straight-line code of its own function, and only during the statement
+    // walk; elsewhere it reads as its declared annotation, or unknown.
+    struct TsAssignSites *assign_sites;
+    struct TsFlowBindings *flow_bindings;
+    CBMScope *fn_scope;           // frame of the function (or module) being walked
+    uint32_t fn_start;            // byte range of that function; the module is
+    uint32_t fn_end;              // [0, UINT32_MAX)
+    const void *straight_stmt;    // statement a block loop is visiting (TSNode.id)
+    unsigned long flow_reads;     // reads of flow bindings; blocks the eval memo
+    bool flow_walk;               // true only during the statement walk
 } TSLSPContext;
 
 #ifdef CBM_ENABLE_TEST_SEAMS
