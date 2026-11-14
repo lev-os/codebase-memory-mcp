@@ -473,6 +473,8 @@ typedef struct {
     bool is_default;         // ES default import (`import X from "Y"`), JS/TS only (#1916)
     bool type_checking_only; // Python: inside a module-level `if TYPE_CHECKING:` block --
                              // binds the name for annotations, never at runtime (#1277)
+    bool function_scope;     // Python: inside a def body -- binds the name in that
+                             // function's scope only, never in the module's (#2285)
     CBMImportKind kind;      // CBM_IMPORT_KIND_DEFAULT unless the syntax names a member kind
     CBMReexportKind reexport; // ES `export {a as b} from` or `export * from`; NONE otherwise
 } CBMImport;
@@ -484,13 +486,16 @@ static inline bool cbm_import_binds_local(const CBMImport *imp) {
     return imp && imp->reexport == CBM_REEXPORT_NONE;
 }
 
-/* True when an import binds its local name at runtime. A Python import under
- * `if TYPE_CHECKING:` exists for annotations only: a call through that name
- * cannot happen, so no CALLS import map may bind it (an import_map edge
- * through it would be fabricated by construction). A re-export binds no
- * local name at all. THE one rule every CALLS import-map builder applies. */
+/* True when an import binds its local name in the module scope at runtime. A
+ * Python import under `if TYPE_CHECKING:` exists for annotations only: a call
+ * through that name cannot happen. A Python import inside a def binds a local
+ * of that function only: a call elsewhere in the file never goes through it.
+ * A re-export binds no local name at all. In each case no file-wide CALLS
+ * import map may bind it (an import_map edge through it would be fabricated
+ * by construction). THE one rule every CALLS import-map builder applies; the
+ * Python LSP binds a def's own import where it stands. */
 static inline bool cbm_import_binds_runtime_name(const CBMImport *imp) {
-    return cbm_import_binds_local(imp) && !imp->type_checking_only;
+    return cbm_import_binds_local(imp) && !imp->type_checking_only && !imp->function_scope;
 }
 
 /* Content-only ordered Python namespace facts; no resolved target identities.
