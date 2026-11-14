@@ -1268,6 +1268,8 @@ static int ei_ts_workspace_package_case(int pad) {
         {"packages/dist/package.json", "{\"name\":\"@sample/missing\",\"exports\":\"./dist/ghost.mjs\"}\n"},
         {"packages/src/dist/ghost.ts", "export const value = 99;\n"},
         {"apps/missing.ts", "import { value } from '@sample/missing';\n"},
+        {"vendor/missing/index.ts", "export const value = 99;\n"},
+        {"apps/vendor-use.ts", "import { value } from '../vendor/missing';\n"},
     };
     static const EIFileEdgeExpect want[] = {
         {"apps/root.ts", "packages/alias/src/index.ts"},

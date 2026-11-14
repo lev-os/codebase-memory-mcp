@@ -3579,6 +3579,14 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
         }
     }
 
+    /* A JS/TS specifier names the whole file or directory. Shortening an
+     * unresolved path can bind an excluded or missing module to an unrelated
+     * ancestor's index.ts. Keep the exact-file fallbacks above, then stop. */
+    if (src_lang == CBM_LANG_JAVASCRIPT || src_lang == CBM_LANG_TYPESCRIPT ||
+        src_lang == CBM_LANG_TSX) {
+        return NULL;
+    }
+
     /* Strategy 4: crate-relative module path → File/Module node.  Rust glob
      * `use crate::ops::*` names a module, not a symbol; strip the glob and the
      * `crate::`/`self::`/`super::` prefix, convert `::`→`/`, then resolve the
