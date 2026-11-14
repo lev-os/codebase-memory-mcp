@@ -660,6 +660,69 @@ TEST(ei_hidden_directory_imports_resolve_exact_modules) {
     PASS();
 }
 
+/* Append `pad` small files so a fixture also runs through the parallel
+ * pipeline. Returns the new file count. */
+static int ei_pad_files(EILangFile *files, int count, char (*names)[32], int pad) {
+    for (int i = 0; i < pad; i++) {
+        snprintf(names[i], sizeof(names[i]), "padding/file_%02d.ts", i);
+        files[count++] = (EILangFile){names[i], "export const padding = 0;\n"};
+    }
+    return count;
+}
+
+static int ei_count_files(const EILangFile *files) {
+    int count = 0;
+    while (files[count].name) {
+        count++;
+    }
+    return count;
+}
+
+/* An alias target can spell its own extension. TypeScript reads that file
+ * first when it exists, then tries the substitution family of the extension
+ * (.mjs: .mts, .d.mts, .mjs; .cjs: .cts, .d.cts, .cjs; .js: .ts, .tsx, .d.ts,
+ * .js, .jsx). A declaration file beside the target is not the target. */
+static int ei_alias_target_extension_case(int pad) {
+    EILangFile files[80] = {
+        {"tsconfig.json",
+         "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{"
+         "\"@runtime\":[\"src/runtime.mjs\"],\"@legacy\":[\"src/legacy.cjs\"],"
+         "\"@source\":[\"src/source.js\"],\"@generated\":[\"src/generated.js\"],"
+         "\"@typed/*\":[\"src/typed/*.js\"]}}}\n"},
+        {"src/runtime.mjs", "export function start() { return 1; }\n"},
+        {"src/runtime.d.ts", "export declare function start(): number;\n"},
+        {"src/legacy.cjs", "module.exports = { stop() { return 1; } };\n"},
+        {"src/legacy.d.ts", "export declare function stop(): number;\n"},
+        {"src/source.js", "export function read() { return 1; }\n"},
+        {"src/source.ts", "export function read() { return 2; }\n"},
+        {"src/generated.ts", "export function make() { return 1; }\n"},
+        {"src/typed/model.js", "export const model = 1;\n"},
+        {"src/typed/model.ts", "export const model = 2;\n"},
+        {"app/runtime.ts", "import '@runtime';\n"},
+        {"app/legacy.ts", "import '@legacy';\n"},
+        {"app/source.ts", "import '@source';\n"},
+        {"app/generated.ts", "import '@generated';\n"},
+        {"app/typed.ts", "import '@typed/model';\n"},
+    };
+    static const EIFileEdgeExpect want[] = {
+        {"app/runtime.ts", "src/runtime.mjs"},     {"app/legacy.ts", "src/legacy.cjs"},
+        {"app/source.ts", "src/source.js"},        {"app/generated.ts", "src/generated.ts"},
+        {"app/typed.ts", "src/typed/model.js"},
+    };
+    char names[60][32];
+    int count = ei_pad_files(files, ei_count_files(files), names, pad);
+    int nwant = (int)(sizeof(want) / sizeof(want[0]));
+    return ei_file_edges_match_properties(files, count, want, nwant, nwant, NULL, NULL, true);
+}
+
+TEST(ei_alias_target_keeps_its_extension) {
+    int sequential_ok = ei_alias_target_extension_case(0);
+    int parallel_ok = ei_alias_target_extension_case(60);
+    ASSERT_TRUE(sequential_ok);
+    ASSERT_TRUE(parallel_ok);
+    PASS();
+}
+
 /* #1682: extensionless dotted basenames are part of the module name.  The
  * resolver used to strip `.engine`, miss the module, and bind both imports to
  * the same-named fixture Function in the sibling spec file. */
@@ -3095,6 +3158,7 @@ TEST(ei_pkgmap_duplicate_package_name_at_equal_depth_is_settled_by_path) {
 SUITE(edge_imports) {
     RUN_TEST(ei_dynamic_imports_resolve_exact_modules);
     RUN_TEST(ei_hidden_directory_imports_resolve_exact_modules);
+    RUN_TEST(ei_alias_target_keeps_its_extension);
     RUN_TEST(ei_relative_astro_css_imports_issue2558);
     RUN_TEST(ei_nix_parent_relative_import_issue2797);
     RUN_TEST(ei_thrift_parent_relative_import_issue2797);

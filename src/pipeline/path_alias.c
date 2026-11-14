@@ -51,20 +51,28 @@ enum {
 /* Strip an explicit JS/TS module extension in place, keeping dotted
  * basenames such as "cat.service". Same set as the relative resolver in
  * fqn.c. Returns its argument. */
-static char *strip_resolved_ext(char *path) {
-    if (!path) {
-        return path;
-    }
-    static const char *const extensions[] = {
-        ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".json",
-    };
-    size_t len = strlen(path);
-    for (size_t i = 0; i < sizeof(extensions) / sizeof(extensions[0]); i++) {
-        size_t ext_len = strlen(extensions[i]);
-        if (len > ext_len && strcmp(path + len - ext_len, extensions[i]) == 0) {
-            path[len - ext_len] = '\0';
-            break;
+static const char *const RESOLVED_EXTS[] = {
+    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".json",
+};
+
+/* Length of the module extension `path` ends with, else 0. With `whole`
+ * the extension may be all of `path` (a mapping suffix such as ".js"). */
+static size_t resolved_ext_len(const char *path, bool whole) {
+    size_t len = path ? strlen(path) : 0;
+    for (size_t i = 0; i < sizeof(RESOLVED_EXTS) / sizeof(RESOLVED_EXTS[0]); i++) {
+        size_t ext_len = strlen(RESOLVED_EXTS[i]);
+        if ((len > ext_len || (whole && len == ext_len)) &&
+            strcmp(path + len - ext_len, RESOLVED_EXTS[i]) == 0) {
+            return ext_len;
         }
+    }
+    return 0;
+}
+
+static char *strip_resolved_ext(char *path) {
+    size_t ext_len = resolved_ext_len(path, false);
+    if (ext_len > 0) {
+        path[strlen(path) - ext_len] = '\0';
     }
     return path;
 }
@@ -330,13 +338,17 @@ void cbm_path_alias_collection_free(cbm_path_alias_collection_t *coll) {
     free(coll);
 }
 
-bool cbm_path_alias_resolve_into(const cbm_path_alias_map_t *map, const char *module_path,
-                                 char *out, size_t cap) {
+bool cbm_path_alias_target_into(const cbm_path_alias_map_t *map, const char *module_path, char *out,
+                                size_t cap, bool *mapping_ext) {
+    if (mapping_ext) {
+        *mapping_ext = false;
+    }
     if (!map || !module_path || !out || cap == 0) {
         return false;
     }
     size_t mod_len = strlen(module_path);
     int n = CBM_NOT_FOUND;
+    bool spelled = false;
 
     for (int i = 0; i < map->count; i++) {
         const cbm_path_alias_t *e = &map->entries[i];
@@ -357,11 +369,13 @@ bool cbm_path_alias_resolve_into(const cbm_path_alias_map_t *map, const char *mo
             int wild_len = (int)(mod_len - prefix_len - suffix_len);
             n = snprintf(out, cap, "%s%.*s%s", e->target_prefix, wild_len, module_path + prefix_len,
                          e->target_suffix);
+            spelled = resolved_ext_len(e->target_suffix, true) > 0;
             break;
         }
 
         if (strcmp(module_path, e->alias_prefix) == 0) {
             n = snprintf(out, cap, "%s", e->target_prefix);
+            spelled = resolved_ext_len(e->target_prefix, false) > 0;
             break;
         }
     }
@@ -374,6 +388,17 @@ bool cbm_path_alias_resolve_into(const cbm_path_alias_map_t *map, const char *mo
         n = snprintf(out, cap, "%s/%s", map->base_url, module_path);
     }
     if (n < 0 || (size_t)n >= cap) {
+        return false;
+    }
+    if (mapping_ext) {
+        *mapping_ext = spelled;
+    }
+    return true;
+}
+
+bool cbm_path_alias_resolve_into(const cbm_path_alias_map_t *map, const char *module_path,
+                                 char *out, size_t cap) {
+    if (!cbm_path_alias_target_into(map, module_path, out, cap, NULL)) {
         return false;
     }
     strip_resolved_ext(out);

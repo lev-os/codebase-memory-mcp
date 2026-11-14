@@ -1722,12 +1722,34 @@ static char *alias_module_qn(const cbm_pipeline_ctx_t *ctx, const char *module_p
     return stripped;
 }
 
+/* The name of the indexed file at exactly `candidate`: its Module when that
+ * Module belongs to this file, else its File. NULL when no such file. */
+static char *js_indexed_candidate_qn(const cbm_pipeline_ctx_t *ctx, const char *candidate) {
+    const cbm_gbuf_node_t *file = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, candidate);
+    if (!file || !file->file_path || strcmp(file->file_path, candidate) != 0) {
+        return NULL;
+    }
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    const char *module_qn = cbm_fqn_module(&arena, ctx->project_name, candidate);
+    const cbm_gbuf_node_t *module = module_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, module_qn) : NULL;
+    bool exact = module && module->label && strcmp(module->label, "Module") == 0 &&
+                 module->file_path && strcmp(module->file_path, candidate) == 0;
+    char *qn = strdup(exact ? module->qualified_name : file->qualified_name);
+    cbm_arena_destroy(&arena);
+    return qn;
+}
+
 /* A resolved path can name a file whose extracted module has a different QN
  * (hidden directory markers are removed during extraction), or no Module at
  * all. Find the exact indexed file before using its extraction-owned name.
- * A same-named file elsewhere must never satisfy this lookup. */
+ * A same-named file elsewhere must never satisfy this lookup. `spelling` is
+ * the path as written before the resolver removed its extension: the import
+ * specifier, or the alias target as its mapping spells it. With
+ * `exact_first` (the alias mapping itself names the extension) the file as
+ * spelled comes before extension substitution, as in TypeScript. */
 static char *js_indexed_file_qn(const cbm_pipeline_ctx_t *ctx, const char *path,
-                                const char *module_path) {
+                                const char *spelling, bool exact_first) {
     static const char *const implicit_exts[] = {
         ".ts", ".tsx", ".d.ts", ".js", ".jsx", ".mts", ".cts", ".d.mts", ".d.cts", ".mjs",
         ".cjs", ".json",
@@ -1742,7 +1764,7 @@ static char *js_indexed_file_qn(const cbm_pipeline_ctx_t *ctx, const char *path,
     /* The path resolver already removed an explicit module extension. Honor
      * that spelling: x.css.ts must not bind x.css, and x.mjs substitutes an
      * .mts source rather than an unrelated .ts file with the same stem. */
-    const char *ext = module_path ? strrchr(module_path, '.') : NULL;
+    const char *ext = spelling ? strrchr(spelling, '.') : NULL;
     const char *single_ext[] = {ext};
     const char *const *extensions = implicit_exts;
     size_t extension_count = sizeof(implicit_exts) / sizeof(implicit_exts[0]);
@@ -1767,6 +1789,15 @@ static char *js_indexed_file_qn(const cbm_pipeline_ctx_t *ctx, const char *path,
     } else {
         spelled = false;
     }
+    if (spelled && exact_first) {
+        char candidate[PKGMAP_PATH_BUF];
+        int n = snprintf(candidate, sizeof(candidate), "%s%s", path, ext);
+        char *qn = n > 0 && (size_t)n < sizeof(candidate) ? js_indexed_candidate_qn(ctx, candidate)
+                                                          : NULL;
+        if (qn) {
+            return qn;
+        }
+    }
     for (int pass = 0; pass < (spelled ? 1 : 3); pass++) {
         bool direct = !spelled && pass == 0;
         const char *entry = !spelled && pass == 2 ? "/index" : "";
@@ -1778,21 +1809,10 @@ static char *js_indexed_file_qn(const cbm_pipeline_ctx_t *ctx, const char *path,
             if (n < 0 || (size_t)n >= sizeof(candidate)) {
                 continue;
             }
-            const cbm_gbuf_node_t *file =
-                cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, candidate);
-            if (!file || !file->file_path || strcmp(file->file_path, candidate) != 0) {
-                continue;
+            char *qn = js_indexed_candidate_qn(ctx, candidate);
+            if (qn) {
+                return qn;
             }
-            CBMArena arena;
-            cbm_arena_init(&arena);
-            const char *module_qn = cbm_fqn_module(&arena, ctx->project_name, candidate);
-            const cbm_gbuf_node_t *module =
-                module_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, module_qn) : NULL;
-            bool exact = module && module->label && strcmp(module->label, "Module") == 0 &&
-                         module->file_path && strcmp(module->file_path, candidate) == 0;
-            char *qn = strdup(exact ? module->qualified_name : file->qualified_name);
-            cbm_arena_destroy(&arena);
-            return qn;
         }
     }
     return NULL;
@@ -1902,7 +1922,7 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
          * stripped a second time by cbm_pipeline_fqn_module. */
         char *qn = cbm_pipeline_fqn_folder(ctx->project_name, resolved);
         if (js) {
-            char *exact_qn = js_indexed_file_qn(ctx, resolved, module_path);
+            char *exact_qn = js_indexed_file_qn(ctx, resolved, module_path, false);
             if (exact_qn) {
                 free(qn);
                 qn = exact_qn;
@@ -1924,7 +1944,16 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
             if (aliased) {
                 char *qn = alias_module_qn(ctx, module_path, aliased);
                 if (js) {
-                    char *exact_qn = js_indexed_file_qn(ctx, aliased, module_path);
+                    /* `aliased` lost its extension. The target as its mapping
+                     * spells it ("@rt": ["src/rt.mjs"]) picks the family. */
+                    char target[CBM_PATH_ALIAS_RESULT_MAX];
+                    bool mapping_ext = false;
+                    const char *spelling =
+                        cbm_path_alias_target_into(amap, module_path, target, sizeof(target),
+                                                   &mapping_ext)
+                            ? target
+                            : module_path;
+                    char *exact_qn = js_indexed_file_qn(ctx, aliased, spelling, mapping_ext);
                     if (exact_qn) {
                         free(qn);
                         qn = exact_qn;
