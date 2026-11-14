@@ -2942,6 +2942,7 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
                          def_count, imp_names, imp_qns, imp_count, r->cached_tree, &out);
 
     pxc_append_results(&r->arena, &r->resolved_calls, &out);
+    cbm_js_rebind_resolved_calls(r);
     pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
 }
 
@@ -3136,6 +3137,11 @@ void cbm_pxc_dispatch_file_with_php_bindings(
         if (used_prebuilt) {
             pxc_append_results(&result->arena, &result->resolved_calls, &out);
             pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
+            if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
+                lang == CBM_LANG_TSX) {
+                /* The resolver names its caller by the function it walked (cbm.h). */
+                cbm_js_rebind_resolved_calls(result);
+            }
         }
         pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
     }

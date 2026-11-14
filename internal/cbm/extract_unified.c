@@ -1109,9 +1109,21 @@ static const char *py_nearest_scope_qn(const WalkState *state) {
     return NULL;
 }
 
+static const char *compute_func_qn_unsplit(CBMExtractCtx *ctx, TSNode node,
+                                           const CBMLangSpec *spec, WalkState *state);
+
 // Compute function QN for scope tracking (mirrors cbm_enclosing_func_qn logic).
+// A JS/TS callable that shares its QN with another callable of the file was
+// given a QN of its own (cbm_js_split_twin_callables); name the same one here.
 static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                    WalkState *state) {
+    const char *qn = compute_func_qn_unsplit(ctx, node, spec, state);
+    const char *twin = qn ? cbm_js_twin_qn(ctx, qn, ts_node_start_byte(node)) : NULL;
+    return twin ? twin : qn;
+}
+
+static const char *compute_func_qn_unsplit(CBMExtractCtx *ctx, TSNode node,
+                                           const CBMLangSpec *spec, WalkState *state) {
     /* Raw configured definitions already own the canonical QN, including
      * namespace scope. Never rederive it from the bare macro identifier. */
     const char *configured_qn = cbm_test_definition_qn(ctx, node);
@@ -2864,6 +2876,13 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
                 }
             }
         }
+    } else if ((ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
+                ctx->language == CBM_LANG_TSX) &&
+               state->enclosing_class_qn &&
+               strcmp(ts_node_type(node), "class_static_block") == 0) {
+        /* A static block runs as part of its class: its calls are the
+         * class's, as a class field arrow's are the field's. */
+        (void)push_function_scope(state, depth, state->enclosing_class_qn, node);
     } else if (cbm_is_namespace_scope_kind(ctx->language, ts_node_type(node))) {
         const char *namespace_qn = compute_class_qn(ctx, node, state);
         if (namespace_qn) {

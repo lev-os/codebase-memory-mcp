@@ -35739,7 +35739,172 @@ TEST(pipeline_ts_signature_targets_require_owner) {
     PASS();
 }
 
+/* The CALLS edges recorded at `line` whose target is named `callee` in a file
+ * ending in `callee_file`: how many there are, and the source of the last one
+ * as "<name>@<start line>", or "<file>" when it is the File or Module node. */
+static int ts_caller_at_line(cbm_store_t *s, const char *project, int line, const char *callee,
+                             const char *callee_file, int callee_line, char *caller,
+                             size_t caller_cap) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &edge_count);
+    int hits = 0;
+    snprintf(caller, caller_cap, "none");
+    for (int i = 0; i < edge_count; i++) {
+        const char *props = edges[i].properties_json;
+        const char *at = props ? strstr(props, "\"line\":") : NULL;
+        if (!at || atoi(at + strlen("\"line\":")) != line) {
+            continue;
+        }
+        cbm_node_t src = {0};
+        cbm_node_t tgt = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK &&
+            tgt.name && strcmp(tgt.name, callee) == 0 && tgt.file_path &&
+            strlen(tgt.file_path) >= strlen(callee_file) &&
+            strcmp(tgt.file_path + strlen(tgt.file_path) - strlen(callee_file), callee_file) ==
+                0 &&
+            (callee_line == 0 || tgt.start_line == callee_line)) {
+            hits++;
+            if (strcmp(src.label, "File") == 0 || strcmp(src.label, "Module") == 0) {
+                snprintf(caller, caller_cap, "<file>");
+            } else {
+                snprintf(caller, caller_cap, "%s@%d", src.name, src.start_line);
+            }
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return hits;
+}
+
+/* A call is recorded under the nearest named callable that holds it: an
+ * object-literal method or arrow property, a class field arrow, a const
+ * arrow inside a method, a nested function. Two callables of one file that
+ * share a name stay two nodes, each keeping its own calls; an anonymous
+ * callback is no caller. Sequential and parallel, full and incremental. */
+TEST(pipeline_ts_caller_is_innermost_named_callable) {
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        char tmp[256] = "/tmp/cbm_ts_callers_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        write_temp_file(tmp, "lib.ts",
+                        "export function fire() {}\n"
+                        "export function boot() {}\n"
+                        "export function audit(x: unknown) {}\n"
+                        "export function wrap<T>(f: T): T { return f; }\n"
+                        "export function drain() {}\n"
+                        "export function flush() {}\n"
+                        "export function spin() {}\n"
+                        "export function ping(x: unknown) {}\n");
+        const char *source =
+            "import { fire, boot, audit, wrap, drain, flush, spin, ping } from './lib';\n"
+            "class Port { send() {} }\n"
+            "const hook = { fire() {} };\n"
+            "export const actions = { first() {}, second(p: Port) { ping(p); } };\n"
+            "export const tasks = { first: () => {}, second: () => fire() };\n"
+            "export const handlers = { run: () => spin() };\n"
+            "export const handler = wrap(async (req: unknown) => { audit(req); });\n"
+            "class Engine {\n"
+            "  field = () => this.go();\n"
+            "  static { boot(); }\n"
+            "  go() {}\n"
+            "  start() {\n"
+            "    const retry = async () => { drain(); };\n"
+            "    return retry;\n"
+            "  }\n"
+            "}\n"
+            "function describe(n: string, f: () => void) { f(); }\n"
+            "describe('one', () => { function setup() { fire(); } setup(); });\n"
+            "describe('two', () => { function setup() { flush(); } setup(); });\n"
+            "class Decoy { send() {} }\n"
+            "function outer() { const relay = (p: Port) => { p.send(); }; return relay; }\n";
+        write_temp_file(tmp, "main.ts", source);
+        for (int i = 0; mode && i < 50; i++) {
+            char name[64];
+            snprintf(name, sizeof(name), "pad%d.ts", i);
+            write_temp_file(tmp, name, "export {};\n");
+        }
+        XlangEnvSave saved = xlang_env_select(mode != 0);
+        char db[512], path[512];
+        snprintf(db, sizeof(db), "%s/graph.db", tmp);
+        snprintf(path, sizeof(path), "%s/main.ts", tmp);
+        for (int phase = 0; phase < 2; phase++) {
+            if (phase) {
+                char changed[2048];
+                snprintf(changed, sizeof(changed), "%s// body edit\n", source);
+                write_temp_file(tmp, "main.ts", changed);
+                ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000, 0), 0);
+            }
+            cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+            ASSERT_NOT_NULL(p);
+            ASSERT_EQ(cbm_pipeline_run(p), 0);
+            cbm_store_t *s = cbm_store_open_path(db);
+            ASSERT_NOT_NULL(s);
+            const char *project = cbm_pipeline_project_name(p);
+            const struct {
+                int line;
+                const char *callee, *callee_file;
+                int callee_line;
+                const char *caller;
+            } cases[] = {
+                {4, "ping", "lib.ts", 8, "second@4"},
+                {5, "fire", "lib.ts", 1, "second@5"},
+                {6, "spin", "lib.ts", 7, "run@6"},
+                {7, "audit", "lib.ts", 3, "<file>"},
+                {9, "go", "main.ts", 11, "field@9"},
+                {10, "boot", "lib.ts", 2, "Engine@8"},
+                {13, "drain", "lib.ts", 5, "retry@13"},
+                {18, "fire", "lib.ts", 1, "setup@18"},
+                {19, "flush", "lib.ts", 6, "setup@19"},
+                /* Each test callback calls its own `setup`. */
+                {18, "setup", "main.ts", 18, "<file>"},
+                {19, "setup", "main.ts", 19, "<file>"},
+                /* Only the typed resolver tells Port.send from Decoy.send:
+                 * its row must join the call in the nested arrow. */
+                {21, "send", "main.ts", 2, "relay@21"},
+            };
+            for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+                char caller[256];
+                int got = ts_caller_at_line(s, project, cases[i].line, cases[i].callee,
+                                            cases[i].callee_file, cases[i].callee_line, caller,
+                                            sizeof(caller));
+                if (got != 1 || strcmp(caller, cases[i].caller) != 0) {
+                    fprintf(stderr, "callers mode=%d phase=%d line %d -> %s: %d edges from %s, want "
+                                    "1 from %s\n",
+                            mode, phase, cases[i].line, cases[i].callee, got, caller,
+                            cases[i].caller);
+                    ok = false;
+                }
+            }
+            /* The same-name decoy method of `hook` takes no call to the import. */
+            char decoy[256];
+            if (ts_caller_at_line(s, project, 5, "fire", "main.ts", 0, decoy, sizeof(decoy)) != 0) {
+                fprintf(stderr, "callers mode=%d phase=%d: line 5 reached hook.fire from %s\n",
+                        mode, phase, decoy);
+                ok = false;
+            }
+            if (ts_caller_at_line(s, project, 21, "send", "main.ts", 20, decoy, sizeof(decoy)) !=
+                0) {
+                fprintf(stderr, "callers mode=%d phase=%d: line 21 reached Decoy.send from %s\n",
+                        mode, phase, decoy);
+                ok = false;
+            }
+            cbm_store_close(s);
+            cbm_pipeline_free(p);
+        }
+        xlang_env_restore(&saved);
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_ts_caller_is_innermost_named_callable);
     RUN_TEST(pipeline_ts_signature_targets_require_owner);
     RUN_TEST(pipeline_inc_c_family_fragments);
     RUN_TEST(pipeline_python_module_callers_sequential);
