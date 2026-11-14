@@ -53,6 +53,7 @@
 #include <foundation/compat.h>
 #include "test_framework.h"
 #include "repro_harness.h"
+#include "repro_trace.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -130,37 +131,22 @@ TEST(repro_issue480_trace_path_nonempty_with_calls) {
              "{\"function_name\":\"callee\","
              "\"project\":\"%s\","
              "\"direction\":\"inbound\","
-             "\"depth\":2}",
+             "\"depth\":2,\"format\":\"json\"}",
              lp.project);
 
     char *resp = rh_call(&lp, "trace_path", args);
     ASSERT_NOT_NULL(resp);
 
-    /* The response must NOT be a "function not found" error.
-     * If the name lookup itself fails, this fires first and pinpoints the
-     * start-node lookup as the breakage site. */
-    ASSERT_NULL(strstr(resp, "function not found"));
-
-    /* The response is the MCP tool-result envelope
-     *   {"content":[{"type":"text","text":"<inner trace_path json>"}]}
-     * so the inner json is embedded as a STRING value and its quotes are
-     * backslash-escaped: the "callers" key appears as \"callers\" in the
-     * serialized response. Match the escaped form — the project's own
-     * passing trace_path tests (test_incremental.c, via resp_has_key) do the
-     * same. (The earlier unescaped strstr could never match a correctly
-     * escaped MCP envelope, which is why this repro was mis-targeted.)
-     *
-     * The "callers" key must appear (always emitted for inbound). */
-    ASSERT_NOT_NULL(strstr(resp, "\\\"callers\\\""));
-
-    /* The "callers" array must be NON-EMPTY. WHY RED on the #480 bug:
-     * cbm_store_bfs() returning 0 hops serialises \"callers\":[] (no caller
-     * QN in the response), so BOTH the empty-array guard and the caller-QN
-     * assertion fire RED. We assert the caller's qualified-name tail
-     * "main.caller" (unambiguous vs the callee "main.callee", and immune to
-     * escaping) so a populated, correctly-named caller hop is required. */
-    ASSERT_NULL(strstr(resp, "\\\"callers\\\":[]")); /* empty array = traversal bug */
-    ASSERT_NOT_NULL(strstr(resp, "main.caller"));    /* caller QN in results       */
+    yyjson_doc *trace = rh_trace_json(resp);
+    ASSERT_NOT_NULL(trace);
+    yyjson_val *root = yyjson_doc_get_root(trace);
+    ASSERT_NULL(yyjson_obj_get(root, "error"));
+    char expected_qn[512];
+    snprintf(expected_qn, sizeof(expected_qn), "%s.main.caller", lp.project);
+    yyjson_val *caller = rh_trace_row(yyjson_obj_get(root, "callers"), expected_qn);
+    ASSERT_NOT_NULL(caller);
+    ASSERT_EQ(yyjson_get_int(yyjson_arr_get(caller, 1)), 1);
+    yyjson_doc_free(trace);
 
     free(resp);
     rh_cleanup(&lp, store);

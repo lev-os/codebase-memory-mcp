@@ -71,6 +71,7 @@
 #include <foundation/compat.h>
 #include "test_framework.h"
 #include "repro_harness.h"
+#include "repro_trace.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -209,53 +210,24 @@ TEST(repro_issue546_dts_split_caller_set) {
              "{\"function_name\":\"alignToEdge\","
              "\"project\":\"%s\","
              "\"direction\":\"inbound\","
-             "\"depth\":2}",
+             "\"depth\":2,\"format\":\"json\"}",
              lp.project);
 
     char *resp = rh_call(&lp, "trace_path", args);
     ASSERT_NOT_NULL(resp);
+    fprintf(stderr, "  [546] trace response: %s\n", resp);
 
-    /* Symbol must be found — if "function not found" fires, the name lookup
-     * itself has a problem unrelated to #546. */
-    ASSERT_NULL(strstr(resp, "function not found"));
-
-    /* "callers" key must appear (always emitted when direction is inbound).
-     * The response is the MCP envelope (inner json embedded as an escaped
-     * string), so the key appears as \"callers\" — match the escaped form. */
-    ASSERT_NOT_NULL(strstr(resp, "\\\"callers\\\""));
-
-    /* The callers array must not be empty — at least the internalConsumer
-     * (whose relative-path import is reliably resolved) must appear.
-     *
-     * WHY this might already be RED for #546:
-     *   If trace_path selected the .d.ts stub node as BFS root, only
-     *   externalConsumer is there; internalConsumer's edge is on the impl
-     *   node, so this check fires RED immediately (callers:[]) or wrong name.
-     */
-    ASSERT_NULL(strstr(resp, "\\\"callers\\\":[]")); /* empty = traversal totally wrong */
-
-    /* ── PRIMARY ASSERTION: BOTH callers must appear in the response ─────
-     *
-     * "internalConsumer" — imports via relative path, CALLS edge → impl node
-     * "externalConsumer" — imports via alias,  CALLS edge → .d.ts stub node
-     *
-     * On CORRECT (fixed) code: trace_path unions both nodes; both names present.
-     *
-     * WHY RED on buggy code:
-     *   trace_path selects ONE of the two "alignToEdge" nodes as its BFS root.
-     *   Only that node's inbound CALLS edges are traversed.  The caller whose
-     *   CALLS edge points to the OTHER node is absent from the JSON response.
-     *   strstr() for the missing caller name returns NULL, and ASSERT_NOT_NULL
-     *   fires → RED.
-     *
-     *   Concretely:
-     *     — if impl node selected:  "externalConsumer" absent → RED
-     *     — if .d.ts node selected: "internalConsumer" absent → RED
-     *   Either way, exactly one of the two assertions below is RED,
-     *   proving the caller set is split and incomplete.
-     */
-    ASSERT_NOT_NULL(strstr(resp, "internalConsumer")); /* relative-import caller */
-    ASSERT_NOT_NULL(strstr(resp, "externalConsumer")); /* alias-import caller   */
+    yyjson_doc *trace = rh_trace_json(resp);
+    ASSERT_NOT_NULL(trace);
+    yyjson_val *root = yyjson_doc_get_root(trace);
+    ASSERT_NULL(yyjson_obj_get(root, "error"));
+    char expected_qn[512];
+    yyjson_val *callers = yyjson_obj_get(root, "callers");
+    snprintf(expected_qn, sizeof(expected_qn), "%s.packages.widget.src.internalConsumer", lp.project);
+    ASSERT_NOT_NULL(rh_trace_row(callers, expected_qn));
+    snprintf(expected_qn, sizeof(expected_qn), "%s.app.src.externalConsumer", lp.project);
+    ASSERT_NOT_NULL(rh_trace_row(callers, expected_qn));
+    yyjson_doc_free(trace);
 
     free(resp);
     rh_cleanup(&lp, store);

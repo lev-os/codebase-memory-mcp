@@ -59,6 +59,7 @@
 #include <foundation/compat.h>
 #include "test_framework.h"
 #include "repro_harness.h"
+#include "repro_trace.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -153,7 +154,7 @@ TEST(repro_issue514_data_flow_surfaces_arg_expr) {
              "\"project\":\"%s\","
              "\"direction\":\"outbound\","
              "\"depth\":2,"
-             "\"mode\":\"data_flow\"}",
+             "\"mode\":\"data_flow\",\"format\":\"json\"}",
              lp.project);
 
     char *resp = rh_call(&lp, "trace_path", args);
@@ -161,36 +162,22 @@ TEST(repro_issue514_data_flow_surfaces_arg_expr) {
 
     fprintf(stderr, "  [514] trace_path data_flow response: %.400s\n", resp);
 
-    /* The response must not be an error -- the node must be found. */
-    ASSERT_NULL(strstr(resp, "function not found"));
-
-    /* The response is the MCP tool-result envelope (inner json embedded as an
-     * escaped string value), so the "callees" key appears as \"callees\".
-     * Match the escaped form (see repro_issue480 / test_incremental's
-     * resp_has_key idiom). */
-    ASSERT_NOT_NULL(strstr(resp, "\\\"callees\\\""));
-
-    /* The callees array must be non-empty: the callee's QN tail "service.callee"
-     * must appear as a hop (unambiguous + escaping-proof). RED if the CALLS
-     * traversal is broken (separate from #514). */
-    ASSERT_NULL(strstr(resp, "\\\"callees\\\":[]"));
-    ASSERT_NOT_NULL(strstr(resp, "service.callee"));
-
-    /*
-     * THE CORE ASSERTION FOR BUG #514:
-     *
-     * The argument expression "payload_info" (part of "payload_info + 1" passed
-     * to callee()) must appear in the response JSON when mode="data_flow".
-     *
-     * WHY RED on current code:
-     *   bfs_to_json_array() (mcp.c ~line 2283) only emits cbm_node_hop_t fields
-     *   (name, qualified_name, hop).  cbm_edge_info_t (store.h ~line 146) does
-     *   not carry properties_json, so the "e":"payload_info + 1" stored in the
-     *   CALLS edge never reaches the JSON output.  strstr returns NULL.
-     *
-     * This assertion is the canonical RED line for bug #514.
-     */
-    ASSERT_NOT_NULL(strstr(resp, "payload_info"));
+    yyjson_doc *trace = rh_trace_json(resp);
+    ASSERT_NOT_NULL(trace);
+    yyjson_val *root = yyjson_doc_get_root(trace);
+    ASSERT_NULL(yyjson_obj_get(root, "error"));
+    char expected_qn[512];
+    yyjson_val *callees = yyjson_obj_get(root, "callees");
+    snprintf(expected_qn, sizeof(expected_qn), "%s.service.callee", lp.project);
+    yyjson_val *callee = rh_trace_row(callees, expected_qn);
+    ASSERT_NOT_NULL(callee);
+    ASSERT_EQ(yyjson_get_int(yyjson_arr_get(callee, 1)), 1);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(yyjson_obj_get(callees, "cols"), 2)), "args");
+    yyjson_val *call_args = yyjson_arr_get(callee, 2);
+    ASSERT_EQ(yyjson_arr_size(call_args), 1);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get_first(call_args), "e")),
+                  "payload_info + 1");
+    yyjson_doc_free(trace);
 
     free(resp);
     rh_cleanup(&lp, store);
