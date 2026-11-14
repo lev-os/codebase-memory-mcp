@@ -3399,13 +3399,17 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
     char *target_qn = cbm_pipeline_resolve_module(ctx, source_rel, imp->module_path);
     const cbm_gbuf_node_t *target = target_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, target_qn) : NULL;
     free(target_qn);
+    /* JS/TS specifiers name modules: the last dotted part of `./codec.js` is
+     * an extension, never a member, even when the module exports `js`. */
+    bool js_specifier = src_lang == CBM_LANG_JAVASCRIPT || src_lang == CBM_LANG_TYPESCRIPT ||
+                        src_lang == CBM_LANG_TSX;
     if (target && (!php_only || node_in_php_file(target))) {
-        /* Python/TS from-import of a member: module_path is often
+        /* Python from-import of a member: module_path is often
          * "pkg.mod.symbol" while resolve_module lands on the Module node
          * "pkg.mod". Prefer the member Function/Class when it exists —
          * required for `from M import f as g` so CALLS can import_map to f
          * (local_name g ≠ f). */
-        if (target->label &&
+        if (!js_specifier && target->label &&
             (strcmp(target->label, "Module") == 0 || strcmp(target->label, "File") == 0)) {
             char symbuf[256];
             const char *sym = import_candidate_symbol(imp->module_path, symbuf, sizeof(symbuf));
@@ -3428,10 +3432,9 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
         return target;
     }
 
-    /* JS/TS specifiers name modules. A path not found above must not fall
-     * through to an unrelated same-named function, folder or namespace. */
-    if (src_lang == CBM_LANG_JAVASCRIPT || src_lang == CBM_LANG_TYPESCRIPT ||
-        src_lang == CBM_LANG_TSX) {
+    /* A path not found above must not fall through to an unrelated
+     * same-named function, folder or namespace. */
+    if (js_specifier) {
         return NULL;
     }
 

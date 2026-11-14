@@ -832,6 +832,35 @@ TEST(ei_reincluded_folder_keeps_its_aliases) {
     PASS();
 }
 
+/* A JS/TS specifier names a module. Its extension (`./codec.js`) is not a
+ * member name, even when the module exports a function called `js`. */
+static int ei_module_extension_not_member_case(int pad) {
+    EILangFile files[80] = {
+        {"src/codec.js", "export function js() { return 1; }\n"},
+        {"src/types.ts", "export function ts() { return 1; }\n"},
+        {"src/loader.ts", "export const load = () => import('./codec.js');\n"},
+        {"src/static.ts", "import './codec.js';\n"},
+        {"src/typed.ts", "export const load = () => import('./types.ts');\n"},
+    };
+    static const EIFileEdgeExpect want[] = {
+        {"src/loader.ts", "src/codec.js"},
+        {"src/static.ts", "src/codec.js"},
+        {"src/typed.ts", "src/types.ts"},
+    };
+    static const bool dynamic[] = {true, false, true};
+    char names[60][32];
+    int count = ei_pad_files(files, ei_count_files(files), names, pad);
+    return ei_file_edges_match_properties(files, count, want, 3, 3, NULL, dynamic, true);
+}
+
+TEST(ei_module_extension_is_not_a_member) {
+    int sequential_ok = ei_module_extension_not_member_case(0);
+    int parallel_ok = ei_module_extension_not_member_case(60);
+    ASSERT_TRUE(sequential_ok);
+    ASSERT_TRUE(parallel_ok);
+    PASS();
+}
+
 /* #1682: extensionless dotted basenames are part of the module name.  The
  * resolver used to strip `.engine`, miss the module, and bind both imports to
  * the same-named fixture Function in the sibling spec file. */
@@ -3270,6 +3299,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_alias_target_keeps_its_extension);
     RUN_TEST(ei_file_target_namespace_calls_reach_its_definitions);
     RUN_TEST(ei_reincluded_folder_keeps_its_aliases);
+    RUN_TEST(ei_module_extension_is_not_a_member);
     RUN_TEST(ei_relative_astro_css_imports_issue2558);
     RUN_TEST(ei_nix_parent_relative_import_issue2797);
     RUN_TEST(ei_thrift_parent_relative_import_issue2797);
