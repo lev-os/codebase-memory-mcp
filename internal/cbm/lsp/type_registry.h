@@ -73,6 +73,7 @@ typedef struct {
     // so this is the only way to bind a short name through `using` directives and
     // enclosing namespaces (#2120). NULL for nested types and unknown namespaces.
     const char *namespace_qn;
+    bool ts_value_binding_written; // JS/TS runtime constructor binding is not stable.
 } CBMRegisteredType;
 
 // Hash-table bucket entry. Chains collisions via next-index list for overload sets.

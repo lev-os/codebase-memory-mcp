@@ -745,6 +745,8 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     }
     dst->is_interface = (strcmp(label, "Interface") == 0 || strcmp(label, "Protocol") == 0);
     dst->js_object_literal = src->js_object_literal;
+    dst->ts_value_binding_written = src->ts_value_binding_written;
+    dst->ts_return_constructor = src->ts_return_constructor;
     /* The return-type string. The Go registrar splits it on '|' (go_lsp.c
      * split_pipe_types), so a Go result LIST arrives split into its element
      * types: `(*T, error)` as `*T|error`, a named `(t *T)` as `*T`. The raw
@@ -3972,6 +3974,83 @@ static void pxc_mark_reexport_targets(const CBMModuleDefIndex *idx, bool *select
     cbm_free(CBM_MEM_CLASS_EXTRACT, queued);
 }
 
+/* Keep class providers referenced by selected TS return/field/base facts.
+ * Incremental fallback registries need the same type universe as a full
+ * shared registry. Each module and each selected definition is visited once. */
+static bool pxc_queue_type_modules(const CBMModuleDefIndex *idx, const CBMLSPDef *defs,
+                                   CBMLanguage lang, const char *text, bool *selected, int *queue,
+                                   int *tail, int *total, CBMHashTable *seen) {
+    if (!text)
+        return true;
+    static const char delimiters[] = "<>|:,(){}[] &\t\r\n";
+    while (*text) {
+        text += strspn(text, delimiters);
+        size_t len = strcspn(text, delimiters);
+        if (len && memchr(text, '.', len)) {
+            char *key = malloc(len + 1);
+            if (!key)
+                return false;
+            memcpy(key, text, len);
+            key[len] = '\0';
+            for (;;) {
+                pxc_module_entry_t *entry = cbm_ht_get(idx->ht, key);
+                if (entry) {
+                    const char *canonical = cbm_ht_get_key(idx->ht, key);
+                    if (!cbm_ht_has(seen, canonical)) {
+                        cbm_ht_set(seen, canonical, entry);
+                        if (!cbm_ht_has(seen, canonical)) {
+                            free(key);
+                            return false;
+                        }
+                        for (int j = 0; j < entry->count; j++) {
+                            int di = entry->indices[j];
+                            if (!selected[di] && pxc_def_lang_matches(lang, defs[di].lang)) {
+                                selected[di] = true;
+                                queue[(*tail)++] = di;
+                                (*total)++;
+                            }
+                        }
+                    }
+                    break;
+                }
+                char *dot = strrchr(key, '.');
+                if (!dot)
+                    break;
+                *dot = '\0';
+            }
+            free(key);
+        }
+        text += len;
+    }
+    return true;
+}
+
+static bool pxc_follow_ts_type_facts(const CBMModuleDefIndex *idx, const CBMLSPDef *defs,
+                                     CBMLanguage lang, bool *selected, int *total) {
+    int *queue = malloc((size_t)idx->def_count * sizeof(*queue));
+    CBMHashTable *seen = cbm_ht_create(64);
+    if (!queue || !seen) {
+        free(queue);
+        cbm_ht_free(seen);
+        return false;
+    }
+    int head = 0, tail = 0;
+    for (int i = 0; i < idx->def_count; i++)
+        if (selected[i])
+            queue[tail++] = i;
+    bool ok = true;
+    while (head < tail && ok) {
+        const CBMLSPDef *d = &defs[queue[head++]];
+        const char *facts[] = {d->return_types, d->embedded_types, d->field_defs, d->alias_target};
+        for (int i = 0; i < 4 && ok; i++)
+            ok = pxc_queue_type_modules(idx, defs, lang, facts[i], selected, queue, &tail, total,
+                                        seen);
+    }
+    free(queue);
+    cbm_ht_free(seen);
+    return ok;
+}
+
 CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef *all_defs,
                                         CBMLanguage caller_lang, const char *caller_namespace,
                                         const char *own_module, const char *const *imp_qns,
@@ -4007,6 +4086,10 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
     if (caller_lang == CBM_LANG_PYTHON) {
         pxc_mark_reexport_targets(idx, selected, all_defs, &total);
     }
+
+    if (pxc_is_js_family(caller_lang) &&
+        !pxc_follow_ts_type_facts(idx, all_defs, caller_lang, selected, &total))
+        goto failed;
 
     if (total == 0) {
         cbm_free(CBM_MEM_CLASS_EXTRACT, selected);

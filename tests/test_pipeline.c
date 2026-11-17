@@ -37692,7 +37692,37 @@ TEST(pipeline_js_twin_callables_scale) {
     PASS();
 }
 
+TEST(pipeline_x9c_imported_class_write_withholds_factory) {
+    char tmp[256] = "/tmp/cbm_x9c_class_write_XXXXXX", db[512], got[1024];
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "lib.ts",
+                    "export class Port { send() {} }\nclass Other { send() {} }\nfunction reset() "
+                    "{ Port = Other; }\n");
+    write_temp_file(tmp, "factory.ts",
+                    "import { Port } from './lib';\nexport function make() { return new Port(); "
+                    "}\nexport function local() { make().send(); }\n");
+    write_temp_file(
+        tmp, "main.ts",
+        "import { make } from './factory';\nexport function use() { make().send(); }\n");
+    snprintf(db, sizeof(db), "%s/g.db", tmp);
+    cbm_pipeline_t *p = js_twin_index(tmp, db);
+    ASSERT_NOT_NULL(p);
+    const char *project = cbm_pipeline_project_name(p);
+    js_twin_calls_at(db, project, "main.ts", 2, got, sizeof(got));
+    bool ok = js_twin_expect("imported written class", got, "main.use -> factory.make");
+    js_twin_calls_at(db, project, "factory.ts", 3, got, sizeof(got));
+    ok = js_twin_expect("local factory from written imported class", got,
+                        "factory.local -> factory.make") &&
+         ok;
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_x9c_imported_class_write_withholds_factory);
+
     RUN_TEST(pipeline_js_module_binding_keeps_plain_name);
     RUN_TEST(pipeline_js_local_callee_is_nearest_binding);
     RUN_TEST(pipeline_js_param_default_skips_body_var);

@@ -15666,6 +15666,107 @@ void cbm_js_twin_bind_local_callees(CBMExtractCtx *ctx) {
     js_drop_value_bound_rows(r);
 }
 
+/* Index writes once for the provider, including closures. A same-spelled
+ * local write can withhold a fact, but cannot manufacture a constructor. */
+static bool js_return_write_pattern(CBMExtractCtx *ctx, CBMHashTable *writes, TSNode node,
+                                    int depth) {
+    if (ts_node_is_null(node))
+        return true;
+    if (depth > 64)
+        return false;
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "identifier") == 0 ||
+        strcmp(kind, "shorthand_property_identifier_pattern") == 0) {
+        const char *name = cbm_node_text(ctx->arena, node, ctx->source);
+        if (!name)
+            return false;
+        cbm_ht_set(writes, name, writes);
+        return cbm_ht_has(writes, name);
+    }
+    if (strcmp(kind, "pair_pattern") == 0)
+        return js_return_write_pattern(ctx, writes, ts_node_child_by_field_name(node, "value", 5),
+                                       depth + 1);
+    if (strcmp(kind, "assignment_pattern") == 0 || strcmp(kind, "object_assignment_pattern") == 0)
+        return js_return_write_pattern(ctx, writes, ts_node_child_by_field_name(node, "left", 4),
+                                       depth + 1);
+    if (strcmp(kind, "object_pattern") == 0 || strcmp(kind, "array_pattern") == 0 ||
+        strcmp(kind, "rest_pattern") == 0 || strcmp(kind, "parenthesized_expression") == 0 ||
+        strcmp(kind, "as_expression") == 0 || strcmp(kind, "satisfies_expression") == 0 ||
+        strcmp(kind, "type_assertion") == 0 || strcmp(kind, "non_null_expression") == 0) {
+        uint32_t count = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < count; i++)
+            if (!js_return_write_pattern(ctx, writes, ts_node_named_child(node, i), depth + 1))
+                return false;
+    }
+    return true;
+}
+
+static void js_invalidate_written_returns(CBMExtractCtx *ctx) {
+    bool needed = false;
+    for (int i = 0; i < ctx->result->defs.count; i++)
+        needed |= ctx->result->defs.items[i].ts_return_constructor ||
+                  strcmp(ctx->result->defs.items[i].label, "Class") == 0;
+    if (!needed)
+        return;
+    CBMHashTable *writes = cbm_ht_create(32);
+    bool complete = writes != NULL;
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    while (complete) {
+        TSNode node = ts_tree_cursor_current_node(&cursor), target = {0};
+        const char *kind = ts_node_type(node);
+        TSNode called = strcmp(kind, "call_expression") == 0
+                            ? ts_node_child_by_field_name(node, "function", 8)
+                            : (TSNode){0};
+        if (strcmp(kind, "with_statement") == 0 ||
+            (strcmp(kind, "call_expression") == 0 && !ts_node_is_null(called) &&
+             strcmp(ts_node_type(called), "identifier") == 0 &&
+             js_node_text_is(called, ctx->source, "eval"))) {
+            complete = false;
+            break; /* Dynamic scope cannot prove that module bindings stay unchanged. */
+        }
+        if (strcmp(kind, "assignment_expression") == 0 ||
+            strcmp(kind, "augmented_assignment_expression") == 0 ||
+            (strcmp(kind, "for_in_statement") == 0 &&
+             ts_node_is_null(ts_node_child_by_field_name(node, "kind", 4))))
+            target = ts_node_child_by_field_name(node, "left", 4);
+        else if (strcmp(kind, "update_expression") == 0)
+            target = ts_node_named_child(node, 0);
+        complete = js_return_write_pattern(ctx, writes, target, 0);
+        if (!complete)
+            break;
+        if (ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor))
+                goto done;
+        }
+    }
+done:
+    ts_tree_cursor_delete(&cursor);
+    for (int i = 0; i < ctx->result->defs.count; i++) {
+        CBMDefinition *def = &ctx->result->defs.items[i];
+        if (strcmp(def->label, "Class") == 0)
+            def->ts_value_binding_written =
+                !complete || (def->name && cbm_ht_has(writes, def->name));
+        if (!def->ts_return_constructor || !def->return_type)
+            continue;
+        const char *name = def->return_type;
+        if (strncmp(name, "Promise<", 8) == 0)
+            name += 8;
+        size_t len = strcspn(name, ">");
+        const char *ctor = cbm_arena_strndup(ctx->arena, name, len);
+        if (!complete || !ctor || cbm_ht_has(writes, ctor) ||
+            (def->name && cbm_ht_has(writes, def->name))) {
+            bool async = strncmp(def->return_type, "Promise<", 8) == 0;
+            bool stable_factory = complete && def->name && !cbm_ht_has(writes, def->name);
+            def->return_type = async && stable_factory ? "Promise<unknown>" : "unknown";
+            def->ts_return_constructor = false;
+            def->ts_return_scope_safe = false;
+        }
+    }
+    cbm_ht_free(writes);
+}
+
 void cbm_extract_definitions(CBMExtractCtx *ctx) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
     if (!spec) {
@@ -15712,6 +15813,7 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
         ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) {
         /* Same language set as extract_js_vars, which marks the bindings. */
         js_mark_default_export_client(ctx, mod_idx);
+        js_invalidate_written_returns(ctx);
     }
     /* Last: the def list of the walk is final, the call-scope walk is next. */
     cbm_js_split_twin_callables(ctx);

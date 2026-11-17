@@ -5900,7 +5900,113 @@ TEST(tslsp_x9c_constructor_binding_forms) {
     PASS();
 }
 
+TEST(tslsp_x9c_provider_binding_writes) {
+    const char *writes[] = {
+        "make = replacement;",
+        "function reset() { make = replacement; }",
+        "Port = Other;",
+        "function reset() { Port = Other; }",
+        "[make] = list;",
+        "({ Port } = input);",
+        "make++;",
+        "for (make of list) {}",
+        "for (Port in input) {}",
+        "(<any>Port) = Other;",
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(writes) / sizeof(writes[0]); i++) {
+        char source[1024];
+        snprintf(
+            source, sizeof(source),
+            "export class Port { send() {} }\nclass Other { send() {} }\nexport function make() { "
+            "return new Port(); }\nfunction replacement() { return new Other(); }\n%s\n",
+            writes[i]);
+        bool pass = x9c_factory_fact(source, false);
+        if (!pass)
+            fprintf(stderr, "provider write %zu failed\n", i);
+        ok = pass && ok;
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(tslsp_x9c_mutable_class_keeps_async_promise) {
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.Port",
+         .short_name = "Port",
+         .label = "Class",
+         .def_module_qn = "test.lib",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .ts_value_binding_written = true},
+        {.qualified_name = "test.lib.later",
+         .short_name = "later",
+         .label = "Function",
+         .def_module_qn = "test.lib",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .return_types = "Promise<test.lib.Port>",
+         .ts_return_constructor = true},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *reg = cbm_ts_build_cross_registry(&arena, defs, 2);
+    const CBMRegisteredFunc *f = reg ? cbm_registry_lookup_func(reg, "test.lib.later") : NULL;
+    const CBMType *result = f && f->signature && f->signature->kind == CBM_TYPE_FUNC &&
+                                    f->signature->data.func.return_types
+                                ? f->signature->data.func.return_types[0]
+                                : NULL;
+    bool ok = result && result->kind == CBM_TYPE_TEMPLATE &&
+              result->data.template_type.template_name &&
+              strcmp(result->data.template_type.template_name, "Promise") == 0 &&
+              result->data.template_type.arg_count == 1 &&
+              cbm_type_is_unknown(result->data.template_type.template_args[0]);
+    cbm_arena_destroy(&arena);
+    for (int phase = 0; phase < 2; phase++) {
+        char source[1024];
+        snprintf(
+            source, sizeof(source),
+            "export class Port { send() {} }\nclass Other { send() {} }\nexport async function "
+            "later() { return new Port(); }\nfunction replacement() { return new Other(); }\n%s\n",
+            phase ? "later = replacement;" : "Port = Other;");
+        CBMFileResult *r = extract_ts(source);
+        bool found = false;
+        for (int i = 0; r && i < r->defs.count; i++) {
+            const CBMDefinition *d = &r->defs.items[i];
+            if (d->name && strcmp(d->name, "later") == 0) {
+                found = true;
+                ok = d->return_type &&
+                     strcmp(d->return_type, phase ? "unknown" : "Promise<unknown>") == 0 && ok;
+            }
+        }
+        ok = found && ok;
+        cbm_free_result(r);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(tslsp_x9c_dynamic_scope_withholds_constructor_facts) {
+    const char *sources[] = {
+        "class Port { send() {} }\nclass Other { send() {} }\nfunction make() { return new Port(); "
+        "}\neval('Port = Other');\nfunction use() { make().send(); }\n",
+        "class Port { send() {} }\nclass Other { send() {} }\nfunction make() { with ({ Port: "
+        "Other }) { return new Port(); } return new Port(); }\nfunction use() { make().send(); }\n",
+    };
+    bool ok = true;
+    for (int i = 0; i < 2; i++) {
+        TsLineTarget site = {i == 0 ? 5 : 4, NULL};
+        ok = ts_check_line_targets_in(extract_js, "dynamic constructor scope", sources[i], &site,
+                                      1) &&
+             ok;
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(ts_lsp) {
+    RUN_TEST(tslsp_x9c_provider_binding_writes);
+    RUN_TEST(tslsp_x9c_mutable_class_keeps_async_promise);
+    RUN_TEST(tslsp_x9c_dynamic_scope_withholds_constructor_facts);
+
     RUN_TEST(tslsp_x9c_constructor_binding_forms);
 
     RUN_TEST(tslsp_captured_receiver_requires_all_writes_to_agree);
