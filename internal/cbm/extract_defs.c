@@ -214,6 +214,7 @@ enum {
 enum { RT_PAIR_SIZE = 2 };
 
 // Forward declarations
+static void js_twin_mark_local(CBMArena *a, CBMDefinition *d);
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
@@ -7210,6 +7211,11 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     memset(&def, 0, sizeof(def));
 
     def.name = name;
+    def.literal_member_name =
+        (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
+         ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) &&
+        (strcmp(ts_node_type(name_node), "string") == 0 ||
+         strcmp(ts_node_type(name_node), "number") == 0);
     def.test_role = configured ? configured_rule.role : CBM_TEST_ROLE_NONE;
     if (configured) {
         TSNode candidate_name, body;
@@ -7486,6 +7492,11 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
             return;
     }
     cbm_overload_describe_def(a, &def, node, ctx->source, ctx->language);
+    /* A literal property key is not a bare lexical function binding.
+     * Keep exact qualified/typed lookup, but exclude short-name guesses. */
+    if (def.literal_member_name) {
+        js_twin_mark_local(a, &def);
+    }
     cbm_defs_push(&ctx->result->defs, a, def);
     if (ctx->language == CBM_LANG_MAKEFILE && strcmp(ts_node_type(node), "rule") == 0) {
         push_make_rule_targets(ctx, node, &def);
@@ -9570,6 +9581,11 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = name;
+    def.literal_member_name =
+        (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
+         ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) &&
+        (strcmp(ts_node_type(name_node), "string") == 0 ||
+         strcmp(ts_node_type(name_node), "number") == 0);
     def.qualified_name = method_qn;
     if (ctx->language == CBM_LANG_SWIFT) {
         if (!method_qn) {
@@ -9694,6 +9710,11 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     def.is_test = def.is_test || ctx->result->is_test_file;
 
     cbm_overload_describe_def(a, &def, child, ctx->source, ctx->language);
+    /* A literal property key is not a bare lexical function binding.
+     * Keep exact qualified/typed lookup, but exclude short-name guesses. */
+    if (def.literal_member_name) {
+        js_twin_mark_local(a, &def);
+    }
     cbm_defs_push(&ctx->result->defs, a, def);
 }
 
@@ -14418,6 +14439,10 @@ static bool js_twin_in_body(const TSNode *anc, int depth) {
 static void js_twin_mark_local(CBMArena *a, CBMDefinition *d) {
     int n = 0;
     while (d->extra_props && d->extra_props[n]) {
+        if (n % PAIR_LEN == 0 && strcmp(d->extra_props[n], CBM_PROP_FUNCTION_LOCAL) == 0 &&
+            d->extra_props[n + 1] && strcmp(d->extra_props[n + 1], "true") == 0) {
+            return;
+        }
         n++;
     }
     const char **kv =
@@ -15579,9 +15604,58 @@ static bool js_plain_identifier(const char *s) {
     return true;
 }
 
+/* Normalizing a property key must not create a lexical function binding.
+ * Such bare calls need the semantic resolver (or the lexical binder below),
+ * never a same-module or short-name guess. Sort literal names once, then
+ * search that small index per call; other files allocate nothing. */
+static void js_literal_callees_require_binding(CBMFileResult *r) {
+    if (!r->calls.count) {
+        return;
+    }
+    int count = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->literal_member_name && js_plain_identifier(d->name)) {
+            count++;
+        }
+    }
+    if (!count) {
+        return;
+    }
+    const char **names = malloc((size_t)count * sizeof(*names));
+    if (!names) {
+        /* Without the name index, conservatively require proof for bare calls. */
+        for (int i = 0; i < r->calls.count; i++) {
+            if (js_plain_identifier(r->calls.items[i].callee_name)) {
+                r->calls.items[i].requires_lsp_resolution = true;
+            }
+        }
+        return;
+    }
+    int n = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->literal_member_name && js_plain_identifier(d->name)) {
+            names[n++] = d->name;
+        }
+    }
+    qsort(names, (size_t)n, sizeof(*names), js_qn_ptr_cmp);
+    for (int i = 0; i < r->calls.count; i++) {
+        CBMCall *call = &r->calls.items[i];
+        if (call->callee_name &&
+            bsearch(&call->callee_name, names, (size_t)n, sizeof(*names), js_qn_ptr_cmp)) {
+            call->requires_lsp_resolution = true;
+        }
+    }
+    free(names);
+}
+
 void cbm_js_twin_bind_local_callees(CBMExtractCtx *ctx) {
     const js_twin_table_t *table = ctx ? ctx->js_twins : NULL;
     CBMFileResult *r = ctx ? ctx->result : NULL;
+    if (r) {
+        js_literal_callees_require_binding(r);
+    }
     if (!table || table->ndecls == 0 || !r || r->calls.count == 0) {
         return;
     }

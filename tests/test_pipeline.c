@@ -36604,6 +36604,106 @@ static char *js_twin_listing(const char *db_path, const char *project) {
     return buf;
 }
 
+/* Only source delimiters disappear: punctuation, numeric keys and escaped
+ * spellings retain distinct identities in definitions and caller QNs. */
+TEST(pipeline_js_quoted_callable_names) {
+    static const char *const exts[] = {"js", "ts"};
+    bool ok = true;
+    for (int x = 0; x < 2; x++) {
+        char tmp[256] = "/tmp/cbm_js_quoted_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        char file[32], db[512];
+        snprintf(file, sizeof(file), "main.%s", exts[x]);
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        write_temp_file(tmp, file,
+            "function work() {} function halt() {}\n"
+            "const ops = {\n"
+            "  'run-now': () => work(),\n"
+            "  \"stop\"() { halt(); },\n"
+            "  run_now() { work(); },\n"
+            "  7() { halt(); },\n"
+            "  'a\\\\b'() { work(); },\n"
+            "  ab() { halt(); },\n"
+            "  '07'() { work(); },\n"
+            "  '-item'() { halt(); }\n"
+            "};\n"
+            "class Box {\n"
+            "  'quoted'() { work(); }\n"
+            "  9() { halt(); }\n"
+            "}\n"
+            "function useBox() {\n"
+            "  const box = new Box();\n"
+            "  box.quoted();\n"
+            "}\n"
+            "function unbound() { stop(); }\n");
+        write_temp_file(tmp, "remote.js", "function unboundRemote() { stop(); }\n");
+        cbm_pipeline_t *p = js_twin_index(tmp, db);
+        ASSERT_NOT_NULL(p);
+        const char *project = cbm_pipeline_project_name(p);
+        const struct { int line; const char *name, *qn, *call; } cases[] = {
+            {3, "run-now", "main.run-now", "main.run-now -> main.work"},
+            {4, "stop", "main.stop", "main.stop -> main.halt"},
+            {5, "run_now", "main.run_now", "main.run_now -> main.work"},
+            {6, "7", "main.7", "main.7 -> main.halt"},
+            {7, "'a\\\\b'", "main.'a\\\\b'", "main.'a\\\\b' -> main.work"},
+            {8, "ab", "main.ab", "main.ab -> main.halt"},
+            {9, "07", "main.07", "main.07 -> main.work"},
+            {10, "-item", "main.-item", "main.-item -> main.halt"},
+            {13, "quoted", "main.Box.quoted", "main.Box.quoted -> main.work"},
+            {14, "9", "main.Box.9", "main.Box.9 -> main.halt"},
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            char got[1024];
+            js_twin_qn_at(db, project, file, cases[i].name, cases[i].line, got, sizeof(got));
+            ok = js_twin_expect(cases[i].name, got, cases[i].qn) && ok;
+            js_twin_calls_at(db, project, file, cases[i].line, got, sizeof(got));
+            ok = js_twin_expect(cases[i].name, got, cases[i].call) && ok;
+        }
+        char incoming[1024];
+        js_twin_calls_at(db, project, file, 18, incoming, sizeof(incoming));
+        ok = js_twin_expect("quoted target", incoming, "main.useBox -> main.Box.quoted") && ok;
+        js_twin_calls_at(db, project, file, 20, incoming, sizeof(incoming));
+        ok = js_twin_expect("property name is not a lexical binding", incoming, "") && ok;
+        js_twin_calls_at(db, project, "remote.js", 1, incoming, sizeof(incoming));
+        ok = js_twin_expect("property name is not a global binding", incoming, "") && ok;
+        cbm_pipeline_free(p);
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_js_quoted_key_keeps_lexical_binding) {
+    static const char *const exts[] = {"js", "ts"};
+    bool ok = true;
+    for (int x = 0; x < 2; x++) {
+        char tmp[256] = "/tmp/cbm_js_key_binding_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        char file[32], db[512], got[1024];
+        snprintf(file, sizeof(file), "main.%s", exts[x]);
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        write_temp_file(tmp, file,
+            "function work() {} function halt() {}\n"
+            "const ops = { 'stop'() { work(); } };\n"
+            "function stop() { halt(); }\n"
+            "function invoke() { stop(); }\n");
+        cbm_pipeline_t *p = js_twin_index(tmp, db);
+        ASSERT_NOT_NULL(p);
+        const char *project = cbm_pipeline_project_name(p);
+        js_twin_qn_at(db, project, file, "stop", 2, got, sizeof(got));
+        ok = js_twin_expect("quoted member identity", got, "main.ops.stop") && ok;
+        js_twin_qn_at(db, project, file, "stop", 3, got, sizeof(got));
+        ok = js_twin_expect("lexical function identity", got, "main.stop") && ok;
+        js_twin_calls_at(db, project, file, 2, got, sizeof(got));
+        ok = js_twin_expect("quoted member caller", got, "main.ops.stop -> main.work") && ok;
+        js_twin_calls_at(db, project, file, 4, got, sizeof(got));
+        ok = js_twin_expect("lexical target", got, "main.invoke -> main.stop") && ok;
+        cbm_pipeline_free(p);
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
 
 
 
@@ -37769,6 +37869,8 @@ TEST(pipeline_js_twin_callables_scale) {
 }
 
 SUITE(pipeline) {
+    RUN_TEST(pipeline_js_quoted_callable_names);
+    RUN_TEST(pipeline_js_quoted_key_keeps_lexical_binding);
     RUN_TEST(pipeline_js_exact_recursion);
     RUN_TEST(pipeline_js_module_binding_keeps_plain_name);
     RUN_TEST(pipeline_js_local_callee_is_nearest_binding);

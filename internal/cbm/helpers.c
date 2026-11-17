@@ -1228,6 +1228,18 @@ char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source,
             *paren = '\0';
         }
     }
+    /* Literal JS/TS property names have one spelling in definitions and
+     * caller scopes. Leave escaped strings intact instead of guessing their
+     * decoded value; numeric property tokens already have no delimiters. */
+    if (text && (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
+                 lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS) &&
+        strcmp(ts_node_type(name_node), "string") == 0 && !strchr(text, '\\')) {
+        size_t len = strlen(text);
+        if (len >= 2 && (text[0] == '\'' || text[0] == '"') && text[len - 1] == text[0]) {
+            memmove(text, text + 1, len - 2);
+            text[len - 2] = '\0';
+        }
+    }
     /* Nix quoted attrpath segment: `"kebab-case" = a: a;` and `services."my.svc" = …`
      * are ordinary names that merely need quoting in source. The node text carries
      * the delimiters, so without this the def is named `"kebab-case"` — quotes and

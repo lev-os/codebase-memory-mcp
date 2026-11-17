@@ -300,6 +300,9 @@ typedef struct {
      * QN from that same node, so the pair names one definition exactly (JS/TS
      * same-name twins, cbm_js_split_twin_callables). 0 when not recorded. */
     uint32_t node_start_byte;
+    /* JS/TS callable name proven by a string/number property-key AST node.
+     * This extraction-only fact keeps literal keys out of the junk-name filter. */
+    bool literal_member_name;
     /* Call matching: defaulted parameters, indexed in declaration order. */
     uint64_t param_default_mask;
     uint8_t selector_param_count;
