@@ -36741,7 +36741,70 @@ TEST(pipeline_js_generator_expressions) {
     PASS();
 }
 
+TEST(pipeline_js_constructor_does_not_guess_type_alias) {
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        char tmp[256] = "/tmp/cbm_js_type_guess_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        XlangEnvSave saved = xlang_env_select(mode != 0);
+        write_temp_file(tmp, "types.ts", "export type Response = { status: number };\n");
+        write_temp_file(tmp, "main.ts",
+            "function actual() {}\n"
+            "const tasks = { 'build-reply': () => new Response('synthetic') };\n"
+            "function control() { actual(); }\n");
+        for (int i = 0; mode && i < 51; i++) {
+            char file[32];
+            snprintf(file, sizeof(file), "pad%d.ts", i);
+            write_temp_file(tmp, file, "export {};\n");
+        }
+        char db[512], got[1024];
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        cbm_pipeline_t *p = js_twin_index(tmp, db);
+        ASSERT_NOT_NULL(p);
+        const char *project = cbm_pipeline_project_name(p);
+        js_twin_calls_at(db, project, "main.ts", 2, got, sizeof(got));
+        ok = js_twin_expect("constructor must not call a type alias", got, "") && ok;
+        js_twin_calls_at(db, project, "main.ts", 3, got, sizeof(got));
+        ok = js_twin_expect("runtime function still binds", got, "main.control -> main.actual") && ok;
+        cbm_pipeline_free(p);
+        xlang_env_restore(&saved);
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
 
+TEST(pipeline_js_keyword_named_local_call) {
+    static const char *const exts[] = {"js", "ts"};
+    bool ok = true;
+    for (int x = 0; x < 2; x++) {
+        char tmp[256] = "/tmp/cbm_js_keyword_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        char file[32], db[512];
+        snprintf(file, sizeof(file), "main.%s", exts[x]);
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        write_temp_file(tmp, file,
+            "function get() {}\n"
+            "function invoke() { get(); }\n"
+            "function shadow(get) { get(); }\n"
+            "function missing() { set(); }\n");
+        write_temp_file(tmp, "decoy.js", "export function set() {}\n");
+        cbm_pipeline_t *p = js_twin_index(tmp, db);
+        ASSERT_NOT_NULL(p);
+        const char *project = cbm_pipeline_project_name(p);
+        char got[1024];
+        js_twin_calls_at(db, project, file, 2, got, sizeof(got));
+        ok = js_twin_expect("keyword local binding", got, "main.invoke -> main.get") && ok;
+        js_twin_calls_at(db, project, file, 3, got, sizeof(got));
+        ok = js_twin_expect("keyword parameter binding", got, "") && ok;
+        js_twin_calls_at(db, project, file, 4, got, sizeof(got));
+        ok = js_twin_expect("keyword without binding", got, "") && ok;
+        cbm_pipeline_free(p);
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
 
 /* Exact recursion survives both writers and an incremental repair. Unknown
  * receivers and a shadowing local binding must never become self calls. */
@@ -37908,6 +37971,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_quoted_callable_names);
     RUN_TEST(pipeline_js_quoted_key_keeps_lexical_binding);
     RUN_TEST(pipeline_js_generator_expressions);
+    RUN_TEST(pipeline_js_constructor_does_not_guess_type_alias);
+    RUN_TEST(pipeline_js_keyword_named_local_call);
     RUN_TEST(pipeline_js_exact_recursion);
     RUN_TEST(pipeline_js_module_binding_keeps_plain_name);
     RUN_TEST(pipeline_js_local_callee_is_nearest_binding);

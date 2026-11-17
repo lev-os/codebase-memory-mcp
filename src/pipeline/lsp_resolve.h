@@ -60,6 +60,15 @@ static inline bool cbm_pipeline_exact_self_call(const cbm_resolution_t *res) {
     return false;
 }
 
+/* A registry name match onto a JS/TS type alias does not prove a runtime
+ * callable. Semantic targets take their existing resolution path separately. */
+static inline bool cbm_pipeline_js_type_only_target(CBMLanguage lang,
+                                                    const cbm_gbuf_node_t *target) {
+    bool js = lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
+              lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS;
+    return js && target && target->label && strcmp(target->label, "Type") == 0;
+}
+
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
 /* Test-build-only operation counter implemented by pass_usages.c. Keeping the
  * increment behind this seam lets the regression measure the real sequential

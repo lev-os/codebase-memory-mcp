@@ -1760,6 +1760,9 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
                          !cbm_pipeline_exact_self_call(&res))) {
         return 0;
     }
+    if (cbm_pipeline_js_type_only_target(lang, target_node)) {
+        drop_plain_call = true;
+    }
     /* A call that resolved onto a struct Field: refused across languages and
      * for a bare C call; a C/C++ member call takes the Field its object's type
      * names instead of the one the member name happened to find. */

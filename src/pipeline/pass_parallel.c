@@ -2486,9 +2486,9 @@ static void emit_config_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                              const cbm_gbuf_node_t *target, const CBMCall *call,
                              const cbm_resolution_t *res, const char *arg) {
     /* emit_service_edge may be reached with target==NULL on the HTTP/ASYNC
-     * external-client bypass (#523); a CONFIGURES edge needs a real target, so
+     * external-client bypass (#523); a CONFIGURES edge needs a real, distinct target, so
      * never deref a NULL target here. */
-    if (!target) {
+    if (!target || source->id == target->id) {
         return;
     }
     char esc_c[CBM_SZ_256];
@@ -2914,8 +2914,13 @@ static bool emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                               const char *route_mount, CBMLanguage lang) {
     /* Match emit_classified_edge: exact recursion bypasses classifiers. */
     if (target && source->id == target->id) {
-        return !suppress_plain_calls && cbm_pipeline_exact_self_call(res) &&
-               emit_normal_calls_edge(gbuf, source, target, call, res);
+        if (cbm_pipeline_exact_self_call(res)) {
+            return !suppress_plain_calls &&
+                   emit_normal_calls_edge(gbuf, source, target, call, res);
+        }
+        /* Unresolved routes use the source as a placeholder target. Keep
+         * classification onto real route/service nodes, never a self call. */
+        suppress_plain_calls = true;
     }
     cbm_svc_kind_t svc = cbm_service_pattern_match_in_project(
         res->qualified_name, target ? target->name : NULL,
@@ -3804,6 +3809,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
         atomic_fetch_add_explicit(&rc->time_ns_rc_target, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
+        if (!lsp_target && cbm_pipeline_js_type_only_target(lang, target_node)) {
+            drop_plain_call = true;
+        }
         /* A call that resolved onto a struct Field: refused across languages
          * and for a bare C call; a C/C++ member call takes the Field its
          * object's type names. Mirrors the sequential twin (pass_calls.c). */
