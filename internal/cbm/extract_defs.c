@@ -6009,62 +6009,6 @@ shadows_done:
     return constructor;
 }
 
-/* Record ownership without renaming the callable. The variable extractor
- * separately proves that the whole literal has no unknown property writes. */
-static const char *js_callable_member_owner(CBMExtractCtx *ctx, TSNode fn, const char *name) {
-    if (!name || (ctx->language != CBM_LANG_TYPESCRIPT && ctx->language != CBM_LANG_TSX &&
-                  ctx->language != CBM_LANG_JAVASCRIPT))
-        return NULL;
-    TSNode member = fn;
-    if (strcmp(ts_node_type(member), "method_definition") != 0 &&
-        strcmp(ts_node_type(member), "pair") != 0) {
-        member = ts_node_parent(fn);
-        if (ts_node_is_null(member) || strcmp(ts_node_type(member), "pair") != 0 ||
-            !ts_node_eq(ts_node_child_by_field_name(member, TS_FIELD("value")), fn))
-            return NULL;
-    }
-    bool pair = strcmp(ts_node_type(member), "pair") == 0;
-    TSNode key = ts_node_child_by_field_name(member, pair ? "key" : "name", pair ? 3 : 4);
-    if (ts_node_is_null(key))
-        return NULL;
-    char *key_name = cbm_node_text(ctx->arena, key, ctx->source);
-    if (!key_name || strchr(key_name, '\\'))
-        return NULL;
-    if (strcmp(ts_node_type(key), "string") == 0) {
-        size_t len = strlen(key_name);
-        if (len < 3)
-            return NULL;
-        key_name[len - 1] = '\0';
-        key_name++;
-    }
-    if (strcmp(key_name, name) != 0)
-        return NULL;
-    TSNode object = ts_node_parent(member);
-    if (ts_node_is_null(object) || strcmp(ts_node_type(object), "object") != 0)
-        return NULL;
-    TSNode decl = ts_node_parent(object);
-    if (ts_node_is_null(decl) || strcmp(ts_node_type(decl), "variable_declarator") != 0 ||
-        !ts_node_eq(ts_node_child_by_field_name(decl, TS_FIELD("value")), object) ||
-        !ts_node_is_null(ts_node_child_by_field_name(decl, TS_FIELD("type"))))
-        return NULL;
-    TSNode binding = ts_node_child_by_field_name(decl, TS_FIELD("name"));
-    if (ts_node_is_null(binding) || strcmp(ts_node_type(binding), "identifier") != 0)
-        return NULL;
-    TSNode statement = ts_node_parent(decl);
-    TSNode kind = ts_node_child_by_field_name(statement, TS_FIELD("kind"));
-    if (ts_node_is_null(kind) || strcmp(ts_node_type(kind), "const") != 0)
-        return NULL;
-    TSNode parent = ts_node_parent(statement);
-    if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "export_statement") == 0)
-        parent = ts_node_parent(parent);
-    if (ts_node_is_null(parent) || strcmp(ts_node_type(parent), "program") != 0)
-        return NULL;
-    const char *owner = cbm_node_text(ctx->arena, binding, ctx->source);
-    return owner ? cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, owner,
-                                               ctx->language)
-                 : NULL;
-}
-
 /* Declared return type of a C-family function/method node whose `type` field is
  * `type_node`. Any other language, and any type with nothing around its base
  * type, gets the base type text exactly as before. */
@@ -7353,7 +7297,6 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     }
 
     def.ts_return_scope_safe = ts_return_scope_safe(ctx, func_node);
-    def.js_member_owner = js_callable_member_owner(ctx, func_node, def.name);
     if (!def.return_type) {
         def.return_type = ts_constructor_return(ctx, func_node);
         if (def.return_type) {
@@ -9679,7 +9622,6 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     }
 
     def.ts_return_scope_safe = ts_return_scope_safe(ctx, child);
-    def.js_member_owner = js_callable_member_owner(ctx, child, def.name);
     if (!def.return_type) {
         def.return_type = ts_constructor_return(ctx, child);
         if (def.return_type) {
@@ -11210,79 +11152,6 @@ static void js_mark_default_export_client(CBMExtractCtx *ctx, int mod_idx) {
     ts_tree_cursor_delete(&cursor);
 }
 
-/* A closed literal has one known definition per key. Reject unknown writes
- * and accessors before admitting an exact object-owned callable; a same-name
- * module function is never evidence about an object's property. */
-static bool js_plain_callable_object(CBMExtractCtx *ctx, TSNode value) {
-    if (ts_node_is_null(value) || strcmp(ts_node_type(value), "object") != 0)
-        return false;
-    CBMHashTable *keys = cbm_ht_create(16);
-    if (!keys)
-        return false;
-    bool valid = true, callable = false;
-    uint32_t count = ts_node_named_child_count(value);
-    for (uint32_t i = 0; i < count && valid; i++) {
-        TSNode item = ts_node_named_child(value, i);
-        const char *kind = ts_node_type(item);
-        if (strcmp(kind, "comment") == 0)
-            continue;
-        TSNode key = {0};
-        if (strcmp(kind, "pair") == 0) {
-            key = ts_node_child_by_field_name(item, TS_FIELD("key"));
-            TSNode fn = ts_node_child_by_field_name(item, TS_FIELD("value"));
-            const char *fk = ts_node_is_null(fn) ? "" : ts_node_type(fn);
-            callable = callable || strcmp(fk, "arrow_function") == 0 ||
-                       strcmp(fk, "function_expression") == 0 || strcmp(fk, "function") == 0 ||
-                       strcmp(fk, "generator_function") == 0;
-        } else if (strcmp(kind, "method_definition") == 0) {
-            key = ts_node_child_by_field_name(item, TS_FIELD("name"));
-            callable = true;
-            for (uint32_t j = 0; j < ts_node_child_count(item); j++) {
-                const char *modifier = ts_node_type(ts_node_child(item, j));
-                if (strcmp(modifier, "get") == 0 || strcmp(modifier, "set") == 0)
-                    valid = false;
-            }
-        } else if (strcmp(kind, "shorthand_property_identifier") == 0) {
-            key = item;
-        } else {
-            valid = false;
-        }
-        if (!valid || ts_node_is_null(key)) {
-            valid = false;
-            break;
-        }
-        const char *kk = ts_node_type(key);
-        if (strcmp(kk, "property_identifier") != 0 && strcmp(kk, "identifier") != 0 &&
-            strcmp(kk, "shorthand_property_identifier") != 0 && strcmp(kk, "string") != 0) {
-            valid = false;
-            break;
-        }
-        char *name = cbm_node_text(ctx->arena, key, ctx->source);
-        if (!name || strchr(name, '\\')) {
-            valid = false;
-            break;
-        }
-        if (strcmp(kk, "string") == 0) {
-            size_t len = strlen(name);
-            if (len < 3) {
-                valid = false;
-                break;
-            }
-            name[len - 1] = '\0';
-            name++;
-        }
-        if (cbm_ht_get(keys, name)) {
-            valid = false;
-            break;
-        }
-        cbm_ht_set(keys, name, (void *)(uintptr_t)1);
-        if (!cbm_ht_get(keys, name))
-            valid = false;
-    }
-    cbm_ht_free(keys);
-    return valid && callable;
-}
-
 // JS/TS variable extraction: skip function-assigned declarators.
 static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
     uint32_t n = ts_node_named_child_count(node);
@@ -11335,8 +11204,6 @@ static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
                     TSNode type = ts_node_child_by_field_name(child, TS_FIELD("type"));
                     if (!ts_node_is_null(type)) {
                         def->return_type = cbm_node_text(a, type, ctx->source);
-                    } else if (js_plain_callable_object(ctx, value)) {
-                        def->js_object_literal = true;
                     } else if (!ts_node_is_null(value) &&
                                strcmp(ts_node_type(value), "new_expression") == 0) {
                         TSNode ctor = ts_node_child_by_field_name(value, TS_FIELD("constructor"));

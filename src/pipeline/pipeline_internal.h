@@ -1811,8 +1811,7 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      rebuild once to drop unproven typed-receiver call edges.
  * The unresolved-call coverage threshold remains independent. */
 /* 22: factory returns and return utilities preserve typed receiver identity. */
-/* 23: exact exported object members require cached literal ownership facts. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 23 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 22 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
