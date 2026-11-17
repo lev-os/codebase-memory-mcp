@@ -2636,6 +2636,26 @@ static const CBMLexicalScope *lexical_binding_owner_at(const WalkState *state, u
     return NULL;
 }
 
+/* Initializers describe a binding only while no write can replace it. A
+ * captured write counts too; resolve its actual owner after all declarations
+ * have been recorded, so a write in a nested block cannot affect a homonym. */
+static void js_invalidate_written_bindings(WalkState *state) {
+    for (int i = 0; i < state->js_writes.count; i++) {
+        const CBMUsage *write = &state->js_writes.items[i];
+        int first = 0, end = 0;
+        const CBMLexicalScope *owner = lexical_binding_owner_at(
+            state, write->lexical_scope_id, write->ref_name, write->site_start_byte, &first, &end);
+        if (!owner) continue;
+        for (int j = first; j < end; j++) {
+            CBMLexicalBinding *binding = &state->lexical_bindings[j];
+            if (binding->value_kind == CBM_BINDING_ARRAY_LITERAL ||
+                binding->value_kind == CBM_BINDING_NEW_INSTANCE) {
+                binding->value_kind = CBM_BINDING_VALUE;
+            }
+        }
+    }
+}
+
 /* Does every binding of `owner` in [first, end) that holds at `position` have
  * value kind `kind`? */
 static bool lexical_bindings_all_kind(const WalkState *state, const CBMLexicalScope *owner,
@@ -2822,6 +2842,7 @@ void cbm_finalize_lexical_usages(CBMExtractCtx *ctx, WalkState *state) {
         qsort(state->lexical_bindings, (size_t)state->lexical_binding_count,
               sizeof(*state->lexical_bindings), compare_lexical_bindings);
     }
+    js_invalidate_written_bindings(state);
     classify_js_calls(ctx, state);
     for (int i = state->usage_start_index; i < ctx->result->usages.count; i++) {
         CBMUsage *usage = &ctx->result->usages.items[i];
@@ -3112,6 +3133,15 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
         return;
     }
     if (is_write_occurrence(ctx, node, spec, state)) {
+        if (js_call_classifier_lang(ctx->language)) {
+            char *name = reference_name(ctx, node);
+            if (name && name[0]) {
+                CBMUsage write = {.ref_name = name,
+                                  .lexical_scope_id = active_lexical_scope_id(state),
+                                  .site_start_byte = ts_node_start_byte(node)};
+                cbm_usages_push(&state->js_writes, ctx->arena, write);
+            }
+        }
         if (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL ||
             ctx->language == CBM_LANG_OBJECTSCRIPT_ROUTINE) {
             char *binding_name = reference_name(ctx, node);

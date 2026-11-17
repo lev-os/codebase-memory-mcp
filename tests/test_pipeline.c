@@ -15473,7 +15473,8 @@ static int smr_calls(cbm_store_t *s, const char *project, const char *caller, co
             size_t sl = strlen(src.qualified_name);
             size_t tl = strlen(tgt.qualified_name);
             if (sl >= cs && tl >= ts && strcmp(src.qualified_name + sl - cs, src_tail) == 0 &&
-                strcmp(tgt.qualified_name + tl - ts, tgt_tail) == 0) {
+                (strcmp(callee, "*") == 0 ||
+                 strcmp(tgt.qualified_name + tl - ts, tgt_tail) == 0)) {
                 hits++;
             }
         }
@@ -15714,6 +15715,39 @@ static int ng_check(const ng_file_t *files, int nfiles, const ng_pair_t *pairs, 
     for (int i = 0; i < npairs && i < NG_MAX_PAIRS; i++) {
         got[i] = s ? smr_calls(s, cbm_pipeline_project_name(p), pairs[i].caller, pairs[i].callee)
                    : -1;
+        if (s && strcmp(pairs[i].callee, "*") == 0) {
+            const char *leaf = strrchr(pairs[i].caller, '.');
+            cbm_node_t *nodes = NULL;
+            int count = 0;
+            bool found = false;
+            cbm_store_find_nodes_by_name(s, cbm_pipeline_project_name(p), leaf ? leaf + 1 : pairs[i].caller,
+                                         &nodes, &count);
+            size_t len = strlen(pairs[i].caller);
+            for (int j = 0; j < count; j++) {
+                size_t n = strlen(nodes[j].qualified_name);
+                if (n > len && nodes[j].qualified_name[n - len - 1] == '.' &&
+                    strcmp(nodes[j].qualified_name + n - len, pairs[i].caller) == 0)
+                    found = true;
+            }
+            cbm_store_free_nodes(nodes, count);
+            if (!found) got[i] = -2;
+        }
+    }
+    bool mismatch = false;
+    for (int i = 0; i < npairs; i++) mismatch = mismatch || got[i] != pairs[i].want;
+    if (s && mismatch) {
+        cbm_edge_t *edges = NULL;
+        int count = 0;
+        cbm_store_find_edges_by_type(s, cbm_pipeline_project_name(p), "CALLS", &edges, &count);
+        for (int i = 0; i < count; i++) {
+            cbm_node_t source = {0}, target = {0};
+            if (cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK &&
+                cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK)
+                printf("  actual %s -> %s\n", source.qualified_name, target.qualified_name);
+            cbm_node_free_fields(&source);
+            cbm_node_free_fields(&target);
+        }
+        cbm_store_free_edges(edges, count);
     }
     if (s) {
         cbm_store_close(s);
@@ -15745,6 +15779,37 @@ static int ng_check(const ng_file_t *files, int nfiles, const ng_pair_t *pairs, 
     ASSERT_EQ(bad, 0);
     PASS();
 }
+
+/* The wildcard counts every outgoing CALLS edge; named pairs and that count
+ * together assert the complete target set, including constructor calls. */
+static int check_x11b_reassigned(bool parallel) {
+    static const ng_file_t files[] = {
+        {"src/reassigned.js", "class Sink { push(v) { return v; } }\n"
+         "export function use() { let rows = []; rows = new Sink(); return rows.push(1); }\n"},
+    };
+    static const ng_pair_t pairs[] = {
+        {"reassigned.use", "reassigned.Sink", 1, "constructor"},
+        {"reassigned.use", "reassigned.Sink.push", 1, "type-proven reassigned receiver"},
+        {"reassigned.use", "*", 2, "complete outgoing set"},
+    };
+    CBMFileResult *result = cbm_extract_file(files[0].content, (int)strlen(files[0].content),
+                                            CBM_LANG_JAVASCRIPT, "x11b", "src/reassigned.js", 0, NULL, NULL);
+    ASSERT_NOT_NULL(result);
+    int found = 0;
+    bool stale = false;
+    for (int i = 0; i < result->calls.count; i++) {
+        if (strcmp(result->calls.items[i].callee_name, "rows.push") == 0) {
+            found++;
+            stale = result->calls.items[i].receiver_requires_lsp;
+        }
+    }
+    cbm_free_result(result);
+    ASSERT_EQ(found, 1);
+    ASSERT_FALSE(stale);
+    return ng_check(files, 1, pairs, 3, parallel);
+}
+TEST(pipeline_x11b_reassigned) { return check_x11b_reassigned(false); }
+TEST(pipeline_x11b_reassigned_parallel) { return check_x11b_reassigned(true); }
 
 /* A member call on a receiver the TS resolver typed as a built-in
  * (`const rows: number[] = []; rows.push(1)`, a `Map`, an array parameter)
@@ -38078,6 +38143,10 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_module_callers_parallel);
     RUN_TEST(pipeline_tsjs_same_module_bound_receiver_not_bound);
     RUN_TEST(pipeline_tsjs_same_module_bound_receiver_not_bound_parallel);
+#if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
+#endif
+    RUN_TEST(pipeline_x11b_reassigned);
+    RUN_TEST(pipeline_x11b_reassigned_parallel);
     RUN_TEST(pipeline_tsjs_builtin_receiver_not_bound);
     RUN_TEST(pipeline_tsjs_builtin_receiver_not_bound_parallel);
     RUN_TEST(pipeline_tsjs_local_callee_not_bound);

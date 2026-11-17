@@ -1822,7 +1822,10 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *     name of a module binds only a definition of its file, and a type, or
  *     a method by a bare name, never. Unchanged files rebuild once to drop
  *     those edges. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 25 };
+/* 26: repair JS/TS suppression without discarding semantic targets; share
+ *     declaration scopes and retain proven imported values and project globals.
+ *     Unchanged files rebuild once to repair their CALLS edges. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 26 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

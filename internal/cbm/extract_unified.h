@@ -236,6 +236,9 @@ typedef struct {
     uint32_t amd_factory_end_byte;
     TSNode amd_dependencies;
 
+    /* JS/TS writes are resolved after every declaration is known. */
+    CBMUsageArray js_writes;
+
     CBMLanguage language;
 
     os_type_map_t os_type_map; // ObjectScript variable → type mapping
