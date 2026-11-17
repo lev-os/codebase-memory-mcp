@@ -5528,6 +5528,12 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                     }
                 }
             }
+            // The bare-call classifier (cbm_finalize_lexical_usages) reads the
+            // scope a JS/TS call sits in once every binding of the file is known.
+            if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
+                ctx->language == CBM_LANG_TSX) {
+                call.lexical_scope_id = state->active_lexical_scope_id;
+            }
             // Go receiver-aware guard (same direction as the TS/JS flag above).
             // Flag a selector call x.foo(). The Go AST cannot separate a method
             // call on a value from a package-qualified call — but every selector

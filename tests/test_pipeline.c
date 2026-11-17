@@ -15654,6 +15654,198 @@ TEST(pipeline_tsjs_same_module_bound_receiver_not_bound_parallel) {
     return check_same_module_bound_receiver(true);
 }
 
+/* ── JS/TS name guesses: the exact target or no edge ──────────────────────
+ * One fixture runner for the three wrong-edge classes below. It writes the
+ * files, runs the sequential resolver or (padded past
+ * MIN_FILES_FOR_PARALLEL, CBM_WORKERS pinned) the parallel one, and counts
+ * the CALLS edges of each (caller tail, callee tail) pair. */
+enum { NG_MAX_PAIRS = 16, NG_PAD_FILES = 52 };
+
+typedef struct {
+    const char *path;
+    const char *content;
+} ng_file_t;
+
+typedef struct {
+    const char *caller; /* QN tail of the calling definition */
+    const char *callee; /* QN tail of the target */
+    int want;           /* edges expected */
+    const char *why;
+} ng_pair_t;
+
+static int ng_check(const ng_file_t *files, int nfiles, const ng_pair_t *pairs, int npairs,
+                    bool parallel) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_ng_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    for (int i = 0; i < nfiles; i++) {
+        write_temp_file(tmp, files[i].path, files[i].content);
+    }
+    for (int i = 0; parallel && i < NG_PAD_FILES; i++) {
+        char name[64];
+        char pad[128];
+        snprintf(name, sizeof(name), "src/ng_pad%d.ts", i);
+        snprintf(pad, sizeof(pad), "export function ngPad%d(): number {\n  return %d;\n}\n", i, i);
+        write_temp_file(tmp, name, pad);
+    }
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    if ((old_workers && !saved_workers) || (old_single && !saved_single)) {
+        free(saved_workers);
+        free(saved_single);
+        th_rmtree(tmp);
+        FAIL("failed to save pipeline environment");
+    }
+    int pin_workers_rc = parallel ? cbm_setenv("CBM_WORKERS", "4", 1) : 0;
+    int pin_single_rc = parallel ? cbm_unsetenv("CBM_INDEX_SINGLE_THREAD") : 0;
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/ng.db", tmp);
+    cbm_pipeline_t *p = pin_workers_rc == 0 && pin_single_rc == 0
+                            ? cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL)
+                            : NULL;
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = run_rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    bool store_opened = s != NULL;
+    int got[NG_MAX_PAIRS];
+    for (int i = 0; i < npairs && i < NG_MAX_PAIRS; i++) {
+        got[i] = s ? smr_calls(s, cbm_pipeline_project_name(p), pairs[i].caller, pairs[i].callee)
+                   : -1;
+    }
+    if (s) {
+        cbm_store_close(s);
+    }
+    cbm_pipeline_free(p);
+    int restore_workers_rc =
+        saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    int restore_single_rc = saved_single ? cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1)
+                                         : cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    free(saved_workers);
+    free(saved_single);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(pin_workers_rc, 0);
+    ASSERT_EQ(pin_single_rc, 0);
+    ASSERT_EQ(restore_workers_rc, 0);
+    ASSERT_EQ(restore_single_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_TRUE(store_opened);
+    ASSERT_TRUE(npairs <= NG_MAX_PAIRS);
+    int bad = 0;
+    for (int i = 0; i < npairs; i++) {
+        if (got[i] != pairs[i].want) {
+            printf("  %s -> %s: %d edge(s), want %d (%s)\n", pairs[i].caller, pairs[i].callee,
+                   got[i], pairs[i].want, pairs[i].why);
+            bad++;
+        }
+    }
+    ASSERT_EQ(bad, 0);
+    PASS();
+}
+
+/* A member call on a receiver the TS resolver typed as a built-in
+ * (`const rows: number[] = []; rows.push(1)`, a `Map`, an array parameter)
+ * names the built-in's method. Before, the resolver's Array.push had no graph
+ * node, the registry ran anyway, and the same-module lookup dropped the
+ * receiver (`rows.push` -> this file's `push`) or a qualified tail matched an
+ * unrelated object of the same spelling in another file. `this.emit()` in a
+ * class that extends a package class must not borrow another class's
+ * `emit`. POSITIVE: an object literal that holds the module's `push`,
+ * `this.emit()` inherited from a project class, and a method of an instance of
+ * a class of this file or an imported one keep their edges. */
+static int check_builtin_receiver(bool parallel) {
+    static const ng_file_t files[] = {
+        {"src/rcv_lib.ts",
+         "export const rows = {\n"
+         "  push(v: number): number {\n"
+         "    return v;\n"
+         "  },\n"
+         "};\n"
+         "export class Bridge {\n"
+         "  emit(name: string): string {\n"
+         "    return name;\n"
+         "  }\n"
+         "}\n"},
+        {"src/rcv_use.ts",
+         "import { EventEmitter } from 'node:events';\n"
+         "import { Bridge } from './rcv_lib';\n"
+         "export function push(item: number): number {\n"
+         "  return item;\n"
+         "}\n"
+         "export function get(key: string): string {\n"
+         "  return key;\n"
+         "}\n"
+         "export function collect(): number[] {\n"
+         "  const rows: number[] = [];\n"
+         "  rows.push(1);\n"
+         "  return rows;\n"
+         "}\n"
+         "export function observe(seen: unknown[]): { onStopped: () => number } {\n"
+         "  seen.push('started');\n"
+         "  return { onStopped: () => seen.push('stopped') };\n"
+         "}\n"
+         "export function lookup(): void {\n"
+         "  const cache = new Map<string, number>();\n"
+         "  cache.get('a');\n"
+         "}\n"
+         "export function literal(item: number): number {\n"
+         "  const context = { push };\n"
+         "  return context.push(item);\n"
+         "}\n"
+         "export class Client extends EventEmitter {\n"
+         "  send(): void {\n"
+         "    this.emit('ready');\n"
+         "  }\n"
+         "}\n"
+         "export class Base {\n"
+         "  emit(name: string): string {\n"
+         "    return name;\n"
+         "  }\n"
+         "}\n"
+         "export class Child extends Base {\n"
+         "  fire(): void {\n"
+         "    this.emit('x');\n"
+         "  }\n"
+         "}\n"
+         "export class Store {\n"
+         "  get(key: string): string {\n"
+         "    return key;\n"
+         "  }\n"
+         "}\n"
+         "export function owned(): void {\n"
+         "  const store = new Store();\n"
+         "  store.get('a');\n"
+         "}\n"
+         "export function bridged(): void {\n"
+         "  const bridge = new Bridge();\n"
+         "  bridge.emit('a');\n"
+         "}\n"},
+    };
+    static const ng_pair_t pairs[] = {
+        {"rcv_use.collect", "push", 0, "array local: Array.push"},
+        {"rcv_use.observe", "push", 0, "array parameter: Array.push"},
+        {"rcv_use.onStopped", "push", 0, "array parameter in a nested arrow: Array.push"},
+        {"rcv_use.lookup", "get", 0, "Map local: Map.get"},
+        {"rcv_use.literal", "rcv_use.push", 1, "object literal holding push: kept"},
+        {"rcv_use.Client.send", "emit", 0, "base class of a package: no project emit"},
+        {"rcv_use.Child.fire", "rcv_use.Base.emit", 1, "project base class: kept"},
+        {"rcv_use.owned", "rcv_use.Store.get", 1, "instance of a class of this file: kept"},
+        {"rcv_use.bridged", "rcv_lib.Bridge.emit", 1, "instance of an imported class: kept"},
+    };
+    return ng_check(files, 2, pairs, (int)(sizeof(pairs) / sizeof(pairs[0])), parallel);
+}
+
+TEST(pipeline_tsjs_builtin_receiver_not_bound) {
+    return check_builtin_receiver(false);
+}
+
+TEST(pipeline_tsjs_builtin_receiver_not_bound_parallel) {
+    return check_builtin_receiver(true);
+}
+
 /* Parallel-resolver regression for the TS/JS receiver guard (>= 50 files forces
  * pass_parallel.c's resolve_file_calls). The guard must not drop a weak member
  * match before the service classification runs — it suppresses ONLY the plain
@@ -37722,6 +37914,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_module_callers_parallel);
     RUN_TEST(pipeline_tsjs_same_module_bound_receiver_not_bound);
     RUN_TEST(pipeline_tsjs_same_module_bound_receiver_not_bound_parallel);
+    RUN_TEST(pipeline_tsjs_builtin_receiver_not_bound);
+    RUN_TEST(pipeline_tsjs_builtin_receiver_not_bound_parallel);
     RUN_TEST(pipeline_python_class_body_calls_sequential);
     RUN_TEST(pipeline_python_class_body_calls_parallel);
     RUN_TEST(pipeline_python_init_scope_sequential);

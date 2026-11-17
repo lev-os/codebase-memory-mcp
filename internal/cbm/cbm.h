@@ -438,12 +438,18 @@ typedef struct {
                                      // C++ operator or static `this` with an instance-only
                                      // member). Never fall back to textual resolution.
     bool receiver_requires_lsp; // No plain CALLS fallback; independent service facts remain valid.
+                                // JS/TS: the call classifier (extract_usages.c) sets it
+                                // for a receiver bound to an array literal or to
+                                // `new Name()` of a runtime constructor.
     bool callee_is_locally_bound;    // bare call foo() whose callee identifier is bound as a
                                      // parameter of an enclosing function, so it cannot be the
                                      // module-level foo. Python: read by the weak-local-binding
                                      // guard. JS/TS: a parameter, variable or catch clause is
                                      // the nearest binding (cbm_js_twin_bind_local_callees), and
                                      // the registry step gives no edge. Default false.
+    uint32_t lexical_scope_id;       // JS/TS: the walk's innermost lexical scope at the call,
+                                     // read by the call classifier (extract_usages.c) at the
+                                     // end of the walk. Extraction only; 0 = none.
     bool receiver_is_amd_dependency; // JS/TS member call x.foo() whose receiver root x is a
                                      // parameter the factory of an enclosing AMD
                                      // define([...], fn) / require([...], fn) binds to a

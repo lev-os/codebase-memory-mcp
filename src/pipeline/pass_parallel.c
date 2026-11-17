@@ -3492,8 +3492,13 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * pass_calls.c; the service fallbacks below still see the call. */
         bool php_vendor_call = cbm_pipeline_php_vendor_call(php_vendor, result, call) ||
                                (lsp && !lsp_target && cbm_pipeline_lsp_external_receiver(lsp));
-        bool rust_external = lsp && cbm_pipeline_rust_external_target(
-                                        lang, lsp->strategy, lsp->callee_qn, rc->project_name);
+        /* The same holds for a TS/JS call the TS resolver placed on a built-in
+         * method (Array.push). Mirrors pass_calls.c. */
+        bool rust_external =
+            lsp && (cbm_pipeline_rust_external_target(lang, lsp->strategy, lsp->callee_qn,
+                                                      rc->project_name) ||
+                    cbm_pipeline_ts_builtin_target(lang, lsp->strategy, lsp->callee_qn,
+                                                   rc->project_name));
         /* Typed Swift calls must not scan the global name bucket first. */
         const char *candidates[CBM_SZ_256];
         int count = 0;

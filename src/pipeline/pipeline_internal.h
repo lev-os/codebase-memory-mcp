@@ -1814,7 +1814,12 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
 /* 23: captured receiver types may use a proof that every write agrees. */
 /* 24: calls through an imported plain object literal resolve as namespace
  *     members again. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 24 };
+/* 25: TS/JS name guesses give the exact target or no edge: a call the TS
+ *     resolver placed on a built-in method, a method of an array literal or
+ *     of `new Map()`-style runtime instance, and `this.x()` in a class whose
+ *     base is no project class, bind no same-named project callable.
+ *     Unchanged files rebuild once to drop those edges. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 25 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

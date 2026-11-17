@@ -5533,9 +5533,11 @@ static const char *js_extends_class(const cbm_registry_t *r, const char *cls, co
  * callable alike.
  *
  * `*no_edge` is set when no guess may answer either: `this` is a function's
- * or an object literal's inside a class (never the class), or the class
- * extends nothing, so no other member can be meant. Uncached: the answer
- * depends on the call. */
+ * or an object literal's inside a class (never the class), the class extends
+ * nothing, so no other member can be meant, or it extends what is no class of
+ * the project (a package's EventEmitter, a runtime global, an expression), so
+ * the member it lacks is that base's and no project callable of the same name
+ * is meant. Uncached: the answer depends on the call. */
 static cbm_resolution_t resolve_js_this_member(const cbm_registry_t *r, const CBMCall *call,
                                                const char *module_qn, const char **import_map_keys,
                                                const char **import_map_vals, int import_map_count,
@@ -5561,15 +5563,16 @@ static cbm_resolution_t resolve_js_this_member(const cbm_registry_t *r, const CB
     bool is_static = call->js_this == CBM_JS_THIS_STATIC;
     const char *name = callee + self_len;
     const char *hit = js_class_member(r, cls, name, is_static);
+    const char *parent = NULL;
     if (!hit && call->js_this_base) {
-        const char *parent = js_extends_class(r, cls, call->js_this_base, module_qn,
-                                              import_map_keys, import_map_vals, import_map_count);
+        parent = js_extends_class(r, cls, call->js_this_base, module_qn, import_map_keys,
+                                  import_map_vals, import_map_count);
         hit = parent ? js_class_member(r, parent, name, is_static) : NULL;
     }
     if (hit) {
         return (cbm_resolution_t){hit, "this_member", CONF_THIS_MEMBER, REG_RESOLVED};
     }
-    *no_edge = !call->js_this_base;
+    *no_edge = !call->js_this_base || !parent;
     return empty_result();
 }
 

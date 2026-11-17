@@ -4250,6 +4250,36 @@ TEST(parallel_rust_external_target_contract) {
     PASS();
 }
 
+/* Contract for cbm_pipeline_ts_builtin_target: only a TS/JS row the TS
+ * resolver placed on a method (lsp_ts_method) whose QN lies outside the
+ * project prefix is a built-in's. The end-to-end probes live in
+ * test_pipeline.c (pipeline_tsjs_builtin_receiver_not_bound*). */
+TEST(parallel_ts_builtin_target_contract) {
+    const char *proj = "proj";
+    ASSERT_TRUE(
+        cbm_pipeline_ts_builtin_target(CBM_LANG_TYPESCRIPT, "lsp_ts_method", "Array.push", proj));
+    ASSERT_TRUE(
+        cbm_pipeline_ts_builtin_target(CBM_LANG_JAVASCRIPT, "lsp_ts_method", "Map.get", proj));
+    ASSERT_TRUE(cbm_pipeline_ts_builtin_target(CBM_LANG_TSX, "lsp_ts_method", "projx.f", proj));
+    /* A project method keeps the registry fallback. */
+    ASSERT_FALSE(cbm_pipeline_ts_builtin_target(CBM_LANG_TYPESCRIPT, "lsp_ts_method",
+                                                "proj.src.a.Rows.push", proj));
+    /* Other strategies are not evidence. */
+    ASSERT_FALSE(
+        cbm_pipeline_ts_builtin_target(CBM_LANG_TYPESCRIPT, "lsp_ts_local", "Array.push", proj));
+    ASSERT_FALSE(
+        cbm_pipeline_ts_builtin_target(CBM_LANG_TYPESCRIPT, "lsp_unresolved", "push", proj));
+    /* Per-language: no other language is affected. */
+    ASSERT_FALSE(
+        cbm_pipeline_ts_builtin_target(CBM_LANG_PYTHON, "lsp_ts_method", "Array.push", proj));
+    /* Defensive NULL/empty inputs. */
+    ASSERT_FALSE(cbm_pipeline_ts_builtin_target(CBM_LANG_TYPESCRIPT, NULL, "Array.push", proj));
+    ASSERT_FALSE(cbm_pipeline_ts_builtin_target(CBM_LANG_TYPESCRIPT, "lsp_ts_method", "", proj));
+    ASSERT_FALSE(
+        cbm_pipeline_ts_builtin_target(CBM_LANG_TYPESCRIPT, "lsp_ts_method", "Array.push", NULL));
+    PASS();
+}
+
 /* Contract for cbm_pipeline_java_external_target: only a Java row the
  * resolver marked lsp_external, naming a qualified member, is external. The
  * end-to-end probes live in test_java_typed_calls.c. */
@@ -6140,6 +6170,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_cross_file_reread_preserves_unretained_edges);
     RUN_TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges);
     RUN_TEST(parallel_rust_external_target_contract);
+    RUN_TEST(parallel_ts_builtin_target_contract);
     RUN_TEST(parallel_java_external_target_contract);
     RUN_TEST(parallel_lsp_tail_match_fallbacks_gated_to_jvm);
     RUN_TEST(parallel_calls_parity);
