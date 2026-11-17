@@ -2552,10 +2552,11 @@ TEST(tslsp_param_property_this_dispatch_issue514) {
     PASS();
 }
 
-/* Only direct new-expression initializers infer a field type. An annotation
- * wins even when unknown, and a factory call is outside this inference. */
+/* Constructor and declared factory returns infer field types. An explicit
+ * annotation wins, including unknown; a same-name method is not a target. */
 TEST(tslsp_field_new_initializer_issue514) {
     const char *source = "class Tool { fire(): void {} }\n"
+                         "class Decoy { fire(): void {} }\n"
                          "class Base { run(): void {} }\n"
                          "class Derived extends Base { run(): void {} }\n"
                          "function makeTool(): Tool { return new Tool(); }\n"
@@ -2594,7 +2595,10 @@ TEST(tslsp_field_new_initializer_issue514) {
         ts514_resolved_count(&r->resolved_calls, annotated, "test.main.Base.run", "lsp_ts_method");
     int wrong = ts514_resolved_count(&r->resolved_calls, annotated, "test.main.Derived.run", NULL);
     int unknown = ts514_resolved_count(&r->resolved_calls, opaque, NULL, NULL);
-    int arbitrary = ts514_resolved_count(&r->resolved_calls, factory, NULL, NULL);
+    int arbitrary =
+        ts514_resolved_count(&r->resolved_calls, factory, "test.main.Tool.fire", "lsp_ts_method");
+    int factory_decoy =
+        ts514_resolved_count(&r->resolved_calls, factory, "test.main.Decoy.fire", NULL);
     cbm_free_result(r);
     ASSERT_TRUE(extracted);
     ASSERT_EQ(tool, 1);
@@ -2605,7 +2609,8 @@ TEST(tslsp_field_new_initializer_issue514) {
     ASSERT_EQ(declared, 1);
     ASSERT_EQ(wrong, 0);
     ASSERT_EQ(unknown, 0);
-    ASSERT_EQ(arbitrary, 0);
+    ASSERT_EQ(arbitrary, 1);
+    ASSERT_EQ(factory_decoy, 0);
     PASS();
 }
 
