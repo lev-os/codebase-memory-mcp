@@ -7765,6 +7765,12 @@ static void ts_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
             continue;
 
         if (strcmp(d->label, "Variable") == 0) {
+            /* `export const api = { run() {} }`: its callables keep module
+             * names, so `api.run()` resolves as a namespace member. Recording
+             * it as a value would mark it an instance of unknown type and
+             * withhold both that lookup and the plain-name fallback. */
+            if (d->js_object_literal)
+                continue;
             if (!reg->ts_values)
                 reg->ts_values = cbm_scope_push(arena, NULL);
             const CBMType *value =

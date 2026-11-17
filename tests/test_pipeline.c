@@ -32814,7 +32814,7 @@ TEST(pipeline_python_namespace_change_admission) {
     }
     int body = -9, signature = -9, alias = -9, order = -9;
     int empty = -9, literal = -9, unknown = -9, deletion = -9, transition = -9;
-    const char *non_python = "{\"v\":4,\"lang\":0,\"lsp\":[],\"reg\":[],\"py\":null}";
+    const char *non_python = "{\"v\":5,\"lang\":0,\"lsp\":[],\"reg\":[],\"py\":null}";
     if (complete) {
         body = cbm_lsp_surface_python_change(json[0], json[1]);
         signature = cbm_lsp_surface_python_change(json[0], json[2]);
@@ -32945,24 +32945,24 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
      * it re-extracts in full. */
     const char *bad[] = {
         "{\"v\":1,\"lsp\":[]}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[]}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":null}",
-        "{\"v\":4,\"lang\":1.0,\"lsp\":[],\"py\":null}",
-        "{\"v\":4,\"v\":4,\"lang\":0,\"lsp\":[],\"py\":null}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[]}",
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":null}",
+        "{\"v\":5,\"lang\":1.0,\"lsp\":[],\"py\":null}",
+        "{\"v\":5,\"v\":5,\"lang\":0,\"lsp\":[],\"py\":null}",
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":3,\"failure\":2,\"events\":[]}}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":99,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":99,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\\u0000suffix\",\"status\":2,"
         "\"failure\":0,\"events\":[]}}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":999,\"d\":0,\"s\":0,\"r\":0,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":8,\"d\":0,\"s\":1,\"r\":0,\"f\":0,\"l\":4294967296,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
@@ -32982,7 +32982,7 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
         cbm_arena_destroy(&arena);
     }
     const char *unknown =
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":7,\"d\":0,\"s\":0,\"r\":7,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}";
@@ -33010,7 +33010,7 @@ TEST(pipeline_lsp_surface_large_object_array_decode) {
     const size_t capacity = (size_t)count * 192 + 64;
     char *json = malloc(capacity);
     ASSERT_NOT_NULL(json);
-    size_t used = (size_t)snprintf(json, capacity, "{\"v\":4,\"lang\":0,\"py\":null,\"lsp\":[");
+    size_t used = (size_t)snprintf(json, capacity, "{\"v\":5,\"lang\":0,\"py\":null,\"lsp\":[");
     for (int i = 0; i < count; i++) {
         int n = snprintf(json + used, capacity - used,
                          "%s{\"qn\":\"pkg.f%d\",\"sn\":\"f%d\",\"lb\":\"Function\","
@@ -33100,10 +33100,10 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
         ASSERT_TRUE(row_a->surface_sha && row_a->surface_sha[0]);
         if (round == 0) {
             snprintf(sha_baseline, sizeof(sha_baseline), "%s", row_a->surface_sha);
-            /* The row is the versioned codec envelope (codec version 4) with
+            /* The row is the versioned codec envelope (codec version 5) with
              * the def present. */
             snprintf(json_probe, sizeof(json_probe), "%.20s", row_a->defs_json);
-            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":4") != NULL);
+            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":5") != NULL);
             ASSERT_TRUE(strstr(row_a->defs_json, "surface_probe") != NULL);
         } else if (round == 1) {
             ASSERT_STR_EQ(row_a->surface_sha, sha_baseline);
@@ -36990,6 +36990,67 @@ TEST(pipeline_ts_return_utilities_follow_imports) {
     PASS();
 }
 
+/* An imported const object literal is a namespace: its callables keep module
+ * names, so a call through it reaches them. A value of unknown type, or a
+ * mutable literal, is not a namespace, and a same-name module function is
+ * never its member. Incremental runs flip only the literal's `const`, so the
+ * importer stays unchanged and must follow the provider's new surface. The
+ * last run edits only the importer, so the provider's fact must come back
+ * from its cached surface. */
+TEST(pipeline_js_object_literal_export_is_namespace) {
+    static const char *const exts[] = {"ts", "js"};
+    static const char *const library = "export function halt() {}\n"
+                                       "export function build() { return null; }\n"
+                                       "export const made = build();\n"
+                                       "export %s api = { run() { return 1; }, stop: () => 2 };\n";
+    bool ok = true;
+    for (int x = 0; x < 2; x++) {
+        char tmp[256] = "/tmp/cbm_js_object_ns_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        static const char *const importer = "import { api, made } from './lib';\n"
+                                            "export function first() { api.run(); }\n"
+                                            "export function second() { api.stop(); }\n"
+                                            "export function third() { made.halt(%s); }\n";
+        char lib_name[32], main_name[32], lib[512], main_src[512], path[512], db[512], got[1024],
+            what[64];
+        snprintf(lib_name, sizeof(lib_name), "lib.%s", exts[x]);
+        snprintf(main_name, sizeof(main_name), "main.%s", exts[x]);
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        snprintf(main_src, sizeof(main_src), importer, "");
+        write_temp_file(tmp, main_name, main_src);
+        for (int phase = 0; phase < 4; phase++) {
+            if (phase < 3) {
+                snprintf(lib, sizeof(lib), library, phase == 1 ? "let" : "const");
+                write_temp_file(tmp, lib_name, lib);
+                snprintf(path, sizeof(path), "%s/%s", tmp, lib_name);
+            } else {
+                /* A body edit: same names, so the provider stays cached. */
+                snprintf(main_src, sizeof(main_src), importer, "api.run()");
+                write_temp_file(tmp, main_name, main_src);
+                snprintf(path, sizeof(path), "%s/%s", tmp, main_name);
+            }
+            ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000 + phase * 100, 0), 0);
+            cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+            ASSERT_NOT_NULL(p);
+            ASSERT_EQ(cbm_pipeline_run(p), 0);
+            const char *project = cbm_pipeline_project_name(p);
+            /* In the last run, `made.halt(api.run())` has one target: the argument. */
+            const char *want[] = {phase == 1 ? "" : "main.first -> lib.run",
+                                  phase == 1 ? "" : "main.second -> lib.stop",
+                                  phase == 3 ? "main.third -> lib.run" : ""};
+            for (int i = 0; i < 3; i++) {
+                snprintf(what, sizeof(what), "%s phase %d line %d", exts[x], phase, i + 2);
+                js_twin_calls_at(db, project, main_name, i + 2, got, sizeof(got));
+                ok = js_twin_expect(what, got, want[i]) && ok;
+            }
+            cbm_pipeline_free(p);
+        }
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 /* Index-file symbols belong to the folder, while ordinary files keep their
  * stem. Both paths must resolve the same calls by type, even with namesakes
  * elsewhere. Compare the complete target/strategy rows at each call site so
@@ -37640,6 +37701,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_top_level_declaration_keeps_plain_name);
     RUN_TEST(pipeline_js_this_call_in_arrow_reaches_class_method);
     RUN_TEST(pipeline_ts_factory_returns_keep_import_identity);
+    RUN_TEST(pipeline_js_object_literal_export_is_namespace);
     RUN_TEST(pipeline_ts_captured_receiver_tracks_every_write);
     RUN_TEST(pipeline_ts_return_utilities_follow_imports);
     RUN_TEST(pipeline_ts_index_file_resolver_matches_main);

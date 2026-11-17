@@ -264,6 +264,7 @@ typedef struct {
     bool is_entry_point;
     bool ts_return_scope_safe;      // TS return spelling has no generic parameter shadow.
     bool ts_return_constructor;     // Inferred `new C()` result; C must prove a runtime class.
+    bool js_object_literal;         // Unannotated module const initialized by a plain object.
     const char *structural_profile; // AST structural profile (arena-allocated) or NULL
     const char *body_tokens; // space-separated raw identifier tokens from body (arena) or NULL
     /* Rust only: raw trait path from the exact `impl Trait for Type` block

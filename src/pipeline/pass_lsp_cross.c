@@ -744,6 +744,7 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
             src->decl_namespace ? cbm_arena_strdup(arena, src->decl_namespace) : NULL;
     }
     dst->is_interface = (strcmp(label, "Interface") == 0 || strcmp(label, "Protocol") == 0);
+    dst->js_object_literal = src->js_object_literal;
     /* The return-type string. The Go registrar splits it on '|' (go_lsp.c
      * split_pipe_types), so a Go result LIST arrives split into its element
      * types: `(*T, error)` as `*T|error`, a named `(t *T)` as `*T`. The raw

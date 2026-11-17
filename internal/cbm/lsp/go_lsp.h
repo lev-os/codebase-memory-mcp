@@ -109,6 +109,9 @@ typedef struct {
      * by the registrar against def_module_qn like return_types. NULL = not an
      * identity alias. */
     const char *alias_target;
+    /* JS/TS only: a Variable initialized by an unannotated plain object
+     * literal. Its callables are module members, not a typed receiver. */
+    bool js_object_literal;
 } CBMLSPDef;
 
 // Parse source, build registry from defs + stdlib, run LSP.

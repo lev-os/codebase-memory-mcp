@@ -11205,6 +11205,11 @@ static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
                     if (!ts_node_is_null(type)) {
                         def->return_type = cbm_node_text(a, type, ctx->source);
                     } else if (!ts_node_is_null(value) &&
+                               strcmp(ts_node_type(value), "object") == 0) {
+                        /* A plain literal is a namespace of module members,
+                         * which keep their module names. */
+                        def->js_object_literal = true;
+                    } else if (!ts_node_is_null(value) &&
                                strcmp(ts_node_type(value), "new_expression") == 0) {
                         TSNode ctor = ts_node_child_by_field_name(value, TS_FIELD("constructor"));
                         if (!ts_node_is_null(ctor) &&

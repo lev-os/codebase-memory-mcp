@@ -1812,7 +1812,9 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  * The unresolved-call coverage threshold remains independent. */
 /* 22: factory returns and return utilities preserve typed receiver identity. */
 /* 23: captured receiver types may use a proof that every write agrees. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 23 };
+/* 24: calls through an imported plain object literal resolve as namespace
+ *     members again. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 24 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
