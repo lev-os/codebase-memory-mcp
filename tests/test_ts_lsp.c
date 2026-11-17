@@ -6035,7 +6035,26 @@ TEST(tslsp_x9c_async_return_awaits_promise) {
     PASS();
 }
 
+TEST(tslsp_x9c_repeated_var_initializers_are_writes) {
+    const char *source =
+        "class Port { send() {} }\n"
+        "class Other { send() {} }\n"
+        "var item = new Port();\n"
+        "export function read() { item.send(); }\n"
+        "var item = new Other(); function reset() { item = new Port(); }\n"
+        "function local() { var value = new Port(); const read = () => value.send(); var value = "
+        "new Other(); function reset() { value = new Port(); } }\n"
+        "var same = new Port(); var same = new Port(); const keep = () => same.send();\n"
+        "var empty = new Port(); var empty; const keepEmpty = () => empty.send();\n";
+    const TsLineTarget cases[] = {
+        {4, NULL}, {6, NULL}, {7, "test.main.Port.send"}, {8, "test.main.Port.send"}};
+    ASSERT_TRUE(ts_check_line_targets("var initializer", source, cases, 4));
+    PASS();
+}
+
 SUITE(ts_lsp) {
+    RUN_TEST(tslsp_x9c_repeated_var_initializers_are_writes);
+
     RUN_TEST(tslsp_x9c_async_return_awaits_promise);
 
     RUN_TEST(tslsp_x9c_normal_exits_return_class);

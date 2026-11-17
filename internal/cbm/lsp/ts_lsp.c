@@ -1746,29 +1746,10 @@ static void ts_site_push_pattern(TSLSPContext *ctx, TsSiteVec *v, TSNode pattern
     }
 }
 
-/* True when the `var` declaration under the cursor is a statement of a
- * function body or of the file, so it runs whenever its function does. */
-static bool ts_var_declaration_is_top(const TSTreeCursor *cursor) {
-    TSTreeCursor up = ts_tree_cursor_copy(cursor);
-    bool top = false;
-    if (ts_tree_cursor_goto_parent(&up)) {
-        TSNode parent = ts_tree_cursor_current_node(&up);
-        if (node_kind_is(parent, "export_statement") && ts_tree_cursor_goto_parent(&up))
-            parent = ts_tree_cursor_current_node(&up);
-        if (node_kind_is(parent, "program"))
-            top = true;
-        else if (node_kind_is(parent, "statement_block") && ts_tree_cursor_goto_parent(&up))
-            top = ts_is_flow_function(ts_tree_cursor_current_node(&up));
-    }
-    ts_tree_cursor_delete(&up);
-    return top;
-}
-
-/* A `var` hoists to its function. A declarator with a value in a nested
- * block, branch or loop header is also a write of that hoisted binding. */
+/* Every var initializer writes its hoisted binding, including a repeated
+ * declaration in the module or function body. An empty var adds no write. */
 static void ts_site_visit_var(TSLSPContext *ctx, TsSiteVec *v, TsSiteVec *hoist,
                               const TSTreeCursor *cursor, TSNode node, uint32_t fs, uint32_t fe) {
-    bool nested = !ts_var_declaration_is_top(cursor);
     uint32_t count = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < count; i++) {
         TSNode decl = ts_node_named_child(node, i);
@@ -1777,7 +1758,7 @@ static void ts_site_visit_var(TSLSPContext *ctx, TsSiteVec *v, TsSiteVec *hoist,
         TSNode name = ts_node_child_by_field_name(decl, "name", TS_LSP_FIELD_LEN("name"));
         ts_site_push_pattern(ctx, hoist, name, fs, fe, 0);
         TSNode value = ts_node_child_by_field_name(decl, "value", TS_LSP_FIELD_LEN("value"));
-        if (nested && !ts_node_is_null(value))
+        if (!ts_node_is_null(value))
             ts_site_push_pattern(ctx, v, name, fs, fe, 0);
     }
 }
@@ -3825,6 +3806,12 @@ static const CBMType *ts_declarator_type(TSLSPContext *ctx, TSNode decl,
 /* True when the collector recorded this `var` declarator as a write of
  * the binding its function hoists (ts_site_visit_var). */
 static bool ts_var_writes_hoisted(const TSLSPContext *ctx, TSNode decl) {
+    TSNode block = ts_node_parent(ts_node_parent(decl));
+    if (node_kind_is(block, "export_statement"))
+        block = ts_node_parent(block);
+    if (node_kind_is(block, "program") ||
+        (node_kind_is(block, "statement_block") && ts_is_flow_function(ts_node_parent(block))))
+        return false; /* A body declaration still binds and checks its uniform-write proof. */
     const struct TsAssignSites *sites = ctx->assign_sites;
     TSNode name = ts_node_child_by_field_name(decl, "name", TS_LSP_FIELD_LEN("name"));
     if (!sites || !sites->by_start || ts_node_is_null(name))
@@ -4249,6 +4236,9 @@ void ts_process_statement(TSLSPContext *ctx, TSNode node) {
             TSNode c = ts_node_named_child(node, i);
             if (!node_kind_is(c, "variable_declarator"))
                 continue;
+            if (hoisted && ts_node_is_null(ts_node_child_by_field_name(c, "value", 5)) &&
+                ts_node_is_null(ts_node_child_by_field_name(c, "type", 4)))
+                continue; /* An empty var redeclaration does not change its hoisted binding. */
             if (hoisted && ts_var_writes_hoisted(ctx, c))
                 ts_var_redeclare(ctx, c, straight);
             else
@@ -5533,7 +5523,9 @@ static void bind_module_declaration(TSLSPContext *ctx, TSNode node) {
             TSNode value = ts_node_child_by_field_name(decl, "value", TS_LSP_FIELD_LEN("value"));
             /* Module callables already have exact registry identities. Binding
              * them as unknown locals would hide JSX tags and direct calls. */
-            if (ts_is_function_value(value))
+            if (ts_is_function_value(value) ||
+                (node_kind_is(node, "variable_declaration") && ts_node_is_null(value) &&
+                 ts_node_is_null(ts_node_child_by_field_name(decl, "type", 4))))
                 continue;
             bind_variable_declarator(ctx, decl, ts_declaration_writable(ctx, node));
         }
