@@ -15923,6 +15923,25 @@ static int check_x11b_binding_scopes(bool parallel) {
 TEST(pipeline_x11b_binding_scopes) { return check_x11b_binding_scopes(false); }
 TEST(pipeline_x11b_binding_scopes_parallel) { return check_x11b_binding_scopes(true); }
 
+static int check_x11b_script_visibility(bool parallel) {
+    static const ng_file_t files[] = {
+        {"src/hidden.js", "export function eq() { return 0; }\n"
+         "export function ready() { return 0; }\n"},
+        {"src/visible.js", "function ready() { return 1; }\n"},
+        {"src/script.js", "function callsFromScript() { eq(); ready(); }\n"},
+        {"src/module.js", "export function callsFromModule() { return ready(); }\n"},
+    };
+    static const ng_pair_t pairs[] = {
+        {"script.callsFromScript", "visible.ready", 1, "classic script global"},
+        {"script.callsFromScript", "*", 1, "module export eq is invisible"},
+        {"module.callsFromModule", "visible.ready", 1, "global beats module decoy"},
+        {"module.callsFromModule", "*", 1, "complete outgoing set"},
+    };
+    return ng_check(files, 4, pairs, 4, parallel);
+}
+TEST(pipeline_x11b_script_visibility) { return check_x11b_script_visibility(false); }
+TEST(pipeline_x11b_script_visibility_parallel) { return check_x11b_script_visibility(true); }
+
 /* A member call on a receiver the TS resolver typed as a built-in
  * (`const rows: number[] = []; rows.push(1)`, a `Map`, an array parameter)
  * names the built-in's method. Before, the resolver's Array.push had no graph
@@ -16211,6 +16230,7 @@ static void write_external_import_shadow_fixture(const char *dir, int pad_files)
                     "export function sql(chunk: string): string {\n"
                     "  return chunk.replace(/\\s+/g, ' ');\n"
                     "}\n"
+                    "export function globalReady(): boolean { return false; }\n"
                     "export function normalize(s: string): string {\n"
                     "  return s.trim().toLowerCase();\n"
                     "}\n");
@@ -16224,16 +16244,17 @@ static void write_external_import_shadow_fixture(const char *dir, int pad_files)
                     "export function buildQuery(id: string): unknown {\n"
                     "  return [eq({ id }, id), sql('select 1'), normalize(id)];\n"
                     "}\n");
-    /* No import of `eq` at all. In a module (the file exports) an unimported
-     * bare name can only be a global, so it binds no project `eq`; a script
-     * shares top-level names with the other scripts of a page, so its guess
-     * keeps its edge. */
+    /* A script and a module can both call a real script global. Neither
+     * can reach an unrelated module export by a bare name. */
     write_temp_file(dir, "src/no-import.ts",
                     "export function callsWithoutImport(a: string, b: string): boolean {\n"
                     "  return eq(a, b);\n"
                     "}\n");
+    write_temp_file(dir, "src/classic-global.ts",
+                    "function globalReady(): boolean { return true; }\n");
     write_temp_file(dir, "src/no-import-script.ts",
                     "function callsFromScript(a: string, b: string): boolean {\n"
+                    "  globalReady();\n"
                     "  return eq(a, b);\n"
                     "}\n");
     for (int i = 0; i < pad_files; i++) {
@@ -16277,13 +16298,18 @@ static int assert_external_import_shadow_contract(const char *dir, const char *d
     if (rc == 0 && !cross_file_call_exists(s, project, "buildQuery", "normalize")) {
         rc = 6;
     }
-    /* (3) a bare call a module never imports is a global: no project edge;
-     * the same call in a script keeps its pre-existing edge. */
+    /* (3) module exports remain invisible to bare callers in both kinds
+     * of file. A classic-script global is the positive control. */
     if (rc == 0 && cross_file_call_exists(s, project, "callsWithoutImport", "eq")) {
         rc = 7;
     }
-    if (rc == 0 && !cross_file_call_exists(s, project, "callsFromScript", "eq")) {
+    if (rc == 0 && cross_file_call_exists(s, project, "callsFromScript", "eq")) {
         rc = 8;
+    }
+    if (rc == 0 && (smr_calls(s, project, "no-import-script.callsFromScript",
+                              "classic-global.globalReady") != 1 ||
+                    smr_calls(s, project, "no-import-script.callsFromScript", "*") != 1)) {
+        rc = 9;
     }
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -38263,6 +38289,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_x11b_project_globals_parallel);
     RUN_TEST(pipeline_x11b_binding_scopes);
     RUN_TEST(pipeline_x11b_binding_scopes_parallel);
+    RUN_TEST(pipeline_x11b_script_visibility);
+    RUN_TEST(pipeline_x11b_script_visibility_parallel);
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
 #endif
     RUN_TEST(pipeline_x11b_reassigned);
