@@ -37720,7 +37720,38 @@ TEST(pipeline_x9c_imported_class_write_withholds_factory) {
     PASS();
 }
 
+TEST(pipeline_x9c_transparent_object_literals) {
+    const char *values[] = {"({ run() {} })", "{ run() {} } as const",
+                            "({ run() {} } satisfies Shape)", "Object.freeze({ run() {} })",
+                            "({ ...input, run() {} })"};
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+        char tmp[256] = "/tmp/cbm_x9c_object_XXXXXX", db[512], lib[512], got[1024];
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        snprintf(lib, sizeof(lib),
+                 "const input = undefined; const key = Math.random() ? 'run' : 'other';\n"
+                 "export const api = %s;\nexport function halt() {}\n", values[i]);
+        const char *lib_file = i >= 5 ? "lib.js" : "lib.ts";
+        const char *main_file = i >= 5 ? "main.js" : "main.ts";
+        write_temp_file(tmp, lib_file, lib);
+        write_temp_file(tmp, main_file,
+                        "import { api } from './lib';\nexport function use() { api.run(); "
+                        "}\n");
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        cbm_pipeline_t *p = js_twin_index(tmp, db);
+        ASSERT_NOT_NULL(p);
+        js_twin_calls_at(db, cbm_pipeline_project_name(p), main_file, 2, got, sizeof(got));
+        ok = js_twin_expect(values[i], got, i < 3 ? "main.use -> lib.run" : "") && ok;
+        cbm_pipeline_free(p);
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_x9c_transparent_object_literals);
+
     RUN_TEST(pipeline_x9c_imported_class_write_withholds_factory);
 
     RUN_TEST(pipeline_js_module_binding_keeps_plain_name);

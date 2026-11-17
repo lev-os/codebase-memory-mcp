@@ -11150,7 +11150,7 @@ static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
             continue;
         }
         bool is_require = false;
-        TSNode value = ts_node_child_by_field_name(child, TS_FIELD("value"));
+        TSNode value = cbm_ts_unwrap_value(ts_node_child_by_field_name(child, TS_FIELD("value")));
         if (!ts_node_is_null(value)) {
             const char *vk = ts_node_type(value);
             if (strcmp(vk, "arrow_function") == 0 || strcmp(vk, "function_expression") == 0 ||
@@ -11193,8 +11193,7 @@ static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
                     TSNode type = ts_node_child_by_field_name(child, TS_FIELD("type"));
                     if (!ts_node_is_null(type)) {
                         def->return_type = cbm_node_text(a, type, ctx->source);
-                    } else if (!ts_node_is_null(value) &&
-                               strcmp(ts_node_type(value), "object") == 0) {
+                    } else if (cbm_ts_plain_object(value)) {
                         /* A plain literal is a namespace of module members,
                          * which keep their module names. */
                         def->js_object_literal = true;

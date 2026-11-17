@@ -60,4 +60,26 @@ static inline bool cbm_ts_returns_on_normal_exit(TSNode node, int depth) {
     return false;
 }
 
+/* Parentheses and compile-time assertions preserve the runtime value. */
+static inline TSNode cbm_ts_unwrap_value(TSNode node) {
+    for (int depth = 0; depth < 64 && !ts_node_is_null(node); depth++) {
+        const char *kind = ts_node_type(node);
+        if (strcmp(kind, "parenthesized_expression") != 0 && strcmp(kind, "as_expression") != 0 &&
+            strcmp(kind, "satisfies_expression") != 0)
+            return node;
+        node = ts_node_named_child(node, 0);
+    }
+    return (TSNode){0};
+}
+
+static inline bool cbm_ts_plain_object(TSNode node) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "object") != 0)
+        return false;
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++)
+        if (strcmp(ts_node_type(ts_node_named_child(node, i)), "spread_element") == 0)
+            return false;
+    return true;
+}
+
 #endif
