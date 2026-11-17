@@ -1818,8 +1818,10 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *     resolver placed on a built-in method, a method of an array literal or
  *     of `new Map()`-style runtime instance, and `this.x()` in a class whose
  *     base is no project class, bind no same-named project callable; a bare
- *     call through a parameter or a local value binds none. Unchanged files
- *     rebuild once to drop those edges. */
+ *     call through a parameter or a local value binds none; an unbound bare
+ *     name of a module binds only a definition of its file, and a type, or
+ *     a method by a bare name, never. Unchanged files rebuild once to drop
+ *     those edges. */
 enum { CBM_SEMANTIC_INDEX_VERSION = 25 };
 
 typedef struct {

@@ -15932,6 +15932,74 @@ TEST(pipeline_tsjs_local_callee_not_bound_parallel) {
     return check_local_callee(true);
 }
 
+/* A bare name no scope and no import of the file binds is a global
+ * (`fetch`, `new Response()`): only a definition of this file can be it. A
+ * type alias or an interface is never constructed, and a class method is
+ * never called by a bare name. POSITIVE: an imported function and a function
+ * of this file keep their edges, also in a dotfile module, whose definitions
+ * the pipeline's module name spells with the leading dot and the extractor
+ * without it (the registry guesses there; a homonym of another file exists). */
+static int check_unbound_global(bool parallel) {
+    static const ng_file_t files[] = {
+        {"src/glb_lib.ts", "export type Response = { ok: boolean };\n"
+                           "export interface Request {\n"
+                           "  url: string;\n"
+                           "}\n"
+                           "export class Api {\n"
+                           "  fetch(url: string): string {\n"
+                           "    return url;\n"
+                           "  }\n"
+                           "}\n"
+                           "export function structuredClone(v: unknown): unknown {\n"
+                           "  return v;\n"
+                           "}\n"
+                           "export function shared(): number {\n"
+                           "  return 1;\n"
+                           "}\n"
+                           "export function stamp(n: number): number {\n"
+                           "  return n * 2;\n"
+                           "}\n"},
+        {"src/.glb-dot.ts", "export function stamp(n: number): number {\n"
+                            "  return n;\n"
+                            "}\n"
+                            "export function withStamp(a: number, b: number = stamp(a)): number {\n"
+                            "  return a + b;\n"
+                            "}\n"},
+        {"src/glb_use.ts", "import { shared } from './glb_lib';\n"
+                           "function local(): number {\n"
+                           "  return 2;\n"
+                           "}\n"
+                           "export async function load(): Promise<void> {\n"
+                           "  await fetch('/x');\n"
+                           "  void new Response('body');\n"
+                           "  void new Request('/y');\n"
+                           "  structuredClone({});\n"
+                           "  shared();\n"
+                           "  local();\n"
+                           "}\n"},
+    };
+    static const ng_pair_t pairs[] = {
+        {"glb_use.load", "fetch", 0, "global fetch, not a project method"},
+        {"glb_use.load", "glb_lib.Response", 0, "a type alias is not constructed"},
+        {"glb_use.load", "glb_lib.Request", 0, "an interface is not constructed"},
+        {"glb_use.load", "glb_lib.structuredClone", 0, "global, not imported"},
+        {"glb_use.load", "glb_lib.shared", 1, "imported: kept"},
+        {"glb_use.load", "glb_use.local", 1, "this file: kept"},
+        {"glb-dot.withStamp", "glb-dot.stamp", 1, "this dotfile module: kept"},
+        {"glb-dot.withStamp", "glb_lib.stamp", 0, "a homonym of another file"},
+    };
+    return ng_check(files, (int)(sizeof(files) / sizeof(files[0])), pairs,
+                    (int)(sizeof(pairs) / sizeof(pairs[0])), parallel);
+}
+
+TEST(pipeline_tsjs_unbound_global_not_bound) {
+    return check_unbound_global(false);
+}
+
+TEST(pipeline_tsjs_unbound_global_not_bound_parallel) {
+    return check_unbound_global(true);
+}
+
 /* Parallel-resolver regression for the TS/JS receiver guard (>= 50 files forces
  * pass_parallel.c's resolve_file_calls). The guard must not drop a weak member
  * match before the service classification runs — it suppresses ONLY the plain
@@ -15979,10 +16047,16 @@ static void write_external_import_shadow_fixture(const char *dir, int pad_files)
                     "export function buildQuery(id: string): unknown {\n"
                     "  return [eq({ id }, id), sql('select 1'), normalize(id)];\n"
                     "}\n");
-    /* No import of `eq` at all: nothing in the caller's source contradicts the
-     * guess, so the pre-existing fallback keeps its edge. */
+    /* No import of `eq` at all. In a module (the file exports) an unimported
+     * bare name can only be a global, so it binds no project `eq`; a script
+     * shares top-level names with the other scripts of a page, so its guess
+     * keeps its edge. */
     write_temp_file(dir, "src/no-import.ts",
                     "export function callsWithoutImport(a: string, b: string): boolean {\n"
+                    "  return eq(a, b);\n"
+                    "}\n");
+    write_temp_file(dir, "src/no-import-script.ts",
+                    "function callsFromScript(a: string, b: string): boolean {\n"
                     "  return eq(a, b);\n"
                     "}\n");
     for (int i = 0; i < pad_files; i++) {
@@ -16026,9 +16100,13 @@ static int assert_external_import_shadow_contract(const char *dir, const char *d
     if (rc == 0 && !cross_file_call_exists(s, project, "buildQuery", "normalize")) {
         rc = 6;
     }
-    /* (3) a bare call the caller never imports keeps its pre-existing edge. */
-    if (rc == 0 && !cross_file_call_exists(s, project, "callsWithoutImport", "eq")) {
+    /* (3) a bare call a module never imports is a global: no project edge;
+     * the same call in a script keeps its pre-existing edge. */
+    if (rc == 0 && cross_file_call_exists(s, project, "callsWithoutImport", "eq")) {
         rc = 7;
+    }
+    if (rc == 0 && !cross_file_call_exists(s, project, "callsFromScript", "eq")) {
+        rc = 8;
     }
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -38004,6 +38082,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_tsjs_builtin_receiver_not_bound_parallel);
     RUN_TEST(pipeline_tsjs_local_callee_not_bound);
     RUN_TEST(pipeline_tsjs_local_callee_not_bound_parallel);
+    RUN_TEST(pipeline_tsjs_unbound_global_not_bound);
+    RUN_TEST(pipeline_tsjs_unbound_global_not_bound_parallel);
     RUN_TEST(pipeline_python_class_body_calls_sequential);
     RUN_TEST(pipeline_python_class_body_calls_parallel);
     RUN_TEST(pipeline_python_init_scope_sequential);

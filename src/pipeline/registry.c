@@ -5608,6 +5608,50 @@ static bool js_nested_callable(const cbm_registry_t *r, const char *qn) {
     return nested;
 }
 
+/* Is `qn` a definition a bare name can reach from the call: one whose parent
+ * scope is the calling module or a scope that encloses the call? The caller's
+ * QN is the extractor's, the scheme of the definition QNs; module_qn is the
+ * pipeline's, which spells some file names differently (a dotfile keeps its
+ * leading dot there), so either may vouch. */
+static bool js_qn_in_calling_scope(const char *qn, const char *module_qn, const char *caller_qn) {
+    const char *last = strrchr(qn, '.');
+    if (!last) {
+        return false;
+    }
+    size_t parent_len = (size_t)(last - qn);
+    if (module_qn && strncmp(qn, module_qn, parent_len) == 0 && module_qn[parent_len] == '\0') {
+        return true;
+    }
+    return caller_qn && strncmp(caller_qn, qn, parent_len) == 0 &&
+           (caller_qn[parent_len] == '\0' || caller_qn[parent_len] == '.');
+}
+
+/* A JS/TS name guess the call's own syntax refutes. A type alias or an
+ * interface is never called or constructed (`new Response()` where the project
+ * has only `type Response = ...`). A class method is never called by a bare
+ * name, so a weak short-name match of `fetch()` onto Api.fetch is no target.
+ * An unbound bare name in a module file (callee_is_unbound) is a global: only
+ * a definition of this file the call can reach can be it. */
+static bool js_guess_refuted(const cbm_registry_t *r, const CBMCall *call, const char *module_qn,
+                             const cbm_resolution_t *res) {
+    const char *qn = res->qualified_name;
+    if (!qn || !qn[0]) {
+        return false;
+    }
+    const char *label = cbm_ht_get(r->exact, qn);
+    if (label && (strcmp(label, "Interface") == 0 || strcmp(label, "Type") == 0)) {
+        return true;
+    }
+    bool bare = !strchr(call->callee_name, '.');
+    if (bare && label && strcmp(label, "Method") == 0 && weak_short_name_strategy(res->strategy)) {
+        return true;
+    }
+    if (bare && call->callee_is_unbound) {
+        return !js_qn_in_calling_scope(qn, module_qn, call->enclosing_func_qn);
+    }
+    return false;
+}
+
 /* The registry step both call resolvers (pass_calls.c, pass_parallel.c) run
  * once the LSP has not answered: a Python bare name bound in an enclosing def
  * first (the LSP binds those locals itself; this covers the sites it did not
@@ -5648,6 +5692,9 @@ cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const
                                              import_map_vals, import_map_count, lang, caller_test);
     if (js && strncmp(callee_name, "this.", strlen("this.")) == 0 &&
         js_nested_callable(r, res.qualified_name)) {
+        return empty_result();
+    }
+    if (js && js_guess_refuted(r, call, module_qn, &res)) {
         return empty_result();
     }
     return res;

@@ -2770,6 +2770,15 @@ static bool js_bare_callee_is_local_value(const WalkState *state, const CBMCall 
                                       CBM_BINDING_CALLABLE);
 }
 
+/* A bare name that nothing binds is a global (`fetch`, `new
+ * Response()`). In a module no definition of another file is visible by a
+ * bare name: only one of this file can be the callee (callee_is_unbound). A
+ * script's calls are left alone. */
+static bool js_bare_callee_is_unbound(CBMExtractCtx *ctx, const CBMLexicalScope *owner,
+                                      int *module_file) {
+    return !owner && js_file_is_module(ctx, module_file);
+}
+
 /* The JS/TS call classifier, run once every binding of the file is known.
  * Each rule only takes an edge away; a failed binding table classifies
  * nothing, which can only keep an edge. */
@@ -2799,6 +2808,8 @@ static void classify_js_calls(CBMExtractCtx *ctx, WalkState *state) {
             state, call->lexical_scope_id, call->callee_name, call->site_start_byte, &first, &end);
         if (js_bare_callee_is_local_value(state, call, owner, first, end)) {
             call->callee_is_locally_bound = true;
+        } else if (js_bare_callee_is_unbound(ctx, owner, &module_file)) {
+            call->callee_is_unbound = true;
         }
     }
 }

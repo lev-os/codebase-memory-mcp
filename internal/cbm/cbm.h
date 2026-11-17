@@ -452,6 +452,11 @@ typedef struct {
     uint32_t lexical_scope_id;       // JS/TS: the walk's innermost lexical scope at the call,
                                      // read by the call classifier (extract_usages.c) at the
                                      // end of the walk. Extraction only; 0 = none.
+    bool callee_is_unbound;          // JS/TS bare call foo() / new Foo() in a module file
+                                     // (it imports or exports) whose name no scope, no
+                                     // declaration and no import of the file binds: a
+                                     // global. Only a definition of this file can be the
+                                     // callee (registry.c). Default false.
     bool receiver_is_amd_dependency; // JS/TS member call x.foo() whose receiver root x is a
                                      // parameter the factory of an enclosing AMD
                                      // define([...], fn) / require([...], fn) binds to a
