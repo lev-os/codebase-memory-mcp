@@ -5757,6 +5757,8 @@ static void ts_lsp_collect_import_aliases(TSLSPContext *ctx, TSNode root) {
         if (!node_kind_is(kids[i], "import_statement"))
             continue;
         TSNode clause = find_first_kind(kids[i], "import_clause");
+        if (ts_node_is_null(clause))
+            continue; /* A side-effect-only import has no local bindings. */
         for (uint32_t j = 0; j < ts_node_named_child_count(clause); j++) {
             TSNode binding = ts_node_named_child(clause, j);
             if (node_kind_is(binding, "identifier")) {
