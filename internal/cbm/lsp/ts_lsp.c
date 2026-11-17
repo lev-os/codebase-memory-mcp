@@ -28,6 +28,7 @@
 
 #include "ts_lsp.h"
 #include "ts_proof.h"
+#include "lsp_work.h"
 #include "../../../src/foundation/platform.h"
 #include "../helpers.h"
 #include "../js_this.h"
@@ -4097,16 +4098,27 @@ static const CBMType *ts_uniform_write_type(TSLSPContext *ctx, const char *name,
         cbm_registry_lookup_type(ctx->registry, base->data.named.qualified_name);
     if (!type || type->is_interface)
         return NULL;
-    int first = ts_proof_first_name(s->by_name, s->count, name);
+    int lo = 0, hi = s->count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        CBM_LSP_WORK(1);
+        int cmp = strcmp(s->by_name[mid].name, name);
+        if (cmp < 0 || (cmp == 0 && s->by_name[mid].start < ctx->fn_start))
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    int first = lo;
     if (first == s->count || strcmp(s->by_name[first].name, name) != 0 || !ts_proof_shadows(ctx))
         return NULL;
     if (!ts_proof_context(initializer) || !ts_proof_expression(ctx, initializer, 0))
         return NULL;
     bool seen = false;
     for (int i = first; i < s->count && strcmp(s->by_name[i].name, name) == 0; i++) {
+        CBM_LSP_WORK(1);
         const TsAssignSite *site = &s->by_name[i];
-        if (site->start < ctx->fn_start || site->start >= ctx->fn_end)
-            continue;
+        if (site->start >= ctx->fn_end)
+            break;
         if (ts_node_is_null(site->value))
             return NULL;
         if (!ts_proof_context(site->value) || !ts_proof_expression(ctx, site->value, 0))

@@ -25,6 +25,7 @@
 #include "lsp/c_lsp.h"
 #include "lsp/py_lsp.h"
 #include "lsp/ts_lsp.h"
+#include "lsp/lsp_work.h"
 #include "lsp/php_lsp.h"
 #include "lsp/java_lsp.h"
 #include "lsp/kotlin_lsp.h"
@@ -385,7 +386,15 @@ static bool pxc_base_strategy_is_weak(const char *strategy) {
  * uses, plus the facts the external-base gate reads. NULL (the surface-probe
  * path) keeps every base at its raw spelling. */
 typedef struct {
+    const CBMImport *binding;
+    const char *module;
+    bool ambiguous;
+} pxc_ts_return_import_t;
+
+typedef struct {
     const cbm_registry_t *reg;
+    CBMHashTable *ts_return_imports;
+    bool ts_return_imports_complete;
     const char **imp_keys;
     const char **imp_vals;
     int imp_count;
@@ -501,6 +510,42 @@ static const char *pxc_resolve_base_qn(const pxc_base_scope_t *bs, const char *r
 /* Resolve a simple return type in its declaration's import scope, not the
  * caller's. A generic parameter may shadow an imported type with the same
  * spelling; extraction records that scope fact before syntax is discarded. */
+/* Return qualification reads this one per-file index instead of scanning
+ * every import for every declaration. Duplicate bindings fail closed. */
+static void pxc_index_ts_return_imports(CBMArena *arena, pxc_base_scope_t *bs) {
+    bs->ts_return_imports = cbm_ht_create(bs->imports ? (uint32_t)bs->imports->count : 0);
+    if (!bs->ts_return_imports)
+        return;
+    for (int i = 0; bs->imports && i < bs->imports->count; i++) {
+        CBM_LSP_WORK(1);
+        const CBMImport *binding = &bs->imports->items[i];
+        if (!binding->local_name)
+            continue;
+        pxc_ts_return_import_t *entry = cbm_ht_get(bs->ts_return_imports, binding->local_name);
+        if (entry) {
+            entry->ambiguous = true;
+            continue;
+        }
+        entry = cbm_arena_calloc(arena, (1) * sizeof(*entry));
+        if (!entry)
+            return;
+        entry->binding = binding;
+        cbm_ht_set(bs->ts_return_imports, binding->local_name, entry);
+        if (!cbm_ht_has(bs->ts_return_imports, binding->local_name))
+            return;
+    }
+    for (int i = 0; i < bs->imp_count; i++) {
+        CBM_LSP_WORK(1);
+        pxc_ts_return_import_t *entry = cbm_ht_get(bs->ts_return_imports, bs->imp_keys[i]);
+        if (!entry)
+            continue;
+        if (entry->module && strcmp(entry->module, bs->imp_vals[i]) != 0)
+            entry->ambiguous = true;
+        entry->module = bs->imp_vals[i];
+    }
+    bs->ts_return_imports_complete = true;
+}
+
 static const char *pxc_ts_return_qn(CBMArena *arena, const CBMDefinition *def,
                                     const pxc_base_scope_t *bs, const char *module_qn) {
     if (!bs ||
@@ -519,28 +564,19 @@ static const char *pxc_ts_return_qn(CBMArena *arena, const CBMDefinition *def,
     /* Same-module names are already qualified by the TS parser. Only an
      * explicit import needs rewriting, so ordinary primitive/local returns
      * never pay for a syntax or registry lookup here. */
-    int matches = 0;
-    const CBMImport *binding = NULL;
-    for (int i = 0; bs->imports && i < bs->imports->count; i++) {
-        const char *local = bs->imports->items[i].local_name;
-        if (local && strlen(local) == len && memcmp(local, name, len) == 0) {
-            matches++;
-            binding = &bs->imports->items[i];
-        }
-    }
-    if (matches > 1 || (!matches && !def->ts_return_constructor))
+    if (!bs->ts_return_imports_complete)
         return NULL;
     const char *bare = cbm_arena_strndup(arena, name, len);
+    if (!bare)
+        return NULL;
+    CBM_LSP_WORK(1);
+    const pxc_ts_return_import_t *entry = cbm_ht_get(bs->ts_return_imports, bare);
+    if ((entry && entry->ambiguous) || (!entry && !def->ts_return_constructor))
+        return NULL;
+    const CBMImport *binding = entry ? entry->binding : NULL;
     const char *qn = NULL;
     if (binding && binding->member) {
-        const char *module = NULL;
-        for (int i = 0; i < bs->imp_count; i++) {
-            if (strcmp(bs->imp_keys[i], bare) != 0)
-                continue;
-            if (module && strcmp(module, bs->imp_vals[i]) != 0)
-                return NULL;
-            module = bs->imp_vals[i];
-        }
+        const char *module = entry->module;
         if (module) {
             const char *candidate = cbm_arena_sprintf(arena, "%s.%s", module, binding->member);
             if (cbm_label_is_type_like(cbm_registry_label_of(bs->reg, candidate)))
@@ -1380,12 +1416,16 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
                                         files[fi].language, fr, true, &bs.imp_keys, &bs.imp_vals,
                                         &bs.imp_count);
         }
+        if (bs.reg && (bs.lang == CBM_LANG_TYPESCRIPT || bs.lang == CBM_LANG_TSX ||
+                       bs.lang == CBM_LANG_JAVASCRIPT))
+            pxc_index_ts_return_imports(arena, &bs);
         for (int di = 0; di < fr->defs.count; di++) {
             if (pxc_build_lsp_def(arena, &fr->defs.items[di], def_modules[fi], namespace_name,
                                   files[fi].language, &defs[idx], bs.reg ? &bs : NULL) == 0) {
                 idx++;
             }
         }
+        cbm_ht_free(bs.ts_return_imports);
         if (files[fi].language == CBM_LANG_PYTHON) {
             pxc_fold_py_field_types(arena, fr, defs, file_start, idx, &bs, def_modules[fi]);
             /* Package namespace records (re-exports), reserved in the bound

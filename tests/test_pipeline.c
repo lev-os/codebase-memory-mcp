@@ -7,6 +7,7 @@
 #include "../src/foundation/compat.h"
 #include "foundation/platform.h" // cbm_normalize_path_sep (drive-canonicalization regression)
 #include "test_framework.h"
+#include "lsp/lsp_work.h"
 #include "test_helpers.h"
 #include "foundation/mem.h" // cbm_mem_init/budget (back-pressure futile-nap test)
 #include "pipeline/pipeline.h"
@@ -37800,7 +37801,61 @@ TEST(pipeline_x9c_default_import_value_boundaries) {
     PASS();
 }
 
+static uint64_t x9c_return_import_work(int count, bool *complete) {
+    size_t cap = (size_t)count * 160 + 128;
+    char *source = malloc(cap);
+    if (!source) {
+        *complete = false;
+        return 0;
+    }
+    int off = 0;
+    for (int i = 0; i < count; i++)
+        off += snprintf(
+            source + off, cap - (size_t)off,
+            "import { Port as I%d } from './lib%d';\nexport function f%d(): I%d { return null; }\n",
+            i, i, i, i);
+    CBMFileResult *fr =
+        cbm_extract_file(source, off, CBM_LANG_TYPESCRIPT, "probe", "main.ts", 0, NULL, NULL);
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("probe", "/unused");
+    cbm_pipeline_ctx_t ctx = {.project_name = "probe", .gbuf = gbuf, .registry = reg};
+    CBMFileResult *cache[] = {fr};
+    cbm_file_info_t files[] = {{.rel_path = "main.ts", .language = CBM_LANG_TYPESCRIPT}};
+    char *modules[] = {NULL};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    int n = 0;
+    (void)cbm_lsp_work_take();
+    CBMLSPDef *defs = fr && reg && gbuf ? cbm_pxc_collect_all_defs(&ctx, &arena, cache, files, 1,
+                                                                   "probe", modules, &n, NULL)
+                                        : NULL;
+    uint64_t work = cbm_lsp_work_take();
+    *complete = defs && n == count;
+    free(defs);
+    free(modules[0]);
+    cbm_arena_destroy(&arena);
+    cbm_gbuf_free(gbuf);
+    cbm_registry_free(reg);
+    cbm_free_result(fr);
+    free(source);
+    return work;
+}
+
+TEST(pipeline_x9c_return_import_work_is_linear) {
+    bool small_ok, large_ok;
+    uint64_t small = x9c_return_import_work(128, &small_ok);
+    uint64_t large = x9c_return_import_work(512, &large_ok);
+    fprintf(stderr, "return import work: 128=%llu 512=%llu\n", (unsigned long long)small,
+            (unsigned long long)large);
+    ASSERT_TRUE(small_ok && large_ok);
+    ASSERT_GT(small, 0);
+    ASSERT_LTE(large, small * 6);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_x9c_return_import_work_is_linear);
+
     RUN_TEST(pipeline_x9c_default_import_value_boundaries);
 
     RUN_TEST(pipeline_x9c_transparent_object_literals);
