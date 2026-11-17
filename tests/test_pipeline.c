@@ -15860,6 +15860,45 @@ static int check_x11b_import_values(bool parallel) {
 TEST(pipeline_x11b_import_values) { return check_x11b_import_values(false); }
 TEST(pipeline_x11b_import_values_parallel) { return check_x11b_import_values(true); }
 
+static int check_x11b_project_globals(bool parallel) {
+    static const ng_file_t files[] = {
+        {"src/classic.js", "function appReady() { return 1; }\n"
+         "class ScriptBox { poke() { return 2; } }\n"},
+        {"src/ambient.d.ts", "declare function ambientReady(): number;\n"},
+        {"src/install.js", "export {};\n"
+         "globalThis.globalReady = function globalReady() { return 3; };\n"
+         "window.windowReady = function windowReady() { return 4; };\n"
+         "export function scoped(window) { window.shadowReady = function shadowReady() { return 0; }; }\n"
+         "const object = { objectReady() { return 0; } };\n"},
+        {"src/decoy.js", "export function appReady() { return 0; }\n"
+         "export function exportedOnly() { return 0; }\n"
+         "export class ScriptBox { poke() { return 0; } }\n"},
+        {"src/commonjs.js", "function commonReady() { return 0; }\n"
+         "module.exports = { commonReady };\n"},
+        {"src/globals.js", "export function use() { return appReady(); }\n"
+         "export function ambient() { return ambientReady(); }\n"
+         "export function installed() { return globalReady() + windowReady(); }\n"
+         "export function create() { const box = new ScriptBox(); return box.poke(); }\n"
+         "export function hidden() { exportedOnly(); shadowReady(); objectReady(); commonReady(); }\n"},
+    };
+    static const ng_pair_t pairs[] = {
+        {"globals.use", "classic.appReady", 1, "script global beats module homonym"},
+        {"globals.use", "*", 1, "complete outgoing set"},
+        {"globals.ambient", "ambient.d.ambientReady", 1, "ambient project declaration"},
+        {"globals.ambient", "*", 1, "complete outgoing set"},
+        {"globals.installed", "install.globalReady", 1, "explicit globalThis assignment"},
+        {"globals.installed", "install.windowReady", 1, "explicit window assignment"},
+        {"globals.installed", "*", 2, "complete outgoing set"},
+        {"globals.create", "classic.ScriptBox", 1, "global constructor"},
+        {"globals.create", "classic.ScriptBox.poke", 1, "global instance method"},
+        {"globals.create", "*", 2, "complete outgoing set"},
+        {"globals.hidden", "*", 0, "another module export is invisible"},
+    };
+    return ng_check(files, 6, pairs, 11, parallel);
+}
+TEST(pipeline_x11b_project_globals) { return check_x11b_project_globals(false); }
+TEST(pipeline_x11b_project_globals_parallel) { return check_x11b_project_globals(true); }
+
 /* A member call on a receiver the TS resolver typed as a built-in
  * (`const rows: number[] = []; rows.push(1)`, a `Map`, an array parameter)
  * names the built-in's method. Before, the resolver's Array.push had no graph
@@ -38196,6 +38235,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_x11b_default_scope_parallel);
     RUN_TEST(pipeline_x11b_import_values);
     RUN_TEST(pipeline_x11b_import_values_parallel);
+    RUN_TEST(pipeline_x11b_project_globals);
+    RUN_TEST(pipeline_x11b_project_globals_parallel);
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
 #endif
     RUN_TEST(pipeline_x11b_reassigned);

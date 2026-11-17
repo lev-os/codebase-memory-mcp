@@ -1394,6 +1394,7 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
         cbm_node_props_function_local(node->properties_json) ||
         cbm_node_is_split_overload(node->qualified_name, node->name, node->properties_json)) {
         cbm_registry_add_qn_only(seed->registry, node->qualified_name, node->label);
+        cbm_registry_add_js_global_node(seed->registry, node->qualified_name, node->properties_json);
         return;
     }
     /* Same per-file bound as the full index (pass_definitions.c). */
@@ -1407,6 +1408,7 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
                    cbm_registry_test_double_path(node->file_path);
     cbm_registry_add_lang_in_module(seed->registry, node->name, node->qualified_name, node->label,
                                     lang, prefix_len, is_test);
+    cbm_registry_add_js_global_node(seed->registry, node->qualified_name, node->properties_json);
     if (node->properties_json) {
         const char *mask = strstr(node->properties_json, "\"param_default_mask\":\"");
         const char *count = strstr(node->properties_json, "\"selector_param_count\":");

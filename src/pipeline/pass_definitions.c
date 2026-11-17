@@ -552,6 +552,8 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
             cbm_registry_add_lang_in_module(ctx->registry, def->name, def->qualified_name,
                                             def->label, lang, module_prefix_len, is_test);
         }
+        cbm_registry_add_js_global(ctx->registry, cbm_def_js_global_name(def->extra_props),
+                                    def->qualified_name);
         if (lang == CBM_LANG_SWIFT && def->qn_sig_off) {
             cbm_registry_set_swift_signature(ctx->registry, def->qualified_name,
                                              def->param_default_mask, def->selector_param_count,

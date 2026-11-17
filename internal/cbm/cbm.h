@@ -365,6 +365,8 @@ typedef struct {
  * function's locals (pipeline.h cbm_def_props_function_local). Value
  * "true". */
 #define CBM_PROP_FUNCTION_LOCAL "function_local"
+/* The identifier through which a script/ambient/explicit global is visible. */
+#define CBM_PROP_JS_GLOBAL_NAME "js_global_name"
 
 /* Argument captured from a call expression */
 typedef struct {
@@ -496,6 +498,7 @@ typedef struct {
     const char **trailing_closure_labels;
     /* A constant local's proven import provenance, scoped to this call site.
      * root is the original import-map key, NULL for a direct require. */
+    const char *js_receiver_ctor; /* unbound constructor of a stable receiver */
     const char *js_import_root;
     const char *js_import_module;
     const char *js_import_member;

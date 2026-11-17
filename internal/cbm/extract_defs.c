@@ -9084,6 +9084,9 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     def.qualified_name = class_qn;
     def.label = label;
     def.file_path = ctx->rel_path;
+    if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
+        ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS)
+        def.node_start_byte = ts_node_start_byte(node);
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);

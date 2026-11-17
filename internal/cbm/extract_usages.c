@@ -2831,24 +2831,6 @@ static bool js_plain_call_name(const char *s) {
 
 /* Does the file import or export, which makes it a module? A script without
  * either shares its top-level names with the other scripts of a page. */
-static bool js_program_is_module(TSNode root) {
-    uint32_t count = ts_node_named_child_count(root);
-    for (uint32_t i = 0; i < count; i++) {
-        const char *kind = ts_node_type(ts_node_named_child(root, i));
-        if (strcmp(kind, "import_statement") == 0 || strcmp(kind, "export_statement") == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool js_file_is_module(CBMExtractCtx *ctx, int *module_file) {
-    if (*module_file < 0) {
-        *module_file = js_program_is_module(ctx->root) ? 1 : 0;
-    }
-    return *module_file == 1;
-}
-
 /* `root.member` or `root?.member` with two plain names: the root, copied into
  * `buf`, else NULL. */
 static const char *js_member_call_root(const char *callee, char *buf, size_t cap) {
@@ -2885,7 +2867,8 @@ static bool js_new_of_global(CBMExtractCtx *ctx, const WalkState *state,
             return false;
         }
     }
-    return js_file_is_module(ctx, module_file);
+    (void)module_file;
+    return true;
 }
 
 /* A member call `xs.push()` / `m.get()` whose receiver's nearest binding
@@ -2895,7 +2878,7 @@ static bool js_new_of_global(CBMExtractCtx *ctx, const WalkState *state,
  * answer may give it an edge (receiver_requires_lsp). Any binding there of
  * another kind keeps the call as it was. */
 static bool js_receiver_is_runtime_object(CBMExtractCtx *ctx, const WalkState *state,
-                                          const CBMCall *call, int *module_file) {
+                                          CBMCall *call, int *module_file) {
     char buf[CBM_SZ_128];
     const char *root = js_member_call_root(call->callee_name, buf, sizeof(buf));
     int first = 0;
@@ -2917,6 +2900,7 @@ static bool js_receiver_is_runtime_object(CBMExtractCtx *ctx, const WalkState *s
             !js_new_of_global(ctx, state, binding, module_file)) {
             return false;
         }
+        if (end == first + 1) call->js_receiver_ctor = binding->ctor_name;
     }
     return true;
 }
@@ -2942,7 +2926,167 @@ static bool js_bare_callee_is_local_value(const WalkState *state, const CBMCall 
  * script's calls are left alone. */
 static bool js_bare_callee_is_unbound(CBMExtractCtx *ctx, const CBMLexicalScope *owner,
                                       int *module_file) {
-    return !owner && js_file_is_module(ctx, module_file);
+    (void)ctx;
+    (void)module_file;
+    return !owner;
+}
+
+static uint32_t js_scope_at(const WalkState *state, uint32_t position) {
+    uint32_t id = state->root_lexical_scope_id;
+    uint32_t width = UINT32_MAX;
+    for (int i = 0; i < state->lexical_scope_count; i++) {
+        const CBMLexicalScope *scope = &state->lexical_scopes[i];
+        if (scope->start_byte <= position && position < scope->end_byte &&
+            scope->end_byte - scope->start_byte < width) {
+            id = scope->id;
+            width = scope->end_byte - scope->start_byte;
+        }
+    }
+    return id;
+}
+
+static bool js_unbound_object(CBMExtractCtx *ctx, const WalkState *state, TSNode node,
+                               const char *name) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "identifier") != 0 ||
+        !text_equals(ctx, node, name)) return false;
+    int first = 0, end = 0;
+    uint32_t at = ts_node_start_byte(node);
+    return !lexical_binding_owner_at(state, js_scope_at(state, at), name, at, &first, &end);
+}
+
+/* CommonJS exports are module bindings too. A local object called `exports`
+ * or `module` does not establish that boundary. Inspect syntax once per file. */
+static bool js_commonjs_module(CBMExtractCtx *ctx, const WalkState *state) {
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    uint64_t steps = 0;
+    bool module = false;
+    for (;;) {
+        if (ctx->walk_budget_nodes && ++steps > ctx->walk_budget_nodes) {
+            module = true; /* no visibility proof from an incomplete scan */
+            break;
+        }
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (ts_node_is_named(node) && strcmp(ts_node_type(node), "assignment_expression") == 0) {
+            TSNode left = ts_node_child_by_field_name(node, TS_FIELD("left"));
+            while (!ts_node_is_null(left) &&
+                   (strcmp(ts_node_type(left), "member_expression") == 0 ||
+                    strcmp(ts_node_type(left), "subscript_expression") == 0)) {
+                TSNode object = ts_node_child_by_field_name(left, TS_FIELD("object"));
+                TSNode property = ts_node_child_by_field_name(left, TS_FIELD("property"));
+                if (ts_node_is_null(property)) property = ts_node_child_by_field_name(left, TS_FIELD("index"));
+                bool exports = !ts_node_is_null(property) && text_equals(ctx, property, "exports");
+                if (!exports && !ts_node_is_null(property) && strcmp(ts_node_type(property), "string") == 0) {
+                    uint32_t start = ts_node_start_byte(property), end = ts_node_end_byte(property);
+                    exports = end == start + 9 && memcmp(ctx->source + start + 1, "exports", 7) == 0;
+                }
+                if (js_unbound_object(ctx, state, object, "exports") ||
+                    (exports && js_unbound_object(ctx, state, object, "module"))) {
+                    module = true;
+                    break;
+                }
+                left = object;
+            }
+        }
+        if (module) break;
+        if (ts_tree_cursor_goto_first_child(&cursor)) continue;
+        bool more = false;
+        for (;;) {
+            if (ts_tree_cursor_goto_next_sibling(&cursor)) { more = true; break; }
+            if (!ts_tree_cursor_goto_parent(&cursor)) break;
+        }
+        if (!more) break;
+    }
+    ts_tree_cursor_delete(&cursor);
+    return module;
+}
+
+/* Global visibility is a source fact, retained for incremental registry
+ * seeding. Bindings are complete here, so a local `window` or `globalThis`
+ * cannot be mistaken for the global object. */
+static void js_mark_globals(CBMExtractCtx *ctx, const WalkState *state) {
+    bool module = cbm_js_program_is_module(ctx->root) || js_commonjs_module(ctx, state);
+    size_t path_len = ctx->rel_path ? strlen(ctx->rel_path) : 0;
+    bool dts = path_len >= 5 && strcmp(ctx->rel_path + path_len - 5, ".d.ts") == 0;
+    if (module && !cbm_memmem(ctx->source, (size_t)ctx->source_len, "globalThis", 10) &&
+        !cbm_memmem(ctx->source, (size_t)ctx->source_len, "window", 6) && !dts)
+        return;
+    const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
+    for (int i = 0; i < ctx->result->defs.count; i++) {
+        CBMDefinition *def = &ctx->result->defs.items[i];
+        if (!def->name || !def->label ||
+            (strcmp(def->label, "Function") != 0 && strcmp(def->label, "Class") != 0))
+            continue;
+        TSNode node = ts_node_descendant_for_byte_range(ctx->root, def->node_start_byte,
+                                                       def->node_start_byte + 1);
+        while (!ts_node_is_null(node) &&
+               (!ts_node_is_named(node) ||
+                (!cbm_js_bodied_kind(ts_node_type(node)) &&
+                 strcmp(ts_node_type(node), "function_signature") != 0 &&
+                 !(spec->class_node_types && cbm_kind_in_set(node, spec->class_node_types)))))
+            node = ts_node_parent(node);
+        if (ts_node_is_null(node)) continue;
+        const char *kind = ts_node_type(node);
+        const char *global = NULL;
+        const char *decl_name = NULL;
+        bool declaration = strcmp(kind, "function_declaration") == 0 ||
+                           strcmp(kind, "generator_function_declaration") == 0 ||
+                           strcmp(kind, "function_signature") == 0 ||
+                           strcmp(kind, "class_declaration") == 0 ||
+                           strcmp(kind, "abstract_class_declaration") == 0;
+        if (declaration) decl_name = def->name;
+        TSNode parent = ts_node_parent(node);
+        if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "variable_declarator") == 0) {
+            TSNode name = ts_node_child_by_field_name(parent, TS_FIELD("name"));
+            if (!ts_node_is_null(name) && strcmp(ts_node_type(name), "identifier") == 0)
+                decl_name = cbm_node_text(ctx->arena, name, ctx->source);
+        }
+        if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "assignment_expression") == 0) {
+            TSNode left = ts_node_child_by_field_name(parent, TS_FIELD("left"));
+            if (!ts_node_is_null(left) && strcmp(ts_node_type(left), "member_expression") == 0) {
+                TSNode object = ts_node_child_by_field_name(left, TS_FIELD("object"));
+                TSNode property = ts_node_child_by_field_name(left, TS_FIELD("property"));
+                const char *root = cbm_node_text(ctx->arena, object, ctx->source);
+                uint32_t position = ts_node_start_byte(left);
+                uint32_t scope_id = js_scope_at(state, position);
+                int first = 0, end = 0;
+                if (root && (strcmp(root, "globalThis") == 0 || strcmp(root, "window") == 0) &&
+                    !lexical_binding_owner_at(state, scope_id, root, position, &first, &end) &&
+                    !ts_node_is_null(property) && strcmp(ts_node_type(property), "property_identifier") == 0)
+                    global = cbm_node_text(ctx->arena, property, ctx->source);
+            }
+        }
+        bool top = true, ambient_global = false;
+        for (TSNode at = parent; !global && !ts_node_is_null(at); at = ts_node_parent(at)) {
+            const char *ancestor = ts_node_type(at);
+            if (strcmp(ancestor, "program") == 0) break;
+            TSNode ambient = at;
+            if (strcmp(ancestor, "statement_block") == 0) ambient = ts_node_parent(at);
+            if (dts && !ts_node_is_null(ambient) && strcmp(ts_node_type(ambient), "internal_module") == 0) {
+                TSNode name = ts_node_child_by_field_name(ambient, TS_FIELD("name"));
+                if (!ts_node_is_null(name) && text_equals(ctx, name, "global")) {
+                    ambient_global = true;
+                    break;
+                }
+            }
+            if (cbm_js_bodied_kind(ancestor) || strcmp(ancestor, "statement_block") == 0 ||
+                strcmp(ancestor, "class_body") == 0 || strcmp(ancestor, "export_statement") == 0 ||
+                strcmp(ancestor, "internal_module") == 0) {
+                top = false;
+                break;
+            }
+        }
+        if (!global && decl_name && top && (!module || ambient_global)) global = decl_name;
+        if (!global) continue;
+        int n = 0;
+        while (def->extra_props && def->extra_props[n]) n++;
+        const char **props = cbm_arena_alloc(ctx->arena, (size_t)(n + 3) * sizeof(char *));
+        if (!props) continue;
+        for (int j = 0; j < n; j++) props[j] = def->extra_props[j];
+        props[n] = CBM_PROP_JS_GLOBAL_NAME;
+        props[n + 1] = global;
+        props[n + 2] = NULL;
+        def->extra_props = props;
+    }
 }
 
 /* The JS/TS call classifier, run once every binding of the file is known.
@@ -2953,6 +3097,7 @@ static void classify_js_calls(CBMExtractCtx *ctx, WalkState *state) {
         return;
     }
     int module_file = -1; /* unknown until a call needs it */
+    js_mark_globals(ctx, state);
     for (int i = state->call_start_index; i < ctx->result->calls.count; i++) {
         CBMCall *call = &ctx->result->calls.items[i];
         if (call->lexical_scope_id == 0) {

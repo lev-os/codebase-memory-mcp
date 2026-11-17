@@ -297,6 +297,7 @@ static void cr_walk_call(cr_ctx_t *c, CBMCall *call) {
     cr_str(c, &call->js_import_root);
     cr_str(c, &call->js_import_module);
     cr_str(c, &call->js_import_member);
+    cr_str(c, &call->js_receiver_ctor);
     int argc = call->arg_count;
     if (argc > CBM_MAX_CALL_ARGS) {
         argc = CBM_MAX_CALL_ARGS;

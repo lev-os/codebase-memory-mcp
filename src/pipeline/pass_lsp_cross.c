@@ -2854,6 +2854,7 @@ static void pxc_append_synthetic_calls(CBMArena *dst_arena, CBMCallArray *dst_ca
         dst.js_import_root = src->js_import_root ? cbm_arena_strdup(dst_arena, src->js_import_root) : NULL;
         dst.js_import_module = src->js_import_module ? cbm_arena_strdup(dst_arena, src->js_import_module) : NULL;
         dst.js_import_member = src->js_import_member ? cbm_arena_strdup(dst_arena, src->js_import_member) : NULL;
+        dst.js_receiver_ctor = src->js_receiver_ctor ? cbm_arena_strdup(dst_arena, src->js_receiver_ctor) : NULL;
         dst.args = NULL;
         if (src->args && src->arg_count > 0) {
             dst.args = cbm_arena_calloc(dst_arena, (size_t)src->arg_count * sizeof(CBMCallArg));
