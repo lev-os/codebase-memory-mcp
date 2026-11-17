@@ -36604,6 +36604,82 @@ static char *js_twin_listing(const char *db_path, const char *project) {
     return buf;
 }
 
+
+
+
+/* Exact recursion survives both writers and an incremental repair. Unknown
+ * receivers and a shadowing local binding must never become self calls. */
+TEST(pipeline_js_exact_recursion) {
+    static const char source[] =
+        "export function walk(n) { if (n) { walk(n - 1); walk(n - 2); } }\n"
+        "export class Walker { walk(n) { if (n) this.walk(n - 1); } }\n"
+        "export const repeat = n => n ? repeat(n - 1) : 0;\n"
+        "export function shadow() { function shadow() {} shadow(); }\n"
+        "export function unknown(other) { other.unknown(); }\n"
+        "import { imported as again } from './main';\n"
+        "export function imported(n) { if (n) again(n - 1); }\n";
+    static const char *const expected[] = {
+        "main.walk -> main.walk", "main.Walker.walk -> main.Walker.walk",
+        "main.repeat -> main.repeat", "main.shadow -> main.shadow.shadow", "", "",
+        "main.imported -> main.imported"};
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        char tmp[256] = "/tmp/cbm_js_recursion_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        XlangEnvSave saved = xlang_env_select(mode != 0);
+        write_temp_file(tmp, "main.js", source);
+        write_temp_file(tmp, "typed.ts",
+            "export class Typed { walk(other: Typed) { other.walk(other); } }\n");
+        for (int i = 0; i < (mode ? 51 : 4); i++) {
+            char pad[32];
+            snprintf(pad, sizeof(pad), "pad%d.js", i);
+            write_temp_file(tmp, pad, "export const pad = 0;\n");
+        }
+        char db[512], full_db[512], path[512], project[256];
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        snprintf(full_db, sizeof(full_db), "%s/fresh.db", tmp);
+        snprintf(path, sizeof(path), "%s/main.js", tmp);
+        for (int phase = 0; phase < 2; phase++) {
+            if (phase) {
+                char edited[1024];
+                snprintf(edited, sizeof(edited), "%s// changed body\n", source);
+                write_temp_file(tmp, "main.js", edited);
+                ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000, 0), 0);
+                cbm_pipeline_incremental_test_reset_faults();
+            }
+            cbm_pipeline_t *p = js_twin_index(tmp, db);
+            ASSERT_NOT_NULL(p);
+            snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+            for (int i = 0; i < 7; i++) {
+                char got[1024], what[80];
+                snprintf(what, sizeof(what), "recursion mode=%d phase=%d line=%d", mode, phase, i + 1);
+                js_twin_calls_at(db, project, "main.js", i + 1, got, sizeof(got));
+                ok = js_twin_expect(what, got, expected[i]) && ok;
+            }
+            char typed[1024];
+            js_twin_calls_at(db, project, "typed.ts", 1, typed, sizeof(typed));
+            ok = js_twin_expect("typed receiver recursion", typed,
+                                "typed.Typed.walk -> typed.Typed.walk") && ok;
+            cbm_pipeline_free(p);
+            if (phase) {
+                ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+            }
+        }
+        cbm_pipeline_t *full = js_twin_index(tmp, full_db);
+        ASSERT_NOT_NULL(full);
+        cbm_pipeline_free(full);
+        char *incremental = js_twin_listing(db, project);
+        char *fresh = js_twin_listing(full_db, project);
+        ok = incremental && fresh && strcmp(incremental, fresh) == 0 && ok;
+        free(incremental);
+        free(fresh);
+        xlang_env_restore(&saved);
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 /* A same-name callable inserted earlier in a file, indexed incrementally,
  * gives the graph a fresh full index gives; the export keeps its name, so
  * the unchanged importer's call still reaches it. */
@@ -37693,6 +37769,7 @@ TEST(pipeline_js_twin_callables_scale) {
 }
 
 SUITE(pipeline) {
+    RUN_TEST(pipeline_js_exact_recursion);
     RUN_TEST(pipeline_js_module_binding_keeps_plain_name);
     RUN_TEST(pipeline_js_local_callee_is_nearest_binding);
     RUN_TEST(pipeline_js_param_default_skips_body_var);

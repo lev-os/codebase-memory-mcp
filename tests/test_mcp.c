@@ -8424,6 +8424,70 @@ TEST(tool_index_status_freshness_sample_cap_truncates) {
 
 /* #2816: stored recursion must remain visible even when the CALLS graph has
  * no self-edges. Removing metadata emission must fail these assertions. */
+/* A persisted recursive edge is one relationship, even when inserted twice.
+ * Traversal must finish and list its root at most once in either direction.
+ * Architecture cycles remain circular dependencies between distinct nodes. */
+TEST(tool_trace_path_stored_self_edge_is_bounded) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    cbm_mcp_server_set_project(srv, "self-edge");
+    ASSERT_EQ(cbm_store_upsert_project(st, "self-edge", "/tmp/self-edge"), CBM_STORE_OK);
+    cbm_node_t node = {.project = "self-edge", .label = "Function", .name = "walk",
+        .qualified_name = "self-edge.walk", .file_path = "walk.js",
+        .properties_json = "{\"self_recursive\":true,\"recursive\":true}"};
+    int64_t id = cbm_store_upsert_node(st, &node);
+    ASSERT_GT(id, 0);
+    cbm_edge_t edge = {.project = "self-edge", .source_id = id, .target_id = id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &edge), 0);
+    ASSERT_GT(cbm_store_insert_edge(st, &edge), 0);
+    ASSERT_EQ(cbm_store_count_edges_by_type(st, "self-edge", "CALLS"), 1);
+    for (int inbound = 0; inbound < 2; inbound++) {
+        char args[256];
+        snprintf(args, sizeof(args),
+            "{\"project\":\"self-edge\",\"function_name\":\"walk\",\"direction\":\"%s\","
+            "\"depth\":20,\"format\":\"json\"}", inbound ? "inbound" : "outbound");
+        char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+        char *inner = extract_text_content(response);
+        ASSERT_NOT_NULL(inner);
+        yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        yyjson_val *total = yyjson_obj_get(root, inbound ? "callers_total" : "callees_total");
+        ASSERT_TRUE(yyjson_is_int(total));
+        ASSERT_TRUE(yyjson_get_int(total) >= 0 && yyjson_get_int(total) <= 1);
+        ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "self_recursive")));
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "self_call_policy")),
+                      "exact_bindings_only");
+        yyjson_doc_free(doc);
+        free(inner);
+        free(response);
+    }
+    char *response = cbm_mcp_handle_tool(srv, "get_architecture",
+        "{\"project\":\"self-edge\",\"aspects\":[\"cycles\"],\"format\":\"json\"}");
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *cycles = yyjson_obj_get(yyjson_doc_get_root(doc), "cycles");
+    ASSERT_TRUE(yyjson_is_arr(cycles));
+    ASSERT_EQ(yyjson_arr_size(cycles), 0);
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    response = cbm_mcp_handle_tool(srv, "query_graph",
+        "{\"project\":\"self-edge\",\"query\":\"MATCH (f:Function) WHERE NOT EXISTS "
+        "{ (f)<-[:CALLS]-() } RETURN f.name\",\"format\":\"json\"}");
+    inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(response, "\"isError\":true"));
+    ASSERT_NULL(strstr(inner, "walk"));
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_trace_path_recursion_metadata_issue2816) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -8475,8 +8539,8 @@ TEST(tool_trace_path_recursion_metadata_issue2816) {
                 snprintf(expected, sizeof(expected), json ? "\"recursive\":%s" : "recursive: %s\n",
                          cases[i].recursive);
                 ASSERT_NOT_NULL(strstr(inner, expected));
-                ASSERT_NOT_NULL(strstr(inner, json ? "\"self_call_policy\":\"omitted\""
-                                                   : "self_call_policy: omitted\n"));
+                ASSERT_NOT_NULL(strstr(inner, json ? "\"self_call_policy\":\"exact_bindings_only\""
+                                                   : "self_call_policy: exact_bindings_only\n"));
                 snprintf(expected, sizeof(expected), json ? "\"%s_total\":0" : "%s_total: 0\n",
                          inbound ? "callers" : "callees");
                 ASSERT_NOT_NULL(strstr(inner, expected));
@@ -8607,8 +8671,8 @@ TEST(tool_trace_path_recursion_survives_budget_floor_issue2816) {
         ASSERT_NULL(strstr(inner, huge));
         ASSERT_NOT_NULL(strstr(inner, json ? "\"self_recursive\":true" : "self_recursive: true\n"));
         ASSERT_NOT_NULL(strstr(inner, json ? "\"recursive\":true" : "recursive: true\n"));
-        ASSERT_NOT_NULL(strstr(inner, json ? "\"self_call_policy\":\"omitted\""
-                                           : "self_call_policy: omitted\n"));
+        ASSERT_NOT_NULL(strstr(inner, json ? "\"self_call_policy\":\"exact_bindings_only\""
+                                           : "self_call_policy: exact_bindings_only\n"));
         free(inner);
         free(response);
     }
@@ -9768,7 +9832,7 @@ TEST(tool_trace_cursor_survives_output_budget_increase) {
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "\"self_recursive\":true"));
     ASSERT_NOT_NULL(strstr(inner, "\"recursive\":true"));
-    ASSERT_NOT_NULL(strstr(inner, "\"self_call_policy\":\"omitted\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"self_call_policy\":\"exact_bindings_only\""));
     ASSERT_NOT_NULL(strstr(inner, "short_row"));
     yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
     ASSERT_NOT_NULL(doc);
@@ -9791,7 +9855,7 @@ TEST(tool_trace_cursor_survives_output_budget_increase) {
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "\"self_recursive\":true"));
     ASSERT_NOT_NULL(strstr(inner, "\"recursive\":true"));
-    ASSERT_NOT_NULL(strstr(inner, "\"self_call_policy\":\"omitted\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"self_call_policy\":\"exact_bindings_only\""));
     ASSERT_NULL(strstr(inner, "cursor_params_mismatch"));
     ASSERT_NULL(strstr(inner, long_qn));
     doc = yyjson_read(inner, strlen(inner), 0);
@@ -9813,7 +9877,7 @@ TEST(tool_trace_cursor_survives_output_budget_increase) {
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "\"self_recursive\":true"));
     ASSERT_NOT_NULL(strstr(inner, "\"recursive\":true"));
-    ASSERT_NOT_NULL(strstr(inner, "\"self_call_policy\":\"omitted\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"self_call_policy\":\"exact_bindings_only\""));
     ASSERT_NULL(strstr(inner, "cursor_params_mismatch"));
     ASSERT_NULL(strstr(inner, "short_row"));
     doc = yyjson_read(inner, strlen(inner), 0);
@@ -28765,6 +28829,7 @@ SUITE(mcp) {
     RUN_TEST(tool_index_status_freshness_sample_cap_truncates);
 
     /* Tool handlers with validation */
+    RUN_TEST(tool_trace_path_stored_self_edge_is_bounded);
     RUN_TEST(tool_trace_path_recursion_metadata_issue2816);
     RUN_TEST(tool_trace_path_recursion_union_and_edges_issue2816);
     RUN_TEST(tool_trace_path_recursion_survives_budget_floor_issue2816);

@@ -10877,7 +10877,7 @@ static void trace_recursion_tree(cbm_sb_t *sb, const trace_recursion_t *metadata
         }
     }
     if (includes_calls) {
-        cbm_tree_scalar_str(sb, "self_call_policy", "omitted");
+        cbm_tree_scalar_str(sb, "self_call_policy", "exact_bindings_only");
     }
 }
 
@@ -10892,7 +10892,7 @@ static void trace_recursion_json(yyjson_mut_doc *doc, yyjson_mut_val *root,
         }
     }
     if (includes_calls) {
-        yyjson_mut_obj_add_str(doc, root, "self_call_policy", "omitted");
+        yyjson_mut_obj_add_str(doc, root, "self_call_policy", "exact_bindings_only");
     }
 }
 

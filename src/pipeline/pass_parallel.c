@@ -2912,6 +2912,11 @@ static bool emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                               const cbm_gbuf_t *main_gbuf, const char **imp_keys,
                               const char **imp_vals, int imp_count, bool suppress_plain_calls,
                               const char *route_mount, CBMLanguage lang) {
+    /* Match emit_classified_edge: exact recursion bypasses classifiers. */
+    if (target && source->id == target->id) {
+        return !suppress_plain_calls && cbm_pipeline_exact_self_call(res) &&
+               emit_normal_calls_edge(gbuf, source, target, call, res);
+    }
     cbm_svc_kind_t svc = cbm_service_pattern_match_in_project(
         res->qualified_name, target ? target->name : NULL,
         target && res->qualified_name && strcmp(target->qualified_name, res->qualified_name) == 0
@@ -3846,7 +3851,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
              * never a package init or a method found by name alone. */
             continue;
         }
-        if (!target_node || source_node->id == target_node->id) {
+        if (!target_node || (source_node->id == target_node->id &&
+                             !cbm_pipeline_exact_self_call(&res))) {
             /* HTTP/ASYNC calls to an EXTERNAL client library (`requests.get(url)`)
              * resolve to an unindexed QN (target_node == NULL), but their edge
              * target is a synthesized route node, not the library — emit them
@@ -3875,6 +3881,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         const cbm_gbuf_node_t *ovl[CBM_OVERLOAD_TARGETS_MAX];
         int novl = cbm_pipeline_overload_targets(rc->main_gbuf, target_node, call, lang, ovl,
                                                  CBM_OVERLOAD_TARGETS_MAX);
+        if (novl > 1 && target_node->id == source_node->id) {
+            continue; /* no exact member of this recursive overload group */
+        }
         if (novl > 1) {
             res.strategy = CBM_OVERLOAD_AMBIGUOUS_STRATEGY;
             if (res.confidence > CBM_OVERLOAD_AMBIGUOUS_CONFIDENCE) {
@@ -3890,7 +3899,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
         if (novl > 0) {
             target_node = ovl[0];
-            if (target_node->id == source_node->id) {
+            if (target_node->id == source_node->id && !cbm_pipeline_exact_self_call(&res)) {
                 continue;
             }
         }
