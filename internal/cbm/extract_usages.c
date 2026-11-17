@@ -18,7 +18,18 @@ enum { LAST_IDX = 1 };
 #include <stdatomic.h>
 
 static _Atomic uint64_t g_usage_field_lookup_work = 0;
+static _Atomic uint64_t g_js_classifier_work = 0;
 static _Atomic uint64_t g_usage_slow_parent_fallbacks = 0;
+
+void cbm_js_classifier_test_reset(void) {
+    atomic_store_explicit(&g_js_classifier_work, 0, memory_order_relaxed);
+}
+uint64_t cbm_js_classifier_test_work(void) {
+    return atomic_load_explicit(&g_js_classifier_work, memory_order_relaxed);
+}
+static void js_classifier_note_work(void) {
+    atomic_fetch_add_explicit(&g_js_classifier_work, 1, memory_order_relaxed);
+}
 
 void cbm_usage_field_lookup_test_reset(void) {
     atomic_store_explicit(&g_usage_field_lookup_work, 0, memory_order_relaxed);
@@ -41,6 +52,7 @@ static void usage_slow_parent_fallback_test_note(void) {
     atomic_fetch_add_explicit(&g_usage_slow_parent_fallbacks, 1, memory_order_relaxed);
 }
 #else
+static void js_classifier_note_work(void) {}
 static void usage_field_lookup_test_note_work(void) {}
 static void usage_slow_parent_fallback_test_note(void) {}
 #endif
@@ -2367,6 +2379,7 @@ static void js_classify_binding(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
     binding->value_kind = CBM_BINDING_VALUE;
     binding->ctor_name = NULL;
     binding->ctor_start = 0;
+    binding->ctor_runtime = 0;
     if (!js_call_classifier_lang(ctx->language)) {
         return;
     }
@@ -2858,24 +2871,46 @@ static const char *js_member_call_root(const char *callee, char *buf, size_t cap
     return js_plain_call_name(buf) && js_plain_call_name(dot + 1) ? buf : NULL;
 }
 
-/* Is `binding`'s `new Name(...)` a constructor of the runtime? Nothing of the
- * file binds or defines Name there, and the file is a module, so no project
- * class is visible by that name. */
-static bool js_new_of_global(CBMExtractCtx *ctx, const WalkState *state,
-                             const CBMLexicalBinding *binding, int *module_file) {
+static int js_definition_name_cmp(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* Sorted once per file; every binding caches the constructor classification. */
+static bool js_definition_name_known(CBMExtractCtx *ctx, WalkState *state, const char *name) {
+    if (!state->js_definition_names_built) {
+        int count = ctx->result->defs.count;
+        state->js_definition_names = cbm_arena_alloc(ctx->arena, (size_t)count * sizeof(char *));
+        state->js_definition_names_built = true;
+        if (!state->js_definition_names) return true;
+        for (int i = 0; i < count; i++) {
+            js_classifier_note_work();
+            const char *key = ctx->result->defs.items[i].name;
+            if (key) state->js_definition_names[state->js_definition_name_count++] = key;
+        }
+        qsort(state->js_definition_names, (size_t)state->js_definition_name_count,
+              sizeof(char *), js_definition_name_cmp);
+    }
+    return !state->js_definition_names ||
+           bsearch(&name, state->js_definition_names, (size_t)state->js_definition_name_count,
+                   sizeof(char *), js_definition_name_cmp) != NULL;
+}
+
+/* An unbound constructor can denote the runtime or a project global.
+ * Its receiver requires a semantic target; the global registry can supply
+ * one, while an arbitrary method-name match cannot. */
+static bool js_new_of_global(CBMExtractCtx *ctx, WalkState *state,
+                             CBMLexicalBinding *binding) {
+    if (binding->ctor_runtime) return binding->ctor_runtime == 2;
+    binding->ctor_runtime = 1;
+    js_classifier_note_work();
     int first = 0;
     int end = 0;
     if (lexical_binding_owner_at(state, binding->scope_id, binding->ctor_name, binding->ctor_start,
                                  &first, &end)) {
         return false;
     }
-    for (int i = 0; i < ctx->result->defs.count; i++) {
-        const char *name = ctx->result->defs.items[i].name;
-        if (name && strcmp(name, binding->ctor_name) == 0) {
-            return false;
-        }
-    }
-    (void)module_file;
+    if (js_definition_name_known(ctx, state, binding->ctor_name)) return false;
+    binding->ctor_runtime = 2;
     return true;
 }
 
@@ -2885,8 +2920,8 @@ static bool js_new_of_global(CBMExtractCtx *ctx, const WalkState *state,
  * runtime, never a project method of the same name, so only a type-aware
  * answer may give it an edge (receiver_requires_lsp). Any binding there of
  * another kind keeps the call as it was. */
-static bool js_receiver_is_runtime_object(CBMExtractCtx *ctx, const WalkState *state,
-                                          CBMCall *call, int *module_file) {
+static bool js_receiver_is_runtime_object(CBMExtractCtx *ctx, WalkState *state,
+                                          CBMCall *call) {
     char buf[CBM_SZ_128];
     const char *root = js_member_call_root(call->callee_name, buf, sizeof(buf));
     int first = 0;
@@ -2899,13 +2934,13 @@ static bool js_receiver_is_runtime_object(CBMExtractCtx *ctx, const WalkState *s
         return false;
     }
     for (int i = first; i < end; i++) {
-        const CBMLexicalBinding *binding = &state->lexical_bindings[i];
+        CBMLexicalBinding *binding = &state->lexical_bindings[i];
         if (!lexical_binding_live(binding, owner, call->site_start_byte) ||
             binding->value_kind == CBM_BINDING_ARRAY_LITERAL) {
             continue;
         }
         if (binding->value_kind != CBM_BINDING_NEW_INSTANCE ||
-            !js_new_of_global(ctx, state, binding, module_file)) {
+            !js_new_of_global(ctx, state, binding)) {
             return false;
         }
         if (end == first + 1) call->js_receiver_ctor = binding->ctor_name;
@@ -2928,17 +2963,8 @@ static bool js_bare_callee_is_local_value(const WalkState *state, const CBMCall 
                                       CBM_BINDING_CALLABLE);
 }
 
-/* A bare name that nothing binds is a global (`fetch`, `new
- * Response()`). In a module no definition of another file is visible by a
- * bare name: only one of this file can be the callee (callee_is_unbound). A
- * script's calls are left alone. */
-static bool js_bare_callee_is_unbound(CBMExtractCtx *ctx, const CBMLexicalScope *owner,
-                                      int *module_file) {
-    (void)ctx;
-    (void)module_file;
-    return !owner;
-}
-
+/* A name with no lexical binding can reach this file or a source-proven
+ * project global. Module exports in unrelated files are never visible. */
 static uint32_t js_scope_at(const WalkState *state, uint32_t position) {
     uint32_t id = state->root_lexical_scope_id;
     uint32_t width = UINT32_MAX;
@@ -3104,7 +3130,6 @@ static void classify_js_calls(CBMExtractCtx *ctx, WalkState *state) {
     if (!js_call_classifier_lang(ctx->language) || state->lexical_binding_tracking_failed) {
         return;
     }
-    int module_file = -1; /* unknown until a call needs it */
     js_mark_globals(ctx, state);
     for (int i = state->call_start_index; i < ctx->result->calls.count; i++) {
         CBMCall *call = &ctx->result->calls.items[i];
@@ -3113,7 +3138,7 @@ static void classify_js_calls(CBMExtractCtx *ctx, WalkState *state) {
         }
         if (call->is_method) {
             if (!call->receiver_requires_lsp &&
-                js_receiver_is_runtime_object(ctx, state, call, &module_file)) {
+                js_receiver_is_runtime_object(ctx, state, call)) {
                 call->receiver_requires_lsp = true;
             }
             continue;
@@ -3136,7 +3161,7 @@ static void classify_js_calls(CBMExtractCtx *ctx, WalkState *state) {
             call->callee_is_locally_bound = true; /* exact import target or no edge */
         } else if (js_bare_callee_is_local_value(state, call, owner, first, end)) {
             call->callee_is_locally_bound = true;
-        } else if (js_bare_callee_is_unbound(ctx, owner, &module_file)) {
+        } else if (!owner) {
             call->callee_is_unbound = true;
         }
     }

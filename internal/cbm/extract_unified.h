@@ -128,6 +128,7 @@ typedef struct {
     uint8_t value_kind;    /* CBMBindingValueKind; JS/TS only, else VALUE */
     const char *ctor_name; /* CBM_BINDING_NEW_INSTANCE: the constructor's name */
     uint32_t ctor_start;   /* and where it is written */
+    uint8_t ctor_runtime; /* 0 unchecked, 1 project/unknown, 2 runtime */
 } CBMLexicalBinding;
 
 /* What a JS/TS binding holds, for the call classifier at the end of the walk:
@@ -245,6 +246,9 @@ typedef struct {
 
     /* JS/TS writes are resolved after every declaration is known. */
     CBMUsageArray js_writes;
+    const char **js_definition_names;
+    int js_definition_name_count;
+    bool js_definition_names_built;
 
     CBMLanguage language;
 

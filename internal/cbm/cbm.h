@@ -1458,6 +1458,8 @@ uint64_t cbm_kotlin_operator_dedup_test_comparisons(void);
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
 // Test-build-only work counter for resolving a node's field role while
 // classifying value references. Production builds retain no instrumentation.
+void cbm_js_classifier_test_reset(void);
+uint64_t cbm_js_classifier_test_work(void);
 void cbm_usage_field_lookup_test_reset(void);
 uint64_t cbm_usage_field_lookup_test_work(void);
 uint64_t cbm_usage_slow_parent_fallback_test_count(void);

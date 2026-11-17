@@ -15942,6 +15942,35 @@ static int check_x11b_script_visibility(bool parallel) {
 TEST(pipeline_x11b_script_visibility) { return check_x11b_script_visibility(false); }
 TEST(pipeline_x11b_script_visibility_parallel) { return check_x11b_script_visibility(true); }
 
+#if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
+static int check_x11b_classifier_work(bool parallel) {
+    char source[32768];
+    int n = 0;
+    for (int i = 0; i < 128; i++) {
+        n += snprintf(source + n, sizeof(source) - (size_t)n,
+                      "export function padding%d() { return %d; }\n", i, i);
+    }
+    n += snprintf(source + n, sizeof(source) - (size_t)n, "export function use() {\n");
+    for (int i = 0; i < 64; i++) {
+        n += snprintf(source + n, sizeof(source) - (size_t)n,
+                      "const cache%d = new Map(); cache%d.get(0); cache%d.get(1);\n", i, i, i);
+    }
+    snprintf(source + n, sizeof(source) - (size_t)n, "}\n");
+    const ng_file_t files[] = {{"src/work.js", source}};
+    const ng_pair_t pairs[] = {{"work.use", "*", 0, "runtime object has no project target"}};
+    cbm_js_classifier_test_reset();
+    int rc = ng_check(files, 1, pairs, 1, parallel);
+    uint64_t work = cbm_js_classifier_test_work();
+    printf("  classifier work=%llu, bound=196\n", (unsigned long long)work);
+    ASSERT_EQ(rc, 0);
+    ASSERT_GT(work, 0);
+    ASSERT_LTE(work, 196);
+    PASS();
+}
+TEST(pipeline_x11b_classifier_work) { return check_x11b_classifier_work(false); }
+TEST(pipeline_x11b_classifier_work_parallel) { return check_x11b_classifier_work(true); }
+#endif
+
 /* A member call on a receiver the TS resolver typed as a built-in
  * (`const rows: number[] = []; rows.push(1)`, a `Map`, an array parameter)
  * names the built-in's method. Before, the resolver's Array.push had no graph
@@ -38292,6 +38321,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_x11b_script_visibility);
     RUN_TEST(pipeline_x11b_script_visibility_parallel);
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
+    RUN_TEST(pipeline_x11b_classifier_work);
+    RUN_TEST(pipeline_x11b_classifier_work_parallel);
 #endif
     RUN_TEST(pipeline_x11b_reassigned);
     RUN_TEST(pipeline_x11b_reassigned_parallel);
