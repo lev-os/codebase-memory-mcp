@@ -5856,7 +5856,53 @@ TEST(tslsp_captured_receiver_requires_all_writes_to_agree) {
     PASS();
 }
 
+static bool x9c_factory_fact(const char *source, bool want) {
+    CBMFileResult *r = extract_ts(source);
+    if (!r) return false;
+    bool found = false, ok = true;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->name && strcmp(d->name, "make") == 0 && !d->parent_class) {
+            found = true;
+            if (d->ts_return_constructor != want) {
+                fprintf(stderr, "factory fact: got %s, want %s\n", d->return_type ? d->return_type : "unknown", want ? "Port" : "unknown");
+                ok = false;
+            }
+        }
+    }
+    cbm_free_result(r);
+    return found && ok;
+}
+
+TEST(tslsp_x9c_constructor_binding_forms) {
+    const char *forms[] = {
+        "export const make = Port => new Port();",
+        "export function make() { for (const Port of list) return new Port(); }",
+        "export function make() { for (const Port in list) return new Port(); }",
+        "export function make() { for (let Port = input;;) return new Port(); }",
+        "export function make() { try { throw 0; } catch (Port) { return new Port(); } }",
+        "export const make = ({ Port }) => new Port();",
+        "export const make = ([Port]) => new Port();",
+        "export function make() { function Port() {} return new Port(); }",
+        "export function make() { const p = function Port() {}; return new Port(); }",
+        "export function make() { const p = class Port {}; return new Port(); }",
+        "export function make() { class Port {} return new Port(); }",
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); i++) {
+        char source[1024];
+        snprintf(source, sizeof(source), "export class Port { send() {} }\n%s\n", forms[i]);
+        bool pass = x9c_factory_fact(source, false);
+        if (!pass) fprintf(stderr, "binding form %zu failed\n", i);
+        ok = pass && ok;
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(ts_lsp) {
+    RUN_TEST(tslsp_x9c_constructor_binding_forms);
+
     RUN_TEST(tslsp_captured_receiver_requires_all_writes_to_agree);
     RUN_TEST(tslsp_factory_return_scope_and_unknowns);
     RUN_TEST(tslsp_return_utilities_preserve_receiver_identity);

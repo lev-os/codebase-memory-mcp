@@ -4,6 +4,7 @@
 #include "arena.h"   // CBMArena, cbm_arena_alloc/strdup/sprintf
 #include "doclink.h" // cbm_doclink_note_doc_line
 #include "helpers.h"
+#include "ts_proof.h"
 #include "lang_specs.h"
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
@@ -5958,20 +5959,7 @@ returns_done:
     cursor = ts_tree_cursor_new(fn);
     for (;;) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
-        const char *kind = ts_node_type(node);
-        TSNode binding = {0};
-        if (strcmp(kind, "variable_declarator") == 0 || strcmp(kind, "class_declaration") == 0 ||
-            strcmp(kind, "function_declaration") == 0)
-            binding = ts_node_child_by_field_name(node, TS_FIELD("name"));
-        else if (strcmp(kind, "required_parameter") == 0 || strcmp(kind, "optional_parameter") == 0)
-            binding = ts_node_child_by_field_name(node, TS_FIELD("pattern"));
-        else if (strcmp(kind, "assignment_expression") == 0 ||
-                 strcmp(kind, "augmented_assignment_expression") == 0)
-            binding = ts_node_child_by_field_name(node, TS_FIELD("left"));
-        else if (strcmp(kind, "formal_parameters") == 0)
-            binding = node; /* JS parameters can be bare identifiers. */
-        else if (strcmp(kind, "catch_clause") == 0)
-            binding = ts_node_child_by_field_name(node, TS_FIELD("parameter"));
+        TSNode binding = cbm_ts_return_binding(node);
         if (!ts_node_is_null(binding)) {
             uint32_t start = ts_node_start_byte(binding), end = ts_node_end_byte(binding);
             size_t len = strlen(constructor);

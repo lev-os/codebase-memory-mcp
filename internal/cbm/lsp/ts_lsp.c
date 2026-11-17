@@ -27,6 +27,7 @@
  */
 
 #include "ts_lsp.h"
+#include "ts_proof.h"
 #include "../../../src/foundation/platform.h"
 #include "../helpers.h"
 #include "../js_this.h"
@@ -6605,19 +6606,11 @@ static void ts_reserve_return_bindings(TSLSPContext *ctx, TSNode fn) {
     TSTreeCursor cursor = ts_tree_cursor_new(fn);
     for (;;) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
-        const char *kind = ts_node_type(node);
-        TSNode binding = {0};
-        if (strcmp(kind, "variable_declarator") == 0 || strcmp(kind, "class_declaration") == 0 ||
-            strcmp(kind, "function_declaration") == 0)
-            binding = ts_node_child_by_field_name(node, "name", 4);
-        else if (strcmp(kind, "required_parameter") == 0 || strcmp(kind, "optional_parameter") == 0)
-            binding = ts_node_child_by_field_name(node, "pattern", 7);
-        else if (strcmp(kind, "catch_clause") == 0)
-            binding = ts_node_child_by_field_name(node, "parameter", 9);
-        else if (strcmp(kind, "identifier") == 0 &&
-                 node_kind_is(ts_node_parent(node), "formal_parameters"))
-            binding = node;
-        bind_unknown_pattern(ctx, binding);
+        TSNode binding = cbm_ts_return_binding(node);
+        if (node_kind_is(binding, "type_identifier"))
+            cbm_scope_bind(ctx->current_scope, node_text(ctx, binding), cbm_type_unknown());
+        else
+            bind_unknown_pattern(ctx, binding);
         if (ts_tree_cursor_goto_first_child(&cursor))
             continue;
         while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
