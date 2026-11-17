@@ -3110,12 +3110,17 @@ TEST(tslsp_crossfile_renamed_import_missing_export_issue2297) {
     PASS();
 }
 
-/* `import { default as greet }` is a default import: it keeps resolving by its
- * local name, as `import greet from` does. */
+/* A default alias resolves the provider's recorded export, independently of
+ * the caller's local name. Missing export evidence cannot borrow a neighbor. */
 TEST(tslsp_crossfile_default_as_import_issue2297) {
-    const char *source = "import { default as greet } from './greetings';\n"
-                         "function go() { greet('hi'); }\n";
+    const char *source = "import { default as welcome } from './greetings';\n"
+                         "function go() { welcome('hi'); }\n";
     CBMLSPDef defs[] = {
+        {.qualified_name = "test.greetings",
+         .short_name = "greetings.ts",
+         .label = "Module",
+         .def_module_qn = "test.greetings",
+         .alias_target = "test.greetings.greet"},
         {.qualified_name = "test.main.go",
          .short_name = "go",
          .label = "Function",
@@ -3126,7 +3131,7 @@ TEST(tslsp_crossfile_default_as_import_issue2297) {
          .def_module_qn = "test.greetings",
          .return_types = "string"},
     };
-    const char *imp_names[] = {"greet"};
+    const char *imp_names[] = {"welcome"};
     const char *imp_qns[] = {"test.greetings"};
 
     CBMArena arena;
@@ -3134,10 +3139,17 @@ TEST(tslsp_crossfile_default_as_import_issue2297) {
     CBMResolvedCallArray out = {0};
 
     cbm_run_ts_lsp_cross(&arena, source, (int)strlen(source), "test.main", false, false, false,
-                         defs, 2, imp_names, imp_qns, 1, NULL, &out);
+                         defs, 3, imp_names, imp_qns, 1, NULL, &out);
 
     ASSERT_GTE(find_resolved_arr(&out, "go", "test.greetings.greet"), 0);
 
+    cbm_arena_destroy(&arena);
+
+    cbm_arena_init(&arena);
+    memset(&out, 0, sizeof(out));
+    cbm_run_ts_lsp_cross(&arena, source, (int)strlen(source), "test.main", false, false, false,
+                         defs + 1, 2, imp_names, imp_qns, 1, NULL, &out);
+    ASSERT_EQ(find_resolved_arr(&out, "go", "test.greetings.greet"), -1);
     cbm_arena_destroy(&arena);
     PASS();
 }
