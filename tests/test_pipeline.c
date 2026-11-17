@@ -36761,6 +36761,78 @@ TEST(pipeline_ts_incremental_code_edit_equals_fresh_full) {
     PASS();
 }
 
+TEST(pipeline_x11b_incremental_equals_full) {
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        char tmp[256] = "/tmp/cbm_x11b_incr_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        write_temp_file(tmp, "classic.js", "function appReady() { return 1; }\n");
+        write_temp_file(tmp, "lib.js", "export function run() { return 2; }\n");
+        write_temp_file(tmp, "keep.js", "export function keep() { return appReady(); }\n");
+        write_temp_file(tmp, "use.js", "export function use(cb) { return cb(); }\n");
+        for (int i = 0; mode && i < NG_PAD_FILES; i++) {
+            char name[64];
+            snprintf(name, sizeof(name), "pad%d.ts", i);
+            write_temp_file(tmp, name, "export {};\n");
+        }
+        XlangEnvSave saved = xlang_env_select(mode != 0);
+        char db[512], project[256];
+        snprintf(db, sizeof(db), "%s/graph.db", tmp);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(p);
+        ASSERT_EQ(cbm_pipeline_run(p), 0);
+        snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+        cbm_pipeline_free(p);
+        for (int phase = 0; phase < 3; phase++) {
+            const char *file = phase ? "classic.js" : "use.js";
+            if (phase == 0) {
+                write_temp_file(tmp, file,
+                                "import * as ops from './lib';\n"
+                                "class Sink { push(v) { return v; } }\n"
+                                "export function use() { const { run } = ops; let rows = []; rows = new Sink(); return run() + rows.push(1); }\n");
+            } else {
+                write_temp_file(tmp, file, phase == 1
+                    ? "export function appReady() { return 1; }\n"
+                    : "function appReady() { return 1; }\n");
+            }
+            char path[512], fresh[512];
+            snprintf(path, sizeof(path), "%s/%s", tmp, file);
+            snprintf(fresh, sizeof(fresh), "%s/fresh%d.db", tmp, phase);
+            ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000 + phase, 0), 0);
+            p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+            ASSERT_NOT_NULL(p);
+            ASSERT_EQ(cbm_pipeline_run(p), 0);
+            cbm_pipeline_free(p);
+            p = cbm_pipeline_new(tmp, fresh, CBM_MODE_FULL);
+            ASSERT_NOT_NULL(p);
+            ASSERT_EQ(cbm_pipeline_run(p), 0);
+            cbm_pipeline_free(p);
+            int ni = 0, nf = 0;
+            char *a = ts_calls_fingerprint(db, project, &ni);
+            char *b = ts_calls_fingerprint(fresh, project, &nf);
+            cbm_store_t *store = cbm_store_open_path(db);
+            int global_edges = phase == 1 ? 0 : 1;
+            bool targets = store && smr_calls(store, project, "use.use", "lib.run") == 1 &&
+                           smr_calls(store, project, "use.use", "use.Sink") == 1 &&
+                           smr_calls(store, project, "use.use", "use.Sink.push") == 1 &&
+                           smr_calls(store, project, "use.use", "*") == 3 &&
+                           smr_calls(store, project, "keep.keep", "classic.appReady") == global_edges &&
+                           smr_calls(store, project, "keep.keep", "*") == global_edges;
+            bool same = a && b && strcmp(a, b) == 0 && ni == nf;
+            printf("  incremental mode=%d phase=%d same=%d targets=%d\n", mode, phase, same, targets);
+            if (!same) printf("  incremental:\n%s  full:\n%s", a ? a : "(null)\n", b ? b : "(null)\n");
+            ok = ok && same && targets;
+            if (store) cbm_store_close(store);
+            free(a);
+            free(b);
+        }
+        xlang_env_restore(&saved);
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 /* A call is recorded under the nearest named callable that holds it: an
  * object-literal method or arrow property, a class field arrow, a const
  * arrow inside a method, a nested function. Two callables of one file that
@@ -38324,6 +38396,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_x11b_classifier_work);
     RUN_TEST(pipeline_x11b_classifier_work_parallel);
 #endif
+    RUN_TEST(pipeline_x11b_incremental_equals_full);
     RUN_TEST(pipeline_x11b_reassigned);
     RUN_TEST(pipeline_x11b_reassigned_parallel);
     RUN_TEST(pipeline_tsjs_builtin_receiver_not_bound);
