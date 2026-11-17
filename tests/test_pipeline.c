@@ -15846,6 +15846,92 @@ TEST(pipeline_tsjs_builtin_receiver_not_bound_parallel) {
     return check_builtin_receiver(true);
 }
 
+/* A bare call whose callee a parameter (plain, destructured, default-valued,
+ * rest) or a local (plain or destructured) of an enclosing function binds
+ * calls that value. No
+ * definition in another file is it by name: `function f({ onRequest }) {
+ * onRequest(); }` bound the project's `onRequest` by unique name. POSITIVE: a
+ * local arrow the file defines keeps its edge (`const helper = () => 1;
+ * helper()`), and so does a function of the file whose name a function type
+ * of the signature writes as a parameter (`onTick: (tick: number) => void`),
+ * which binds nothing at run time. */
+static int check_local_callee(bool parallel) {
+    static const ng_file_t files[] = {
+        {"src/loc_lib.ts", "export function run(): number {\n"
+                           "  return 1;\n"
+                           "}\n"
+                           "export function onRequest(): number {\n"
+                           "  return 2;\n"
+                           "}\n"
+                           "export function sleep(ms: number): number {\n"
+                           "  return ms;\n"
+                           "}\n"
+                           "export function createStream(): number {\n"
+                           "  return 3;\n"
+                           "}\n"},
+        {"src/loc_use.ts", "export function useDestructured({ onRequest }: { onRequest: () => void "
+                           "}): void {\n"
+                           "  onRequest();\n"
+                           "}\n"
+                           "export function usePlain(run: () => void): void {\n"
+                           "  run();\n"
+                           "}\n"
+                           "export function useDefault(sleep = (ms: number) => ms): void {\n"
+                           "  sleep(1);\n"
+                           "}\n"
+                           "export function useRest(...run: Function[]): void {\n"
+                           "  run();\n"
+                           "}\n"
+                           "export function useLocal(o: { sleep?: (ms: number) => number }): void "
+                           "{\n"
+                           "  const sleep = o.sleep ?? ((ms: number) => ms);\n"
+                           "  sleep(2);\n"
+                           "}\n"
+                           "export function useLocalDestructured(deps: { run: () => void }): "
+                           "void {\n"
+                           "  const { run } = deps;\n"
+                           "  run();\n"
+                           "}\n"
+                           "export function useGenerator(): void {\n"
+                           "  const createStream = async function* () {\n"
+                           "    yield 1;\n"
+                           "  };\n"
+                           "  void createStream();\n"
+                           "}\n"
+                           "export function outer(): number {\n"
+                           "  const helper = () => 1;\n"
+                           "  return helper();\n"
+                           "}\n"
+                           "export function report(onTick: (tick: number) => void): number {\n"
+                           "  onTick(1);\n"
+                           "  return tick(2);\n"
+                           "}\n"
+                           "function tick(n: number): number {\n"
+                           "  return n;\n"
+                           "}\n"},
+    };
+    static const ng_pair_t pairs[] = {
+        {"loc_use.useDestructured", "loc_lib.onRequest", 0, "destructured parameter"},
+        {"loc_use.usePlain", "loc_lib.run", 0, "plain parameter"},
+        {"loc_use.useDefault", "loc_lib.sleep", 0, "default-valued parameter"},
+        {"loc_use.useRest", "loc_lib.run", 0, "rest parameter"},
+        {"loc_use.useLocal", "loc_lib.sleep", 0, "local value"},
+        {"loc_use.useLocalDestructured", "loc_lib.run", 0, "local destructured value"},
+        {"loc_use.useGenerator", "loc_lib.createStream", 0, "local generator value"},
+        {"loc_use.outer", "loc_use.helper", 1, "local arrow of this file: kept"},
+        {"loc_use.report", "loc_use.tick", 1, "a name a function type writes: kept"},
+    };
+    return ng_check(files, 2, pairs, (int)(sizeof(pairs) / sizeof(pairs[0])), parallel);
+}
+
+TEST(pipeline_tsjs_local_callee_not_bound) {
+    return check_local_callee(false);
+}
+
+TEST(pipeline_tsjs_local_callee_not_bound_parallel) {
+    return check_local_callee(true);
+}
+
 /* Parallel-resolver regression for the TS/JS receiver guard (>= 50 files forces
  * pass_parallel.c's resolve_file_calls). The guard must not drop a weak member
  * match before the service classification runs — it suppresses ONLY the plain
@@ -37916,6 +38002,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_tsjs_same_module_bound_receiver_not_bound_parallel);
     RUN_TEST(pipeline_tsjs_builtin_receiver_not_bound);
     RUN_TEST(pipeline_tsjs_builtin_receiver_not_bound_parallel);
+    RUN_TEST(pipeline_tsjs_local_callee_not_bound);
+    RUN_TEST(pipeline_tsjs_local_callee_not_bound_parallel);
     RUN_TEST(pipeline_python_class_body_calls_sequential);
     RUN_TEST(pipeline_python_class_body_calls_parallel);
     RUN_TEST(pipeline_python_init_scope_sequential);

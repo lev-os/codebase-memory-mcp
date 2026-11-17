@@ -126,12 +126,18 @@ typedef struct {
 /* What a JS/TS binding holds, for the call classifier at the end of the walk:
  * a callable the extractor makes a definition of (a nested function or class
  * declaration, `const run = () => 1`), an array literal, an instance made by
- * `new Name(...)`, or any other value (a parameter, `const x = f()`). */
+ * `new Name(...)`, any other value (a parameter, `const x = f()`), or nothing
+ * at run time (a parameter name a type writes: `(tick: number) => void`).
+ * A name a destructuring shorthand binds (`{ onRequest }`) holds a value too,
+ * but only the classifier reads it: the usage lookup skips it, as it did
+ * before such names were recorded. */
 typedef enum {
     CBM_BINDING_VALUE = 0,
     CBM_BINDING_CALLABLE,
     CBM_BINDING_ARRAY_LITERAL,
     CBM_BINDING_NEW_INSTANCE,
+    CBM_BINDING_TYPE_ONLY,
+    CBM_BINDING_DESTRUCTURED,
 } CBMBindingValueKind;
 
 typedef enum {

@@ -446,7 +446,9 @@ typedef struct {
                                      // module-level foo. Python: read by the weak-local-binding
                                      // guard. JS/TS: a parameter, variable or catch clause is
                                      // the nearest binding (cbm_js_twin_bind_local_callees), and
-                                     // the registry step gives no edge. Default false.
+                                     // the registry step gives no edge; the call classifier
+                                     // (extract_usages.c) sets it too for a parameter or a
+                                     // local value. Default false.
     uint32_t lexical_scope_id;       // JS/TS: the walk's innermost lexical scope at the call,
                                      // read by the call classifier (extract_usages.c) at the
                                      // end of the walk. Extraction only; 0 = none.

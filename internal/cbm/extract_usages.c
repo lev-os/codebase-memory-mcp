@@ -2275,21 +2275,69 @@ static bool js_call_classifier_lang(CBMLanguage language) {
            language == CBM_LANG_TSX;
 }
 
+/* A JS/TS destructuring shorthand `{ onRequest }` binds its name. It is no
+ * reference node, so the usage pass records it only for the call classifier
+ * (CBM_BINDING_DESTRUCTURED). */
+static bool js_shorthand_binding_leaf(const CBMExtractCtx *ctx, TSNode node) {
+    return js_call_classifier_lang(ctx->language) &&
+           strcmp(ts_node_type(node), "shorthand_property_identifier_pattern") == 0;
+}
+
+/* Is parameter `node` written in the parameter list of a type (`(tick:
+ * number) => void`, a method signature, an overload)? binding_is_parameter
+ * counts it as a parameter of the enclosing function, but no value is bound
+ * to it at run time. */
+static bool js_parameter_of_type(TSNode node) {
+    enum { MAX_PATTERN_HOPS = 16 };
+    TSNode cur = node;
+    for (int hop = 0; hop < MAX_PATTERN_HOPS; hop++) {
+        TSNode parent = ts_node_parent(cur);
+        if (ts_node_is_null(parent)) {
+            return false;
+        }
+        if (strcmp(ts_node_type(parent), "formal_parameters") == 0) {
+            TSNode owner = ts_node_parent(parent);
+            const char *kind = ts_node_is_null(owner) ? "" : ts_node_type(owner);
+            return strcmp(kind, "function_type") == 0 || strcmp(kind, "constructor_type") == 0 ||
+                   strcmp(kind, "call_signature") == 0 ||
+                   strcmp(kind, "construct_signature") == 0 ||
+                   strcmp(kind, "method_signature") == 0 ||
+                   strcmp(kind, "abstract_method_signature") == 0 ||
+                   strcmp(kind, "function_signature") == 0;
+        }
+        cur = parent;
+    }
+    return false;
+}
+
 /* What a JS/TS binding holds (CBMBindingValueKind). A nested function or
  * class declaration, or a declarator whose value is a function or class
  * expression the extractor extracts (`const run = () => 1`), holds a callable
  * it defines. A declarator whose value is an array literal holds an Array; one
  * whose value is `new Name(...)` holds an instance of whatever Name is where
  * it is written, which the classifier decides once every binding is known.
- * Everything else holds a value: a parameter of any shape, `const x = f()`,
- * `const s = async function* () {}` (no definition is made of it). */
+ * A parameter name a type writes holds nothing, and a destructured name a
+ * value only the classifier reads. Everything else holds a value: a
+ * parameter of any shape, `const x = f()`, `const s = async function* () {}`
+ * (no definition is made of it). */
 static void js_classify_binding(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                 bool parameter, TSNode function_declaration,
                                 TSNode class_declaration, CBMLexicalBinding *binding) {
     binding->value_kind = CBM_BINDING_VALUE;
     binding->ctor_name = NULL;
     binding->ctor_start = 0;
-    if (!js_call_classifier_lang(ctx->language) || parameter) {
+    if (!js_call_classifier_lang(ctx->language)) {
+        return;
+    }
+    if (parameter && js_parameter_of_type(node)) {
+        binding->value_kind = CBM_BINDING_TYPE_ONLY;
+        return;
+    }
+    if (js_shorthand_binding_leaf(ctx, node)) {
+        binding->value_kind = CBM_BINDING_DESTRUCTURED;
+        return;
+    }
+    if (parameter) {
         return;
     }
     if (!ts_node_is_null(function_declaration) || !ts_node_is_null(class_declaration)) {
@@ -2517,6 +2565,9 @@ static bool lexical_binding_active_at(const WalkState *state, uint32_t scope_id,
         if (binding->scope_id != scope_id || strcmp(binding->name, name) != 0) {
             break;
         }
+        if (binding->value_kind == CBM_BINDING_DESTRUCTURED) {
+            continue; /* the call classifier's alone */
+        }
         uint32_t active_end = binding->active_end ? binding->active_end : scope->end_byte;
         if (binding->active_start <= position && position < active_end) {
             return true;
@@ -2543,8 +2594,13 @@ static const CBMLexicalScope *lexical_binding_scope_for_usage(const WalkState *s
     return NULL;
 }
 
+/* Does `binding` bind a run-time value at `position`? A name a type writes
+ * never does. */
 static bool lexical_binding_live(const CBMLexicalBinding *binding, const CBMLexicalScope *scope,
                                  uint32_t position) {
+    if (binding->value_kind == CBM_BINDING_TYPE_ONLY) {
+        return false;
+    }
     uint32_t active_end = binding->active_end ? binding->active_end : scope->end_byte;
     return binding->active_start <= position && position < active_end;
 }
@@ -2578,6 +2634,19 @@ static const CBMLexicalScope *lexical_binding_owner_at(const WalkState *state, u
         scope_id = scope->lookup_parent_id;
     }
     return NULL;
+}
+
+/* Does every binding of `owner` in [first, end) that holds at `position` have
+ * value kind `kind`? */
+static bool lexical_bindings_all_kind(const WalkState *state, const CBMLexicalScope *owner,
+                                      int first, int end, uint32_t position, uint8_t kind) {
+    for (int i = first; i < end; i++) {
+        const CBMLexicalBinding *binding = &state->lexical_bindings[i];
+        if (lexical_binding_live(binding, owner, position) && binding->value_kind != kind) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool js_plain_call_name(const char *s) {
@@ -2686,6 +2755,21 @@ static bool js_receiver_is_runtime_object(CBMExtractCtx *ctx, const WalkState *s
     return true;
 }
 
+/* A bare call `run()` / `new Run()` whose nearest binding is a parameter
+ * (plain, destructured, default-valued, rest) or a local value of an enclosing
+ * function or block. No definition is the callee by its name, so the call
+ * gets no edge (callee_is_locally_bound; registry.c gives such a call none).
+ * A local callable the extractor defines (`const run = () => 1`, a nested
+ * function) keeps the name lookup, which finds that definition in this file.
+ * Bindings of the module (imports, top-level declarations) are left to the
+ * resolvers. */
+static bool js_bare_callee_is_local_value(const WalkState *state, const CBMCall *call,
+                                          const CBMLexicalScope *owner, int first, int end) {
+    return owner && owner->kind != CBM_LEXICAL_SCOPE_MODULE &&
+           !lexical_bindings_all_kind(state, owner, first, end, call->site_start_byte,
+                                      CBM_BINDING_CALLABLE);
+}
+
 /* The JS/TS call classifier, run once every binding of the file is known.
  * Each rule only takes an edge away; a failed binding table classifies
  * nothing, which can only keep an edge. */
@@ -2696,12 +2780,25 @@ static void classify_js_calls(CBMExtractCtx *ctx, WalkState *state) {
     int module_file = -1; /* unknown until a call needs it */
     for (int i = state->call_start_index; i < ctx->result->calls.count; i++) {
         CBMCall *call = &ctx->result->calls.items[i];
-        if (call->lexical_scope_id == 0 || !call->is_method) {
+        if (call->lexical_scope_id == 0) {
             continue;
         }
-        if (!call->receiver_requires_lsp &&
-            js_receiver_is_runtime_object(ctx, state, call, &module_file)) {
-            call->receiver_requires_lsp = true;
+        if (call->is_method) {
+            if (!call->receiver_requires_lsp &&
+                js_receiver_is_runtime_object(ctx, state, call, &module_file)) {
+                call->receiver_requires_lsp = true;
+            }
+            continue;
+        }
+        if (call->callee_is_locally_bound || !js_plain_call_name(call->callee_name)) {
+            continue;
+        }
+        int first = 0;
+        int end = 0;
+        const CBMLexicalScope *owner = lexical_binding_owner_at(
+            state, call->lexical_scope_id, call->callee_name, call->site_start_byte, &first, &end);
+        if (js_bare_callee_is_local_value(state, call, owner, first, end)) {
+            call->callee_is_locally_bound = true;
         }
     }
 }
@@ -2936,7 +3033,7 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
     bool possible_binding_leaf =
         ts_node_is_named(node) && ts_node_named_child_count(node) == 0 &&
         (state->inside_import || is_exact_language_binding(ctx, node, state) ||
-         is_policy_binding(ctx, node, occurrence, state));
+         is_policy_binding(ctx, node, occurrence, state) || js_shorthand_binding_leaf(ctx, node));
     if (!reference_node && !possible_binding_leaf) {
         return;
     }
