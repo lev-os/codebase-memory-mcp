@@ -715,6 +715,10 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
                              const char *namespace_name, CBMLanguage lang, CBMLSPDef *dst,
                              const pxc_base_scope_t *bs) {
     const char *label = pxc_map_label(arena, src->label);
+    if (src->label && strcmp(src->label, "Module") == 0 &&
+        (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX || lang == CBM_LANG_JAVASCRIPT) &&
+        (src->return_type || src->js_object_literal || src->alias_target))
+        label = "Module";
     if (!label || !src->qualified_name || !src->name)
         return -1;
     memset(dst, 0, sizeof(*dst));
@@ -745,8 +749,19 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     }
     dst->is_interface = (strcmp(label, "Interface") == 0 || strcmp(label, "Protocol") == 0);
     dst->js_object_literal = src->js_object_literal;
+    dst->is_static = src->is_static;
     dst->ts_value_binding_written = src->ts_value_binding_written;
     dst->ts_return_constructor = src->ts_return_constructor;
+    if (src->js_object_members) {
+        int n = 0;
+        while (src->js_object_members[n])
+            n++;
+        const char **members = cbm_arena_calloc(arena, ((size_t)n + 1) * sizeof(*members));
+        if (members)
+            for (int i = 0; i < n; i++)
+                members[i] = cbm_arena_strdup(arena, src->js_object_members[i]);
+        dst->js_object_members = members;
+    }
     /* The return-type string. The Go registrar splits it on '|' (go_lsp.c
      * split_pipe_types), so a Go result LIST arrives split into its element
      * types: `(*T, error)` as `*T|error`, a named `(t *T)` as `*T`. The raw
@@ -790,7 +805,9 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
         }
     }
     dst->lang = lang;
-    dst->alias_target = (lang == CBM_LANG_GO && src->alias_target)
+    dst->alias_target = ((lang == CBM_LANG_GO || lang == CBM_LANG_TYPESCRIPT ||
+                          lang == CBM_LANG_TSX || lang == CBM_LANG_JAVASCRIPT) &&
+                         src->alias_target)
                             ? cbm_arena_strdup(arena, src->alias_target)
                             : NULL;
     dst->decorators = NULL;
@@ -2675,6 +2692,37 @@ static void pxc_drop_superseded_kt_any(CBMArena *keys, CBMResolvedCallArray *dst
     cbm_ht_free(resolved);
 }
 
+/* A cross-file answer replaces a preliminary unresolved answer for that
+ * exact TS/JS invocation. Otherwise an old weak miss can hide a final veto,
+ * or an old value veto can hide a newly proven namespace target. */
+static int pxc_site_cmp(const void *pa, const void *pb) {
+    const CBMResolvedCall *a = pa, *b = pb;
+    if (a->source_origin != b->source_origin)
+        return (a->source_origin > b->source_origin) - (a->source_origin < b->source_origin);
+    if (a->kind != b->kind)
+        return (a->kind > b->kind) - (a->kind < b->kind);
+    if (a->site_start_byte != b->site_start_byte)
+        return (a->site_start_byte > b->site_start_byte) -
+               (a->site_start_byte < b->site_start_byte);
+    return (a->site_end_byte > b->site_end_byte) - (a->site_end_byte < b->site_end_byte);
+}
+
+static void pxc_retire_ts_misses(CBMResolvedCallArray *old, CBMResolvedCallArray *fresh) {
+    if (!old || !fresh || !fresh->count)
+        return;
+    qsort(fresh->items, (size_t)fresh->count, sizeof(*fresh->items), pxc_site_cmp);
+    int count = 0;
+    for (int i = 0; i < old->count; i++) {
+        CBMResolvedCall *row = &old->items[i];
+        if (row->kind == CBM_RESOLVED_INVOCATION && row->confidence <= 0 &&
+            row->site_end_byte > row->site_start_byte &&
+            bsearch(row, fresh->items, (size_t)fresh->count, sizeof(*fresh->items), pxc_site_cmp))
+            continue;
+        old->items[count++] = *row;
+    }
+    old->count = count;
+}
+
 static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_calls,
                                const CBMResolvedCallArray *src_out) {
     if (!dst_calls || !src_out)
@@ -3055,6 +3103,7 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
     cbm_run_ts_lsp_cross(&scratch, source, source_len, module_qn, js_mode, jsx_mode, dts_mode, defs,
                          def_count, imp_names, imp_qns, imp_count, r->cached_tree, &out);
 
+    pxc_retire_ts_misses(&r->resolved_calls, &out);
     pxc_append_results(&r->arena, &r->resolved_calls, &out);
     cbm_js_rebind_resolved_calls(r);
     pxc_dedup_after_rebind(&r->resolved_calls);
@@ -3250,6 +3299,8 @@ void cbm_pxc_dispatch_file_with_php_bindings(
             break;
         }
         if (used_prebuilt) {
+            if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX)
+                pxc_retire_ts_misses(&result->resolved_calls, &out);
             pxc_append_results(&result->arena, &result->resolved_calls, &out);
             pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
             if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||

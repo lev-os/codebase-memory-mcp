@@ -266,6 +266,9 @@ typedef struct {
     bool ts_return_constructor;     // Inferred `new C()` result; C must prove a runtime class.
     bool ts_value_binding_written;  // Class value binding is assigned in its provider.
     bool js_object_literal;         // Unannotated module const initialized by a plain object.
+    bool is_static;                 // JS/TS method is declared on its class constructor.
+    /* Alternating own member names and exact callable QNs, NULL terminated. */
+    const char **js_object_members;
     const char *structural_profile; // AST structural profile (arena-allocated) or NULL
     const char *body_tokens; // space-separated raw identifier tokens from body (arena) or NULL
     /* Rust only: raw trait path from the exact `impl Trait for Type` block

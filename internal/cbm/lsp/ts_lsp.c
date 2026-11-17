@@ -2329,6 +2329,19 @@ static const char *ts_import_symbol_qn(TSLSPContext *ctx, const char *module_qn,
     if (!ctx || !module_qn || !name) {
         return NULL;
     }
+    if (strcmp(name, "default") == 0) {
+        const char *default_qn = cbm_arena_sprintf(ctx->arena, "%s.default", module_qn);
+        const CBMVarBinding *alias = ts_registry_value(ctx, default_qn);
+        if (alias && alias->type && alias->type->kind == CBM_TYPE_NAMED) {
+            const char *target = alias->type->data.named.qualified_name;
+            if (ts_lookup_func(ctx, ctx->registry, target) ||
+                cbm_registry_lookup_type(ctx->registry, target))
+                return target;
+        }
+        if (ts_lookup_func(ctx, ctx->registry, module_qn) ||
+            cbm_registry_lookup_type(ctx->registry, module_qn) || ts_registry_value(ctx, module_qn))
+            return module_qn;
+    }
     const char *appended = cbm_arena_sprintf(ctx->arena, "%s.%s", module_qn, name);
     size_t module_len = strlen(module_qn);
     size_t name_len = strlen(name);
@@ -2978,6 +2991,15 @@ static const CBMRegisteredFunc *ts_lookup_symbol_for_call(TSLSPContext *ctx, con
     if (!ctx || !ctx->registry || !module_qn || !symbol_name)
         return NULL;
 
+    if (strcmp(symbol_name, "default") == 0) {
+        const char *qn = ts_import_symbol_qn(ctx, module_qn, symbol_name);
+        const char *dot = qn ? strrchr(qn, '.') : NULL;
+        if (!dot)
+            return NULL;
+        module_qn = qn;
+        symbol_name = dot + 1;
+    }
+
     /* Import maps may carry either a module QN or an already-qualified symbol
      * QN.  The registry overload APIs accept the former, so strip one exact
      * trailing `.symbol` before lookup instead of producing x.symbol.symbol. */
@@ -3094,7 +3116,8 @@ static bool ts_import_is_instance(TSLSPContext *ctx, const char *name) {
     const CBMRegisteredType *runtime = cbm_registry_lookup_type(ctx->registry, qn);
     if (runtime && runtime->ts_value_binding_written)
         return true;
-    return ts_registry_value(ctx, qn) != NULL;
+    const CBMVarBinding *value = ts_registry_value(ctx, qn);
+    return value && (!value->type || value->type->kind != CBM_TYPE_OBJECT_LIT);
 }
 
 static const CBMRegisteredFunc *ts_lookup_namespace_call(TSLSPContext *ctx, const char *object_name,
@@ -3109,8 +3132,39 @@ static const CBMRegisteredFunc *ts_lookup_namespace_call(TSLSPContext *ctx, cons
     if (import_matched) {
         /* An import binding lexically shadows a same-named local namespace.
          * Ambiguous imports and missing imported symbols both fail closed. */
-        return import_module ? ts_lookup_symbol_for_call(ctx, import_module, method_name, args)
-                             : NULL;
+        if (!import_module)
+            return NULL;
+        if (ts_scope_has_binding(ctx->named_imports, object_name)) {
+            const char *qn =
+                ts_import_symbol_qn(ctx, import_module, ts_import_export_name(ctx, object_name));
+            if (strcmp(ts_import_export_name(ctx, object_name), "default") == 0)
+                import_module = qn;
+            const CBMRegisteredType *constructor = cbm_registry_lookup_type(ctx->registry, qn);
+            if (strcmp(ts_import_export_name(ctx, object_name), "default") == 0 && constructor &&
+                !constructor->is_interface && !constructor->alias_of) {
+                const CBMRegisteredFunc *method = ts_lookup_method_for_call(
+                    ctx, cbm_type_named(ctx->arena, qn), method_name, args);
+                return method && (method->flags & CBM_FUNC_FLAG_STATICMETHOD) ? method : NULL;
+            }
+            const CBMVarBinding *value = ts_registry_value(ctx, qn);
+            if (value) {
+                const CBMType *type = value->type;
+                if (!type || type->kind != CBM_TYPE_OBJECT_LIT)
+                    return NULL;
+                for (int i = 0;
+                     type->data.object_lit.prop_names && type->data.object_lit.prop_names[i]; i++) {
+                    if (strcmp(type->data.object_lit.prop_names[i], method_name) == 0) {
+                        const CBMType *member = type->data.object_lit.prop_types[i];
+                        return member && member->kind == CBM_TYPE_NAMED
+                                   ? ts_lookup_func(ctx, ctx->registry,
+                                                    member->data.named.qualified_name)
+                                   : NULL;
+                    }
+                }
+                return NULL;
+            }
+        }
+        return ts_lookup_symbol_for_call(ctx, import_module, method_name, args);
     }
     /* TypeScript namespaces are module-like lexical scopes. Inside `namespace
      * App`, `Utils.fn()` addresses App.Utils.fn, not a typed instance named
@@ -4393,7 +4447,10 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
                         if (is_import) {
                             ts_emit_unresolved_call_at(
                                 ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", on, mname),
-                                "module_symbol_not_in_registry", call_node);
+                                ctx->cross_file_mode && ts_scope_has_binding(ctx->named_imports, on)
+                                    ? "ts_import_value_receiver"
+                                    : "module_symbol_not_in_registry",
+                                call_node);
                             return;
                         }
                     }
@@ -5675,10 +5732,9 @@ static void ts_lsp_add_import_alias(TSLSPContext *ctx, const char *local, const 
  * map holds only local bindings, so a renamed binding spelled `<module>.bar`,
  * named nothing, and every call through it lost its CALLS edge. Reading the
  * file's own import statements serves the per-file and both cross-file entry
- * points alike. `default as x` keeps today's local-name lookup (a default
- * import binds no exported member name); string export names and identity
- * aliases need no entry. Must run before the type passes, which resolve
- * imported type names. */
+ * points alike. Default bindings use their provider's recorded default
+ * declaration or value. Namespace imports remain module bindings. Run before
+ * the type passes, which resolve imported type names. */
 static void ts_lsp_collect_import_aliases(TSLSPContext *ctx, TSNode root) {
     if (!ctx || !ctx->arena || ts_node_is_null(root) || ctx->import_count == 0)
         return;
@@ -5688,7 +5744,16 @@ static void ts_lsp_collect_import_aliases(TSLSPContext *ctx, TSNode root) {
     for (uint32_t i = 0; i < kn; i++) {
         if (!node_kind_is(kids[i], "import_statement"))
             continue;
-        TSNode named = find_first_kind(find_first_kind(kids[i], "import_clause"), "named_imports");
+        TSNode clause = find_first_kind(kids[i], "import_clause");
+        for (uint32_t j = 0; j < ts_node_named_child_count(clause); j++) {
+            TSNode binding = ts_node_named_child(clause, j);
+            if (node_kind_is(binding, "identifier")) {
+                const char *local = node_text(ctx, binding);
+                cbm_scope_bind(ctx->named_imports, local, cbm_type_unknown());
+                ts_lsp_add_import_alias(ctx, local, "default");
+            }
+        }
+        TSNode named = find_first_kind(clause, "named_imports");
         if (ts_node_is_null(named))
             continue;
         uint32_t sn = 0;
@@ -5706,8 +5771,7 @@ static void ts_lsp_collect_import_aliases(TSLSPContext *ctx, TSNode root) {
                 continue;
             char *exported = node_text(ctx, name);
             char *local = node_text(ctx, alias);
-            if (exported && local && strcmp(exported, "default") != 0 &&
-                strcmp(exported, local) != 0)
+            if (exported && local && strcmp(exported, local) != 0)
                 ts_lsp_add_import_alias(ctx, local, exported);
         }
     }
@@ -7770,18 +7834,37 @@ static void ts_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
         if (!d->qualified_name || !d->short_name || !d->label)
             continue;
 
-        if (strcmp(d->label, "Variable") == 0) {
-            /* `export const api = { run() {} }`: its callables keep module
-             * names, so `api.run()` resolves as a namespace member. Recording
-             * it as a value would mark it an instance of unknown type and
-             * withhold both that lookup and the plain-name fallback. */
-            if (d->js_object_literal)
-                continue;
+        if (strcmp(d->label, "Module") == 0 && d->alias_target) {
+            if (!reg->ts_values)
+                reg->ts_values = cbm_scope_push(arena, NULL);
+            const char *qn = cbm_arena_sprintf(arena, "%s.default", d->qualified_name);
+            cbm_scope_bind(reg->ts_values, qn, cbm_type_named(arena, d->alias_target));
+            continue;
+        }
+        if (strcmp(d->label, "Variable") == 0 ||
+            (strcmp(d->label, "Module") == 0 && (d->return_types || d->js_object_literal))) {
             if (!reg->ts_values)
                 reg->ts_values = cbm_scope_push(arena, NULL);
             const CBMType *value =
                 d->return_types ? parse_ts_type_text(arena, d->return_types, d->def_module_qn)
                                 : cbm_type_unknown();
+            if (d->js_object_literal) {
+                int count = 0;
+                while (d->js_object_members && d->js_object_members[count * 2])
+                    count++;
+                const char **names = cbm_arena_calloc(arena, ((size_t)count + 1) * sizeof(*names));
+                const CBMType **types =
+                    cbm_arena_calloc(arena, ((size_t)count + 1) * sizeof(*types));
+                if (names && types) {
+                    for (int j = 0; j < count; j++) {
+                        names[j] = d->js_object_members[j * 2];
+                        types[j] = cbm_type_named(arena, d->js_object_members[j * 2 + 1]);
+                    }
+                    value = cbm_type_object_lit(arena, names, types, NULL, NULL);
+                } else {
+                    value = cbm_type_unknown();
+                }
+            }
             cbm_scope_bind(reg->ts_values, d->qualified_name, value);
         } else if (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Interface") == 0) {
             CBMRegisteredType rt;
@@ -7885,6 +7968,8 @@ static void ts_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
             rf.qualified_name = d->qualified_name;
             rf.short_name = d->short_name;
             rf.min_params = -1;
+            if (d->is_static)
+                rf.flags |= CBM_FUNC_FLAG_STATICMETHOD;
             const CBMType **rets = NULL;
             if (d->return_types && d->return_types[0]) {
                 int n = 1;
@@ -8100,7 +8185,9 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
         if (!d->qualified_name || !d->short_name || !d->label)
             continue;
 
-        if (strcmp(d->label, "Variable") == 0) {
+        if (strcmp(d->label, "Variable") == 0 ||
+            (strcmp(d->label, "Module") == 0 &&
+             (d->return_types || d->js_object_literal || d->alias_target))) {
             ts_register_lsp_defs(arena, &reg, &defs[i], 1);
             continue;
         }
@@ -8211,6 +8298,8 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
             rf.qualified_name = d->qualified_name;
             rf.short_name = d->short_name;
             rf.min_params = -1;
+            if (d->is_static)
+                rf.flags |= CBM_FUNC_FLAG_STATICMETHOD;
             // Return types from pipe-separated return_types text.
             const CBMType **rets = NULL;
             if (d->return_types && d->return_types[0]) {

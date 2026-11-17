@@ -112,8 +112,11 @@ typedef struct {
     /* JS/TS only: a Variable initialized by an unannotated plain object
      * literal. Its callables are module members, not a typed receiver. */
     bool js_object_literal;
+    bool is_static; // JS/TS method is declared on its class constructor.
     bool ts_value_binding_written;
     bool ts_return_constructor;
+    /* Alternating own member names and exact callable QNs, NULL terminated. */
+    const char **js_object_members;
 } CBMLSPDef;
 
 // Parse source, build registry from defs + stdlib, run LSP.
