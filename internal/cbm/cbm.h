@@ -262,6 +262,8 @@ typedef struct {
     bool is_abstract;
     bool is_test;
     bool is_entry_point;
+    bool ts_return_scope_safe;      // TS return spelling has no generic parameter shadow.
+    bool ts_return_constructor;     // Inferred `new C()` result; C must prove a runtime class.
     const char *structural_profile; // AST structural profile (arena-allocated) or NULL
     const char *body_tokens; // space-separated raw identifier tokens from body (arena) or NULL
     /* Rust only: raw trait path from the exact `impl Trait for Type` block
@@ -434,6 +436,7 @@ typedef struct {
     bool requires_lsp_resolution;    // requires a type-aware answer (for example an implicit
                                      // C++ operator or static `this` with an instance-only
                                      // member). Never fall back to textual resolution.
+    bool receiver_requires_lsp; // No plain CALLS fallback; independent service facts remain valid.
     bool callee_is_locally_bound;    // bare call foo() whose callee identifier is bound as a
                                      // parameter of an enclosing function, so it cannot be the
                                      // module-level foo. Python: read by the weak-local-binding

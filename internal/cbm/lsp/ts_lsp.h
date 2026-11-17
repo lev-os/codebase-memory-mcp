@@ -29,6 +29,7 @@ typedef struct {
     // Exact module/namespace callable bindings from syntax. A flat registry
     // entry alone does not prove that an object member is a free function.
     CBMScope *module_callables;
+    CBMScope *named_imports; // Named import bindings; excludes namespace imports.
 
     // Import map: local_name -> module QN (resolved or opaque).
     // Parallel arrays of length import_count.

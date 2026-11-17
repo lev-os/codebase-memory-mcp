@@ -211,6 +211,7 @@ static void process_node(TSLSPContext *ctx, TSNode node);
 static void process_function_body(TSLSPContext *ctx, TSNode body, const char *func_qn,
                                   const char *class_qn);
 static const CBMType *type_of_identifier(TSLSPContext *ctx, const char *name);
+
 static const CBMType *lookup_member_type(TSLSPContext *ctx, const CBMType *recv, const char *name);
 static const CBMRegisteredFunc *lookup_method(TSLSPContext *ctx, const CBMType *recv,
                                               const char *method_name);
@@ -651,7 +652,8 @@ static const CBMType *parse_ts_type_text(CBMArena *arena, const char *text, cons
         const char *rest = text + 7;
         while (*rest == ' ' || *rest == '\t')
             rest++;
-        return cbm_type_typeof_query(arena, rest);
+        return cbm_type_typeof_query(
+            arena, module_qn ? cbm_arena_sprintf(arena, "%s.%s", module_qn, rest) : rest);
     }
 
     // Tuple `[T, U]` — first char `[`, balanced. Build TUPLE.
@@ -1506,13 +1508,57 @@ static const CBMType *eval_conditional(TSLSPContext *ctx, const CBMType *t, int 
 
 // Resolve a CBMType against the registry's alias chain when it's a NAMED type that's a
 // pure alias (`type Foo = Bar`). Also evaluates inline conditional types.
-static const CBMType *simplify_type(TSLSPContext *ctx, const CBMType *t) {
+static const CBMType *simplify_type_at(TSLSPContext *ctx, const CBMType *t, int depth) {
     if (!t || !ctx || !ctx->registry)
         return t;
+    if (depth >= 32)
+        return cbm_type_unknown();
+    if (t->kind == CBM_TYPE_TYPEOF_QUERY) {
+        const char *name = t->data.typeof_query.expr;
+        if (name && ctx->module_qn) {
+            size_t n = strlen(ctx->module_qn);
+            if (strncmp(name, ctx->module_qn, n) == 0 && name[n] == '.')
+                name += n + 1;
+        }
+        /* A bare value follows the same lexical/import binding as a call.
+         * Qualified expressions need their own proof; a leaf-name fallback
+         * could bind an unrelated function. */
+        if (!name || !name[0] ||
+            strspn(name, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$") !=
+                strlen(name))
+            return cbm_type_unknown();
+        return simplify_type_at(ctx, type_of_identifier(ctx, name), depth + 1);
+    }
+    if (t->kind == CBM_TYPE_TEMPLATE && t->data.template_type.template_name &&
+        t->data.template_type.arg_count == 1 && t->data.template_type.template_args) {
+        const char *name = t->data.template_type.template_name;
+        if (strcmp(name, "ReturnType") == 0) {
+            const CBMType *fn =
+                simplify_type_at(ctx, t->data.template_type.template_args[0], depth + 1);
+            if (!fn || fn->kind != CBM_TYPE_FUNC || !fn->data.func.return_types ||
+                !fn->data.func.return_types[0] || fn->data.func.return_types[1])
+                return cbm_type_unknown();
+            return simplify_type_at(ctx, fn->data.func.return_types[0], depth + 1);
+        }
+        if (strcmp(name, "Awaited") == 0) {
+            const CBMType *value =
+                simplify_type_at(ctx, t->data.template_type.template_args[0], depth + 1);
+            while (value && value->kind == CBM_TYPE_TEMPLATE &&
+                   value->data.template_type.template_name &&
+                   strcmp(value->data.template_type.template_name, "Promise") == 0 &&
+                   value->data.template_type.arg_count == 1 &&
+                   value->data.template_type.template_args) {
+                if (++depth >= 32)
+                    return cbm_type_unknown();
+                value = simplify_type_at(ctx, value->data.template_type.template_args[0], depth);
+            }
+            return value;
+        }
+    }
     if (t->kind == CBM_TYPE_CONDITIONAL) {
         const CBMType *evaluated = eval_conditional(ctx, t, 0);
         if (evaluated && evaluated != t)
-            return simplify_type(ctx, evaluated);
+            return simplify_type_at(ctx, evaluated, depth + 1);
         return t;
     }
     if (t->kind == CBM_TYPE_ALIAS)
@@ -1529,6 +1575,10 @@ static const CBMType *simplify_type(TSLSPContext *ctx, const CBMType *t) {
         t = cbm_type_named(ctx->arena, rt->alias_of);
     }
     return t;
+}
+
+static const CBMType *simplify_type(TSLSPContext *ctx, const CBMType *t) {
+    return simplify_type_at(ctx, t, 0);
 }
 
 /* cbm_scope_lookup intentionally collapses an absent binding and an UNKNOWN
@@ -2203,6 +2253,25 @@ static const CBMRegisteredFunc *ts_lookup_func(TSLSPContext *ctx, const CBMTypeR
     return own;
 }
 
+/* Values and types have separate namespaces in TS (`interface Port` may
+ * coexist with `const Port`). Reuse the scope's indexed value table without
+ * registering a value as a nominal type or mutating the shared fallback. */
+static const CBMVarBinding *ts_registry_value(TSLSPContext *ctx, const char *qn) {
+    for (const CBMTypeRegistry *reg = ctx->registry; reg; reg = reg->fallback) {
+        const CBMVarBinding *value = cbm_scope_lookup_local(reg->ts_values, qn);
+        if (value) {
+            /* A class expression can also have a Variable row. Its class
+             * registration proves the constructor; interfaces and aliases
+             * do not make the runtime value a constructor. */
+            const CBMRegisteredType *type = cbm_registry_lookup_type(ctx->registry, qn);
+            if (type && !type->is_interface && !type->alias_of)
+                return NULL;
+            return value;
+        }
+    }
+    return NULL;
+}
+
 /* The member an import binding names in its module: the exported name of a
  * renamed named import (`foo` for `import { foo as bar }`, #2297), else the
  * binding itself. Callers have already matched `local` to an import binding. */
@@ -2233,8 +2302,9 @@ static const char *ts_import_symbol_qn(TSLSPContext *ctx, const char *module_qn,
     size_t name_len = strlen(name);
     if (module_len > name_len + 1 && module_qn[module_len - name_len - 1] == '.' &&
         strcmp(module_qn + module_len - name_len, name) == 0) {
-        if (appended && (cbm_registry_lookup_type(ctx->registry, appended) ||
-                         ts_lookup_func(ctx, ctx->registry, appended))) {
+        if (appended &&
+            (cbm_registry_lookup_type(ctx->registry, appended) ||
+             ts_lookup_func(ctx, ctx->registry, appended) || ts_registry_value(ctx, appended))) {
             return appended;
         }
         return module_qn;
@@ -2326,6 +2396,12 @@ static const CBMType *type_of_identifier(TSLSPContext *ctx, const char *name) {
         // Construct the full symbol QN using the same convention as exact
         // imported function-value resolution.
         const char *full_qn = ts_import_symbol_qn(ctx, mqn, ts_import_export_name(ctx, name));
+
+        if (ts_scope_has_binding(ctx->named_imports, name)) {
+            const CBMVarBinding *value = ts_registry_value(ctx, full_qn);
+            if (value)
+                return value->type;
+        }
 
         // Try the symbol lookup precedence: registered func, then registered type.
         const CBMRegisteredFunc *f = ts_lookup_func(ctx, ctx->registry, full_qn);
@@ -2931,13 +3007,22 @@ static const CBMType *ts_new_bare_class_type(TSLSPContext *ctx, const char *cnam
     if (!ctx->module_qn)
         return cbm_type_named(ctx->arena, cname);
     const char *local_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, cname);
-    if (cbm_registry_lookup_type(ctx->registry, local_qn))
+    if (ts_registry_value(ctx, local_qn))
+        return cbm_type_unknown();
+    const CBMRegisteredType *local_type = cbm_registry_lookup_type(ctx->registry, local_qn);
+    if (local_type && (local_type->is_interface || local_type->alias_of))
+        return cbm_type_unknown();
+    if (local_type)
         return cbm_type_named(ctx->arena, local_qn);
     bool import_matched = false;
     const char *import_module = ts_import_module_for_local(ctx, cname, &import_matched);
-    if (import_module)
-        return cbm_type_named(
-            ctx->arena, ts_import_symbol_qn(ctx, import_module, ts_import_export_name(ctx, cname)));
+    if (import_module) {
+        const char *qn = ts_import_symbol_qn(ctx, import_module, ts_import_export_name(ctx, cname));
+        const CBMRegisteredType *type = cbm_registry_lookup_type(ctx->registry, qn);
+        return ts_registry_value(ctx, qn) || (type && (type->is_interface || type->alias_of))
+                   ? cbm_type_unknown()
+                   : cbm_type_named(ctx->arena, qn);
+    }
     return cbm_type_named(ctx->arena, local_qn);
 }
 
@@ -2955,6 +3040,18 @@ static const CBMType *ts_new_expression_type(TSLSPContext *ctx, TSNode node) {
         return NULL;
     return strchr(cname, '.') == NULL ? ts_new_bare_class_type(ctx, cname)
                                       : cbm_type_named(ctx->arena, cname);
+}
+
+static bool ts_import_is_instance(TSLSPContext *ctx, const char *name) {
+    if (ts_scope_has_binding(ctx->current_scope, name) ||
+        !ts_scope_has_binding(ctx->named_imports, name))
+        return false;
+    bool matched = false;
+    const char *module = ts_import_module_for_local(ctx, name, &matched);
+    if (!module)
+        return false;
+    const char *qn = ts_import_symbol_qn(ctx, module, ts_import_export_name(ctx, name));
+    return ts_registry_value(ctx, qn) != NULL;
 }
 
 static const CBMRegisteredFunc *ts_lookup_namespace_call(TSLSPContext *ctx, const char *object_name,
@@ -3030,7 +3127,8 @@ static const CBMType *ts_signature_for_call(TSLSPContext *ctx, TSNode function, 
 
         if (node_kind_is(object, "identifier")) {
             char *object_name = node_text(ctx, object);
-            if (!ts_scope_has_binding(ctx->current_scope, object_name)) {
+            if (!ts_scope_has_binding(ctx->current_scope, object_name) &&
+                !ts_import_is_instance(ctx, object_name)) {
                 bool is_import = false;
                 const CBMRegisteredFunc *namespace_func =
                     ts_lookup_namespace_call(ctx, object_name, method_name, args, &is_import);
@@ -4036,7 +4134,8 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
                 // Identifier as namespace import: `name.fn()` or `mod.fn()`.
                 if (node_kind_is(obj, "identifier")) {
                     char *on = node_text(ctx, obj);
-                    if (on && !ts_scope_has_binding(ctx->current_scope, on)) {
+                    if (on && !ts_scope_has_binding(ctx->current_scope, on) &&
+                        !ts_import_is_instance(ctx, on)) {
                         bool is_import = false;
                         const CBMRegisteredFunc *f =
                             ts_lookup_namespace_call(ctx, on, mname, args, &is_import);
@@ -4062,7 +4161,13 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
                                              call_node);
                     return;
                 }
-                ts_emit_unresolved_call_at(ctx, mname, "method_not_in_registry", call_node);
+                const char *object_name =
+                    node_kind_is(obj, "identifier") ? node_text(ctx, obj) : NULL;
+                ts_emit_unresolved_call_at(ctx, mname,
+                                           object_name && ts_import_is_instance(ctx, object_name)
+                                               ? "ts_import_value_receiver"
+                                               : "method_not_in_registry",
+                                           call_node);
             }
         }
         return;
@@ -4725,6 +4830,13 @@ static void process_node_inner(TSLSPContext *ctx, TSNode node) {
     // Scope-affecting statements bind first, then we recurse.
     ts_process_statement(ctx, node);
 
+    if (strcmp(kind, "new_expression") == 0) {
+        TSNode ctor = ts_node_child_by_field_name(node, "constructor", 11);
+        const char *name = node_kind_is(ctor, "identifier") ? node_text(ctx, ctor) : NULL;
+        if (name && ts_import_is_instance(ctx, name))
+            ts_emit_unresolved_call_at(ctx, name, "ts_value_not_constructor", node);
+    }
+
     if (strcmp(kind, "call_expression") == 0) {
         resolve_call_at(ctx, node);
         resolve_value_references_at(ctx, node);
@@ -5320,6 +5432,7 @@ static void ts_lsp_add_import_alias(TSLSPContext *ctx, const char *local, const 
 static void ts_lsp_collect_import_aliases(TSLSPContext *ctx, TSNode root) {
     if (!ctx || !ctx->arena || ts_node_is_null(root) || ctx->import_count == 0)
         return;
+    ctx->named_imports = cbm_scope_push(ctx->arena, NULL);
     uint32_t kn = 0;
     TSNode *kids = collect_children(ctx->arena, root, &kn);
     for (uint32_t i = 0; i < kn; i++) {
@@ -5336,6 +5449,9 @@ static void ts_lsp_collect_import_aliases(TSLSPContext *ctx, TSNode root) {
             TSNode name = ts_node_child_by_field_name(specs[j], "name", TS_LSP_FIELD_LEN("name"));
             TSNode alias =
                 ts_node_child_by_field_name(specs[j], "alias", TS_LSP_FIELD_LEN("alias"));
+            TSNode binding = ts_node_is_null(alias) ? name : alias;
+            if (node_kind_is(binding, "identifier"))
+                cbm_scope_bind(ctx->named_imports, node_text(ctx, binding), cbm_type_unknown());
             if (!node_kind_is(name, "identifier") || !node_kind_is(alias, "identifier"))
                 continue;
             char *exported = node_text(ctx, name);
@@ -5974,6 +6090,14 @@ void cbm_ts_stdlib_register(CBMTypeRegistry *reg, CBMArena *arena) {
 // as funcs. Walks AST briefly for class fields/extends.
 static void register_file_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMFileResult *result,
                                const char *module_qn) {
+    /* Class facts precede return signatures, including forward declarations.
+     * The existing scope index keeps this proof linear in the definition set. */
+    CBMScope *classes = cbm_scope_push(arena, NULL);
+    for (int i = 0; i < result->defs.count; i++) {
+        const CBMDefinition *d = &result->defs.items[i];
+        if (d->label && strcmp(d->label, "Class") == 0 && d->qualified_name)
+            cbm_scope_bind(classes, d->qualified_name, cbm_type_unknown());
+    }
     for (int i = 0; i < result->defs.count; i++) {
         CBMDefinition *d = &result->defs.items[i];
         if (!d->qualified_name || !d->name || !d->label)
@@ -6066,6 +6190,18 @@ static void register_file_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMFileRes
                 rets = (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
                 if (rets) {
                     rets[0] = parse_ts_type_text(arena, d->return_type, module_qn);
+                    if (d->ts_return_constructor) {
+                        const CBMType *target = rets[0];
+                        if (target && target->kind == CBM_TYPE_TEMPLATE &&
+                            target->data.template_type.template_name &&
+                            strcmp(target->data.template_type.template_name, "Promise") == 0 &&
+                            target->data.template_type.arg_count == 1 &&
+                            target->data.template_type.template_args)
+                            target = target->data.template_type.template_args[0];
+                        if (!target || target->kind != CBM_TYPE_NAMED ||
+                            !cbm_scope_lookup_local(classes, target->data.named.qualified_name))
+                            rets[0] = cbm_type_unknown();
+                    }
                     rets[1] = NULL;
                 }
             } else if (d->return_types) {
@@ -6224,10 +6360,39 @@ static bool ts_walk_push(TSNode **stack, int *cap, int *top, TSNode n, const TSN
     return true;
 }
 
-// Find a `return EXPR` inside a body and evaluate EXPR's type. Children are visited
-// last-child first, so of several returns the one latest in the body is tried
-// first; the first one that resolves wins. Returns UNKNOWN if the body has no
-// return, every return is unresolvable, or the walk stack could not grow.
+/* Return inference runs before the statement walk. Reserve declarations so
+ * an unknown local or parameter cannot borrow a module constructor/function.
+ * Reserving nested sibling bindings too can only withhold an inferred type. */
+static void ts_reserve_return_bindings(TSLSPContext *ctx, TSNode fn) {
+    TSTreeCursor cursor = ts_tree_cursor_new(fn);
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        TSNode binding = {0};
+        if (strcmp(kind, "variable_declarator") == 0 || strcmp(kind, "class_declaration") == 0 ||
+            strcmp(kind, "function_declaration") == 0)
+            binding = ts_node_child_by_field_name(node, "name", 4);
+        else if (strcmp(kind, "required_parameter") == 0 || strcmp(kind, "optional_parameter") == 0)
+            binding = ts_node_child_by_field_name(node, "pattern", 7);
+        else if (strcmp(kind, "catch_clause") == 0)
+            binding = ts_node_child_by_field_name(node, "parameter", 9);
+        else if (strcmp(kind, "identifier") == 0 &&
+                 node_kind_is(ts_node_parent(node), "formal_parameters"))
+            binding = node;
+        bind_unknown_pattern(ctx, binding);
+        if (ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor))
+                goto done;
+        }
+    }
+done:
+    ts_tree_cursor_delete(&cursor);
+}
+
+/* Infer only when every return in this callable proves the same type.
+ * Nested callables own their returns; traversal order never chooses a type. */
 static const CBMType *infer_return_type_from_body(TSLSPContext *ctx, TSNode body) {
     if (ts_node_is_null(body))
         return cbm_type_unknown();
@@ -6236,7 +6401,7 @@ static const CBMType *infer_return_type_from_body(TSLSPContext *ctx, TSNode body
     TSNode *stack = inline_stack;
     int cap = TS_WALK_STACK_INLINE;
     int top = 0;
-    const CBMType *found = cbm_type_unknown();
+    const CBMType *found = NULL;
     stack[top++] = body;
     while (top > 0) {
         TSNode n = stack[--top];
@@ -6246,28 +6411,34 @@ static const CBMType *infer_return_type_from_body(TSLSPContext *ctx, TSNode body
         if (strcmp(k, "return_statement") == 0) {
             // The first named child is the return expression (if any).
             uint32_t rnc = ts_node_named_child_count(n);
-            if (rnc == 0)
-                continue;
+            if (rnc == 0) {
+                found = cbm_type_unknown();
+                break;
+            }
             TSNode expr = ts_node_named_child(n, 0);
             if (ts_node_is_null(expr))
                 continue;
             const CBMType *t = ts_eval_expr_type(ctx, expr);
-            if (t && !cbm_type_is_unknown(t)) {
-                found = t;
+            if (!t || cbm_type_is_unknown(t) || (found && !cbm_type_equal(found, t))) {
+                found = cbm_type_unknown();
                 break;
             }
+            found = t;
             continue;
         }
         // Don't recurse into nested function bodies — their returns belong to them.
-        if (strcmp(k, "function_declaration") == 0 || strcmp(k, "function_expression") == 0 ||
-            strcmp(k, "arrow_function") == 0 || strcmp(k, "method_definition") == 0)
+        if (ts_is_function_declaration(n) || ts_is_function_value(n) ||
+            node_kind_is(n, "method_definition") || node_kind_is(n, "class_declaration") ||
+            node_kind_is(n, "class"))
             continue;
 
-        if (!ts_walk_push_children(&stack, &cap, &top, n, inline_stack, "ts_lsp_return_walk"))
-            break; // "unknown" is the safe answer for a walk that could not finish
+        if (!ts_walk_push_children(&stack, &cap, &top, n, inline_stack, "ts_lsp_return_walk")) {
+            found = cbm_type_unknown();
+            break;
+        }
     }
     cbm_walk_stack_release(stack, inline_stack);
-    return found;
+    return found ? found : cbm_type_unknown();
 }
 
 // These two AST passes patch the FIRST matching local registration, even when
@@ -6891,9 +7062,27 @@ static void infer_implicit_returns(TSLSPContext *ctx, TSNode root, CBMTypeRegist
             continue;
         }
 
+        /* An explicit unknown/any return is a boundary, not an invitation to
+         * replace the annotation with a concrete value seen in the body. */
+        if (!ts_node_is_null(ts_node_child_by_field_name(decl, "return_type", 11)))
+            continue;
+        CBMScope *saved_scope = ctx->current_scope;
+        struct TsEvalMemo *saved_memo = ctx->eval_memo;
+        ctx->current_scope = cbm_scope_push(ctx->arena, saved_scope);
+        ctx->eval_memo = NULL;
+        ts_reserve_return_bindings(ctx, decl);
         const CBMType *inferred = infer_return_type_from_body(ctx, body);
+        ctx->current_scope = saved_scope;
+        ctx->eval_memo = saved_memo;
         if (cbm_type_is_unknown(inferred))
             continue;
+        for (uint32_t j = 0; j < ts_node_child_count(decl); j++) {
+            if (node_kind_is(ts_node_child(decl, j), "async")) {
+                const CBMType *args[] = {inferred, NULL};
+                inferred = cbm_type_template(ctx->arena, "Promise", args, 1);
+                break;
+            }
+        }
 
         // Build a new FUNC signature carrying over params from the existing one (if any).
         const char **param_names = NULL;
@@ -7337,7 +7526,14 @@ static void ts_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
         if (!d->qualified_name || !d->short_name || !d->label)
             continue;
 
-        if (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Interface") == 0) {
+        if (strcmp(d->label, "Variable") == 0) {
+            if (!reg->ts_values)
+                reg->ts_values = cbm_scope_push(arena, NULL);
+            const CBMType *value =
+                d->return_types ? parse_ts_type_text(arena, d->return_types, d->def_module_qn)
+                                : cbm_type_unknown();
+            cbm_scope_bind(reg->ts_values, d->qualified_name, value);
+        } else if (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Interface") == 0) {
             CBMRegisteredType rt;
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = d->qualified_name;
@@ -7601,6 +7797,11 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
         const CBMLSPDef *d = &defs[i];
         if (!d->qualified_name || !d->short_name || !d->label)
             continue;
+
+        if (strcmp(d->label, "Variable") == 0) {
+            ts_register_lsp_defs(arena, &reg, &defs[i], 1);
+            continue;
+        }
 
         if (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Interface") == 0) {
             CBMRegisteredType rt;

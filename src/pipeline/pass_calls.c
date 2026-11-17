@@ -1680,6 +1680,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
      * a package specifier. Suppressing only the plain-CALLS fall-through keeps
      * every Route node and service edge main-identical. */
     bool drop_plain_call =
+        call->receiver_requires_lsp ||
         (cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) &&
          !cbm_weak_member_unique_name_exempt(lang == CBM_LANG_PYTHON,
                                              call->receiver_is_self_attribute, call->callee_name,

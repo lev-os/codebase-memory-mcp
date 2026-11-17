@@ -498,6 +498,66 @@ static const char *pxc_resolve_base_qn(const pxc_base_scope_t *bs, const char *r
     return res.qualified_name;
 }
 
+/* Resolve a simple return type in its declaration's import scope, not the
+ * caller's. A generic parameter may shadow an imported type with the same
+ * spelling; extraction records that scope fact before syntax is discarded. */
+static const char *pxc_ts_return_qn(CBMArena *arena, const CBMDefinition *def,
+                                    const pxc_base_scope_t *bs, const char *module_qn) {
+    if (!bs ||
+        (bs->lang != CBM_LANG_TYPESCRIPT && bs->lang != CBM_LANG_TSX &&
+         bs->lang != CBM_LANG_JAVASCRIPT) ||
+        !def->return_type || !def->ts_return_scope_safe)
+        return NULL;
+    const char *raw = def->return_type;
+    while (*raw == ':' || *raw == ' ' || *raw == '\t')
+        raw++;
+    bool promise = strncmp(raw, "Promise<", 8) == 0;
+    const char *name = raw + (promise ? 8 : 0);
+    size_t len = strspn(name, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$");
+    if (!len || (promise ? strcmp(name + len, ">") != 0 : name[len] != '\0'))
+        return NULL;
+    /* Same-module names are already qualified by the TS parser. Only an
+     * explicit import needs rewriting, so ordinary primitive/local returns
+     * never pay for a syntax or registry lookup here. */
+    int matches = 0;
+    const CBMImport *binding = NULL;
+    for (int i = 0; bs->imports && i < bs->imports->count; i++) {
+        const char *local = bs->imports->items[i].local_name;
+        if (local && strlen(local) == len && memcmp(local, name, len) == 0) {
+            matches++;
+            binding = &bs->imports->items[i];
+        }
+    }
+    if (matches > 1 || (!matches && !def->ts_return_constructor))
+        return NULL;
+    const char *bare = cbm_arena_strndup(arena, name, len);
+    const char *qn = NULL;
+    if (binding && binding->member) {
+        const char *module = NULL;
+        for (int i = 0; i < bs->imp_count; i++) {
+            if (strcmp(bs->imp_keys[i], bare) != 0)
+                continue;
+            if (module && strcmp(module, bs->imp_vals[i]) != 0)
+                return NULL;
+            module = bs->imp_vals[i];
+        }
+        if (module) {
+            const char *candidate = cbm_arena_sprintf(arena, "%s.%s", module, binding->member);
+            if (cbm_label_is_type_like(cbm_registry_label_of(bs->reg, candidate)))
+                qn = candidate;
+            else if (cbm_label_is_type_like(cbm_registry_label_of(bs->reg, module)))
+                qn = module;
+        }
+    } else {
+        qn = pxc_resolve_base_qn(bs, bare, module_qn, def->parent_class);
+    }
+    if (!qn)
+        return NULL;
+    if (def->ts_return_constructor && strcmp(cbm_registry_label_of(bs->reg, qn), "Class") != 0)
+        return NULL;
+    return promise ? cbm_arena_sprintf(arena, "Promise<%s>", qn) : cbm_arena_strdup(arena, qn);
+}
+
 /* pxc_join_pipe over base_classes, substituting each resolved QN for its
  * source spelling. Unresolved entries pass through verbatim so a base the
  * registry does not know keeps working exactly as before. */
@@ -699,6 +759,11 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     } else {
         dst->return_types = src->return_type ? cbm_arena_strdup(arena, src->return_type) : NULL;
     }
+    const char *ts_return = pxc_ts_return_qn(arena, src, bs, module_qn);
+    if (ts_return)
+        dst->return_types = ts_return;
+    else if (src->ts_return_constructor && bs && bs->reg)
+        dst->return_types = "unknown";
     /* Languages whose cross registrars read embedded_types as QNs get their
      * bases resolved against the project registry; everyone else keeps the
      * raw source spelling their own registrar already knows how to handle. */

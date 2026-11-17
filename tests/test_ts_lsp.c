@@ -312,17 +312,16 @@ TEST(tslsp_return_inferred_local) {
     PASS();
 }
 
-/* infer_return_type_from_body visits children last-child first, so of two returns
- * the one later in the body is tried first. Pinned so that a change to the walk
- * order (#2091) is a visible decision rather than a side effect. */
-TEST(tslsp_return_walk_order_prefers_later_return) {
+/* A mixed factory cannot prove the receiver of its caller's method. The
+ * traversal order must not choose one of its return paths as the type. */
+TEST(tslsp_return_paths_must_agree) {
     CBMFileResult *r =
         extract_ts("class A { a(): void {} }\n"
                    "class B { b(): void {} }\n"
                    "function pick(f) { if (f) { return new A(); } return new B(); }\n"
                    "function go() { const x = pick(true); x.b(); }\n");
     ASSERT_NOT_NULL(r);
-    ASSERT_GTE(require_resolved(r, ".go", "b"), 0);
+    ASSERT_EQ(find_resolved(r, ".go", "b"), -1);
     cbm_free_result(r);
     PASS();
 }
@@ -5752,7 +5751,62 @@ TEST(tslsp_union_receiver_needs_one_target) {
     PASS();
 }
 
+TEST(tslsp_return_utilities_preserve_receiver_identity) {
+    const char *source =
+        "class Port { send() {} }\n"
+        "class Decoy { send() {} }\n"
+        "function make(): Port { return new Port(); }\n"
+        "async function later(): Promise<Port> { return new Port(); }\n"
+        "function direct(p: ReturnType<typeof make>) { p.send(); }\n"
+        "function awaited(p: Awaited<ReturnType<typeof later>>) { p.send(); }\n"
+        "function nested(p: Awaited<Promise<Promise<Port>>>) { p.send(); }\n"
+        "function pending(p: ReturnType<typeof later>) { p.send(); }\n"
+        "function missing(p: ReturnType<typeof absent>) { p.send(); }\n"
+        "function shadow(make: unknown) { const p: ReturnType<typeof make> = null; p.send(); }\n"
+        "function unrelated(p: Awaited<Promise<Decoy>>) { p.send(); }\n";
+    const TsLineTarget cases[] = {
+        {5, "test.main.Port.send"},
+        {6, "test.main.Port.send"},
+        {7, "test.main.Port.send"},
+        {8, NULL},
+        {9, NULL},
+        {10, NULL},
+        {11, "test.main.Decoy.send"},
+    };
+    ASSERT_TRUE(
+        ts_check_line_targets("return utilities", source, cases, sizeof(cases) / sizeof(cases[0])));
+    PASS();
+}
+
+TEST(tslsp_factory_return_scope_and_unknowns) {
+    const char *source =
+        "class Port { send() {} }\n"
+        "class Decoy { send() {} }\n"
+        "function shadow(Port: any) { return new Port(); }\n"
+        "function caught() { try {} catch (Port) { return new Port(); } }\n"
+        "function mixed(flag, unknown) { if (flag) return new Port(); return unknown; }\n"
+        "function opaque(): unknown { return new Port(); }\n"
+        "async function later() { return new Port(); }\n"
+        "function a() { shadow(null).send(); }\n"
+        "function b() { caught().send(); }\n"
+        "function c() { mixed(true, null).send(); }\n"
+        "function d() { opaque().send(); }\n"
+        "function e() { later().send(); }\n"
+        "async function f() { (await later()).send(); }\n"
+        "function empty() { function* inner() { return new Decoy(); } }\n"
+        "function g() { empty().send(); }\n";
+    const TsLineTarget cases[] = {
+        {8, NULL},  {9, NULL}, {10, NULL}, {11, NULL}, {12, NULL}, {13, "test.main.Port.send"},
+        {15, NULL},
+    };
+    ASSERT_TRUE(
+        ts_check_line_targets("factory scope", source, cases, sizeof(cases) / sizeof(cases[0])));
+    PASS();
+}
+
 SUITE(ts_lsp) {
+    RUN_TEST(tslsp_factory_return_scope_and_unknowns);
+    RUN_TEST(tslsp_return_utilities_preserve_receiver_identity);
     RUN_TEST(tslsp_unknown_named_lookup_work_is_linear);
     RUN_TEST(tslsp_nested_callback_walk_is_bounded);
     RUN_TEST(tslsp_union_receiver_needs_one_target);
@@ -5781,7 +5835,7 @@ SUITE(ts_lsp) {
     RUN_TEST(tslsp_return_simple);
     RUN_TEST(tslsp_return_chain);
     RUN_TEST(tslsp_return_inferred_local);
-    RUN_TEST(tslsp_return_walk_order_prefers_later_return);
+    RUN_TEST(tslsp_return_paths_must_agree);
     RUN_TEST(tslsp_return_async_promise);
     RUN_TEST(tslsp_return_method_no_rttype);
 

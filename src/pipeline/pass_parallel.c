@@ -3603,6 +3603,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * bound by a package specifier. Suppress only the plain-CALLS
          * fall-through so every Route node stays main-identical. */
         bool drop_plain_call =
+            call->receiver_requires_lsp ||
             (cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) &&
              !cbm_weak_member_unique_name_exempt(lang == CBM_LANG_PYTHON,
                                                  call->receiver_is_self_attribute,

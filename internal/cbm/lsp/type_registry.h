@@ -106,6 +106,7 @@ typedef struct CBMTypeRegistry {
     int type_cap;
 
     CBMArena *arena; // owns all string data
+    struct CBMScope *ts_values; // TS module values, separate from nominal types; arena-owned.
 
     /* Optional fallback registry (Tier 2 two-level lookup). When a
      * lookup misses in this registry, it chains to `fallback`. Used by

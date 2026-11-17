@@ -1810,7 +1810,8 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      and a union receiver needs one shared declaration. Unchanged files
  *      rebuild once to drop unproven typed-receiver call edges.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 21 };
+/* 22: factory returns and return utilities preserve typed receiver identity. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 22 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

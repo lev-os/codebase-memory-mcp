@@ -36764,6 +36764,191 @@ TEST(pipeline_js_this_call_in_arrow_reaches_class_method) {
     PASS();
 }
 
+/* Return facts survive imports, provider edits and unchanged-provider reuse.
+ * An unknown constructor or a value/type name collision cannot supply a method. */
+TEST(pipeline_ts_factory_returns_keep_import_identity) {
+    char tmp[256] = "/tmp/cbm_ts_factory_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "types.ts",
+                    "export class Port { send() {} }\n"
+                    "export class Other { send() {} }\n"
+                    "export interface Shared { send(): void }\n"
+                    "export const Shared: any = null;\n"
+                    "export function unproven() { return new Shared(); }\n");
+    const char *factory_body =
+        "export function make() { return new Wire(); }\n"
+        "export async function later() { return new Wire(); }\n"
+        "export function declared(): Wire { return new Wire(); }\n"
+        "export class Builder { context<T>() { return new Builder(); } make() { return new Wire(); "
+        "} }\n"
+        "export function mixed(flag: boolean) { if (flag) return new Wire(); return new Other(); "
+        "}\n"
+        "export function opaque(): unknown { return new Wire(); }\n"
+        "export function shadow(Wire: any) { return new Wire(); }\n"
+        "export function caught() { try { throw 0; } catch (Wire) { return new Wire(); } }\n"
+        "export function generic<Wire>(value: Wire): Wire { return value; }\n"
+        "export const seed = new Builder();\n"
+        "export let changing = new Builder(); changing = opaque();\n"
+        "export function context(): Other { return new Other(); }\n"
+        "function produce(): Wire { return new Wire(); }\n"
+        "export function deferred(): ReturnType<typeof produce> { return produce(); }\n";
+    char factory[2048];
+    snprintf(factory, sizeof(factory), "import { Port as Wire, Other } from './types';\n%s",
+             factory_body);
+    write_temp_file(tmp, "factory.ts", factory);
+    write_temp_file(tmp, "decoy.ts",
+                    "export class Port { send() {} }\n"
+                    "export class Wire { send() {} }\n");
+    write_temp_file(tmp, "seed.ts",
+                    "import { Port } from './types';\n"
+                    "export const seed = new Port();\n");
+    write_temp_file(tmp, "namespaces.ts",
+                    "import * as seed from './factory';\n"
+                    "import { Shared, unproven } from './types';\n"
+                    "import { seed as same } from './seed';\n"
+                    "import { deferred } from './factory';\n"
+                    "class Decoy { send() {} }\n"
+                    "function produce(): Decoy { return new Decoy(); }\n"
+                    "export function throughNamespace() { seed.declared().send(); }\n"
+                    "export function throughType(p: Shared) { p.send(); }\n"
+                    "export function throughSameStem() { same.send(); }\n"
+                    "export function foreignQuery() { deferred().send(); }\n"
+                    "export function throughUnknownCtor() { unproven().send(); }\n");
+    write_temp_file(tmp, "main.ts",
+                    "import { make, later, declared, Builder, mixed, opaque, shadow, caught, "
+                    "generic, seed, changing } from './factory';\n"
+                    "export function inferred() { make().send(); }\n"
+                    "export async function awaited() { (await later()).send(); }\n"
+                    "export function typed() { declared().send(); }\n"
+                    "export function method(b: Builder) { b.make().send(); }\n"
+                    "export function pending() { later().send(); }\n"
+                    "export function ambiguous() { mixed(true).send(); }\n"
+                    "export function unknown() { opaque().send(); }\n"
+                    "export function dynamic() { shadow(null).send(); }\n"
+                    "export function catchShadow() { caught().send(); }\n"
+                    "export function utility(p: ReturnType<typeof make>) { p.send(); }\n"
+                    "export function chain() { seed.context<string>().make().send(); }\n"
+                    "export function mutable() { changing.context().make().send(); }\n"
+                    "export function parameter() { generic(null).send(); }\n"
+                    "export function constructed() { new seed().send(); }\n");
+    char db[512], got[1024];
+    snprintf(db, sizeof(db), "%s/g.db", tmp);
+    const char *callers[] = {"inferred", "awaited", "typed",   "method", NULL, NULL, NULL,
+                             NULL,       NULL,      "utility", "chain",  NULL, NULL, NULL};
+    bool ok = true;
+    for (int phase = 0; phase < 3; phase++) {
+        if (phase == 1) {
+            snprintf(factory, sizeof(factory),
+                     "import { Other as Wire, Other } from './types';\n%s", factory_body);
+            write_temp_file(tmp, "factory.ts", factory);
+        }
+        if (phase == 1) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/factory.ts", tmp);
+            ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000, 0), 0);
+        }
+        if (phase == 2)
+            write_temp_file(
+                tmp, "later.ts",
+                "import { make } from './factory'; import { unproven } from './types';\n"
+                "export function added() { make().send(); }\n"
+                "export function rejected() { unproven().send(); }\n");
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(p);
+        ASSERT_EQ(cbm_pipeline_run(p), 0);
+        const char *project = cbm_pipeline_project_name(p);
+        for (int i = 0; i < 14; i++) {
+            js_twin_rows(db, project,
+                         "SELECT s.qualified_name, t.qualified_name FROM edges e "
+                         "JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id "
+                         "WHERE e.project = ?1 AND e.type = 'CALLS' "
+                         "AND json_extract(e.properties, '$.line') = ?2 "
+                         "AND substr(s.file_path, -length(?3)) = ?3 AND t.label = 'Method' "
+                         "AND (?4 = '' OR t.name = ?4) ORDER BY 1, 2",
+                         i + 2, "main.ts", callers[i] ? "send" : "", true, got, sizeof(got));
+            char want[256] = "";
+            if (callers[i])
+                snprintf(want, sizeof(want), "main.%s -> types.%s.send", callers[i],
+                         phase ? "Other" : "Port");
+            ok = js_twin_expect("factory return", got, want) && ok;
+            if (i == 11 || i == 13) {
+                js_twin_calls_at(db, project, "main.ts", i + 2, got, sizeof(got));
+                ok = js_twin_expect("unknown imported instance", got, "") && ok;
+            }
+        }
+        const char *extra_callers[] = {"throughNamespace", "throughType", "throughSameStem", NULL,
+                                       NULL};
+        const char *extra_types[] = {phase ? "Other" : "Port", "Shared", "Port", NULL, NULL};
+        for (int i = 0; i < 5; i++) {
+            js_twin_rows(db, project,
+                         "SELECT s.qualified_name, t.qualified_name FROM edges e "
+                         "JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id "
+                         "WHERE e.project = ?1 AND e.type = 'CALLS' "
+                         "AND json_extract(e.properties, '$.line') = ?2 "
+                         "AND substr(s.file_path, -length(?3)) = ?3 AND t.name = ?4 ORDER BY 1, 2",
+                         i + 7, "namespaces.ts", "send", true, got, sizeof(got));
+            char want[256] = "";
+            if (extra_callers[i])
+                snprintf(want, sizeof(want), "namespaces.%s -> types.%s.send", extra_callers[i],
+                         extra_types[i]);
+            ok = js_twin_expect("return namespace", got, want) && ok;
+        }
+        if (phase == 2) {
+            for (int line = 2; line <= 3; line++) {
+                js_twin_rows(
+                    db, project,
+                    "SELECT s.qualified_name, t.qualified_name FROM edges e "
+                    "JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id "
+                    "WHERE e.project = ?1 AND e.type = 'CALLS' "
+                    "AND json_extract(e.properties, '$.line') = ?2 "
+                    "AND substr(s.file_path, -length(?3)) = ?3 AND t.name = ?4 ORDER BY 1, 2",
+                    line, "later.ts", "send", true, got, sizeof(got));
+                ok = js_twin_expect("persisted factory return", got,
+                                    line == 2 ? "later.added -> types.Other.send" : "") &&
+                     ok;
+            }
+        }
+        cbm_pipeline_free(p);
+    }
+    th_rmtree(tmp);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_ts_return_utilities_follow_imports) {
+    char tmp[256] = "/tmp/cbm_ts_return_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "factory.ts",
+                    "export class Port { send() {} }\n"
+                    "export function make(): Port { return new Port(); }\n"
+                    "export async function later(): Promise<Port> { return new Port(); }\n");
+    write_temp_file(tmp, "decoy.ts",
+                    "export class Port { send() {} }\n"
+                    "export function make(): Port { return new Port(); }\n");
+    write_temp_file(tmp, "main.ts",
+                    "import { make as build, later } from './factory';\n"
+                    "export function direct(p: ReturnType<typeof build>) { p.send(); }\n"
+                    "export function awaited(p: Awaited<ReturnType<typeof later>>) { p.send(); }\n"
+                    "export function pending(p: ReturnType<typeof later>) { p.send(); }\n"
+                    "export function unknown(p: ReturnType<typeof missing>) { p.send(); }\n");
+    char db[512], got[1024];
+    snprintf(db, sizeof(db), "%s/g.db", tmp);
+    cbm_pipeline_t *p = js_twin_index(tmp, db);
+    ASSERT_NOT_NULL(p);
+    const char *project = cbm_pipeline_project_name(p);
+    bool ok = true;
+    const char *want[] = {"main.direct -> factory.Port.send", "main.awaited -> factory.Port.send",
+                          "", ""};
+    for (int i = 0; i < 4; i++) {
+        js_twin_calls_at(db, project, "main.ts", i + 2, got, sizeof(got));
+        ok = js_twin_expect("imported return utility", got, want[i]) && ok;
+    }
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 /* Index-file symbols belong to the folder, while ordinary files keep their
  * stem. Both paths must resolve the same calls by type, even with namesakes
  * elsewhere. Compare the complete target/strategy rows at each call site so
@@ -37413,6 +37598,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_twin_insert_incremental_equals_full);
     RUN_TEST(pipeline_js_top_level_declaration_keeps_plain_name);
     RUN_TEST(pipeline_js_this_call_in_arrow_reaches_class_method);
+    RUN_TEST(pipeline_ts_factory_returns_keep_import_identity);
+    RUN_TEST(pipeline_ts_return_utilities_follow_imports);
     RUN_TEST(pipeline_ts_index_file_resolver_matches_main);
     RUN_TEST(pipeline_js_this_in_nested_function_is_not_the_class);
     RUN_TEST(pipeline_js_this_boundaries_and_arrows_are_exact);

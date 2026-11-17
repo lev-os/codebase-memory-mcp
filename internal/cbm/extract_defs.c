@@ -5853,6 +5853,162 @@ static size_t c_rt_render(c_rt_out_t *out, TSNode func_node, TSNode type_node, T
     return added;
 }
 
+/* Import qualification requires a type spelling without a generic shadow. */
+static bool ts_return_scope_safe(CBMExtractCtx *ctx, TSNode fn) {
+    if (ctx->language != CBM_LANG_TYPESCRIPT && ctx->language != CBM_LANG_TSX &&
+        ctx->language != CBM_LANG_JAVASCRIPT)
+        return false;
+    int depth = 0;
+    for (TSNode p = fn; !ts_node_is_null(p); p = ts_node_parent(p)) {
+        if (++depth > 64)
+            return false;
+        if (!ts_node_is_null(ts_node_child_by_field_name(p, TS_FIELD("type_parameters"))))
+            return false;
+    }
+    return true;
+}
+
+/* Carry a consistent returned constructor to the cross-file class check.
+ * Mixed/unknown returns and local constructor bindings fail closed. */
+static const char *ts_constructor_return(CBMExtractCtx *ctx, TSNode fn) {
+    if (ctx->language != CBM_LANG_TYPESCRIPT && ctx->language != CBM_LANG_TSX &&
+        ctx->language != CBM_LANG_JAVASCRIPT)
+        return NULL;
+    if (strstr(ts_node_type(fn), "generator"))
+        return NULL;
+    for (TSNode p = ts_node_parent(fn); !ts_node_is_null(p); p = ts_node_parent(p)) {
+        const char *kind = ts_node_type(p);
+        if (strcmp(kind, "statement_block") == 0 || strcmp(kind, "class") == 0 ||
+            strcmp(kind, "function") == 0 || strstr(kind, "generator") ||
+            strcmp(kind, "function_declaration") == 0 || strcmp(kind, "function_expression") == 0 ||
+            strcmp(kind, "arrow_function") == 0 || strcmp(kind, "method_definition") == 0 ||
+            strcmp(kind, "internal_module") == 0)
+            return NULL;
+    }
+    TSNode body = ts_node_child_by_field_name(fn, TS_FIELD("body"));
+    if (ts_node_is_null(body))
+        return NULL;
+    /* Most unannotated callables contain no constructor at all. Avoid a
+     * second syntax walk for that common case. */
+    bool has_new = false;
+    uint32_t body_end = ts_node_end_byte(body);
+    for (uint32_t i = ts_node_start_byte(body); i + 3 <= body_end; i++) {
+        if (memcmp(ctx->source + i, "new", 3) == 0) {
+            has_new = true;
+            break;
+        }
+    }
+    if (!has_new)
+        return NULL;
+    const char *constructor = NULL;
+    bool valid = true;
+    TSTreeCursor cursor = ts_tree_cursor_new(body);
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        bool descend = true;
+        TSNode value = {0};
+        if (strcmp(kind, "return_statement") == 0) {
+            value = ts_node_named_child(node, 0);
+            descend = false;
+            if (ts_node_is_null(value)) {
+                valid = false;
+                break;
+            }
+        } else if (ts_node_eq(node, body) && strcmp(kind, "statement_block") != 0) {
+            value = node;
+            descend = false;
+        } else if (strcmp(kind, "function_declaration") == 0 ||
+                   strcmp(kind, "function_expression") == 0 || strcmp(kind, "function") == 0 ||
+                   strcmp(kind, "arrow_function") == 0 || strcmp(kind, "method_definition") == 0 ||
+                   strcmp(kind, "class_declaration") == 0 || strstr(kind, "generator")) {
+            descend = false;
+        }
+        if (!ts_node_is_null(value)) {
+            if (strcmp(ts_node_type(value), "new_expression") != 0) {
+                valid = false;
+                break;
+            }
+            TSNode ctor = ts_node_child_by_field_name(value, TS_FIELD("constructor"));
+            if (ts_node_is_null(ctor) || strcmp(ts_node_type(ctor), "identifier") != 0) {
+                valid = false;
+                break;
+            }
+            const char *name = cbm_node_text(ctx->arena, ctor, ctx->source);
+            if (!name || (constructor && strcmp(name, constructor) != 0)) {
+                valid = false;
+                break;
+            }
+            constructor = name;
+        }
+        if (descend && ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor))
+                goto returns_done;
+        }
+    }
+returns_done:
+    ts_tree_cursor_delete(&cursor);
+    if (!valid || !constructor)
+        return NULL;
+
+    /* Reject a shadow anywhere in the callable, including a nested block or
+     * parameter pattern. This is deliberately conservative across siblings. */
+    cursor = ts_tree_cursor_new(fn);
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        TSNode binding = {0};
+        if (strcmp(kind, "variable_declarator") == 0 || strcmp(kind, "class_declaration") == 0 ||
+            strcmp(kind, "function_declaration") == 0)
+            binding = ts_node_child_by_field_name(node, TS_FIELD("name"));
+        else if (strcmp(kind, "required_parameter") == 0 || strcmp(kind, "optional_parameter") == 0)
+            binding = ts_node_child_by_field_name(node, TS_FIELD("pattern"));
+        else if (strcmp(kind, "assignment_expression") == 0 ||
+                 strcmp(kind, "augmented_assignment_expression") == 0)
+            binding = ts_node_child_by_field_name(node, TS_FIELD("left"));
+        else if (strcmp(kind, "formal_parameters") == 0)
+            binding = node; /* JS parameters can be bare identifiers. */
+        else if (strcmp(kind, "catch_clause") == 0)
+            binding = ts_node_child_by_field_name(node, TS_FIELD("parameter"));
+        if (!ts_node_is_null(binding)) {
+            uint32_t start = ts_node_start_byte(binding), end = ts_node_end_byte(binding);
+            size_t len = strlen(constructor);
+            /* An identifier occurrence in the pattern is enough to withhold
+             * inference; matching type names is a safe false negative. */
+            for (uint32_t i = start; i + len <= end; i++) {
+                if (memcmp(ctx->source + i, constructor, len) == 0 &&
+                    (i == start || !(isalnum((unsigned char)ctx->source[i - 1]) ||
+                                     ctx->source[i - 1] == '_' || ctx->source[i - 1] == '$')) &&
+                    (i + len == end ||
+                     !(isalnum((unsigned char)ctx->source[i + len]) ||
+                       ctx->source[i + len] == '_' || ctx->source[i + len] == '$'))) {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        if (!valid)
+            break;
+        if (ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor))
+                goto shadows_done;
+        }
+    }
+shadows_done:
+    ts_tree_cursor_delete(&cursor);
+    if (!valid)
+        return NULL;
+    for (uint32_t i = 0; i < ts_node_child_count(fn); i++) {
+        if (strcmp(ts_node_type(ts_node_child(fn, i)), "async") == 0)
+            return cbm_arena_sprintf(ctx->arena, "Promise<%s>", constructor);
+    }
+    return constructor;
+}
+
 /* Declared return type of a C-family function/method node whose `type` field is
  * `type_node`. Any other language, and any type with nothing around its base
  * type, gets the base type text exactly as before. */
@@ -7137,6 +7293,15 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
             def.return_type = c_declared_return_type(ctx, func_node, rt);
             def.return_types = extract_return_types(a, rt, ctx->source, ctx->language);
             break;
+        }
+    }
+
+    def.ts_return_scope_safe = ts_return_scope_safe(ctx, func_node);
+    if (!def.return_type) {
+        def.return_type = ts_constructor_return(ctx, func_node);
+        if (def.return_type) {
+            def.ts_return_scope_safe = true; /* a constructor is a value, not a type parameter */
+            def.ts_return_constructor = true;
         }
     }
 
@@ -9456,6 +9621,15 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
         }
     }
 
+    def.ts_return_scope_safe = ts_return_scope_safe(ctx, child);
+    if (!def.return_type) {
+        def.return_type = ts_constructor_return(ctx, child);
+        if (def.return_type) {
+            def.ts_return_scope_safe = true;
+            def.ts_return_constructor = true;
+        }
+    }
+
     // ObjectScript: return type is method_definition -> return_type -> typename.
     if (!def.return_type && (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL ||
                              ctx->language == CBM_LANG_OBJECTSCRIPT_ROUTINE)) {
@@ -11015,6 +11189,31 @@ static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
                 }
                 int before = ctx->result->defs.count;
                 push_var_def(ctx, cbm_node_text(a, vname, ctx->source), child);
+                /* An immutable module instance is a receiver, not a namespace.
+                 * Preserve its declared type, or the exact bare constructor.
+                 * A let/var or a nested binding has no cross-file value proof. */
+                TSNode parent = ts_node_parent(node);
+                if (strcmp(ts_node_type(parent), "export_statement") == 0)
+                    parent = ts_node_parent(parent);
+                TSNode decl_kind = ts_node_child_by_field_name(node, TS_FIELD("kind"));
+                if (ctx->result->defs.count > before && !ts_node_is_null(parent) &&
+                    strcmp(ts_node_type(parent), "program") == 0 &&
+                    js_node_text_is(decl_kind, ctx->source, "const")) {
+                    CBMDefinition *def = &ctx->result->defs.items[before];
+                    def->ts_return_scope_safe = true;
+                    TSNode type = ts_node_child_by_field_name(child, TS_FIELD("type"));
+                    if (!ts_node_is_null(type)) {
+                        def->return_type = cbm_node_text(a, type, ctx->source);
+                    } else if (!ts_node_is_null(value) &&
+                               strcmp(ts_node_type(value), "new_expression") == 0) {
+                        TSNode ctor = ts_node_child_by_field_name(value, TS_FIELD("constructor"));
+                        if (!ts_node_is_null(ctor) &&
+                            strcmp(ts_node_type(ctor), "identifier") == 0) {
+                            def->return_type = cbm_node_text(a, ctor, ctx->source);
+                            def->ts_return_constructor = true;
+                        }
+                    }
+                }
                 if (ctx->result->defs.count > before &&
                     js_is_axios_create_call(value, ctx->source)) {
                     js_mark_axios_client(a, &ctx->result->defs.items[before], value, ctx->source);
@@ -15276,6 +15475,19 @@ static void js_rebind_row_callers(CBMFileResult *r) {
         }
         if (one_holder && strcmp(rc->caller_qn, holder) != 0) {
             rc->caller_qn = holder;
+        }
+        if (one_holder && rc->reason &&
+            (strcmp(rc->reason, "ts_import_value_receiver") == 0 ||
+             strcmp(rc->reason, "ts_value_not_constructor") == 0)) {
+            /* An exact negative receiver fact must survive the name-based
+             * fallback, in sequential and parallel pipelines alike. */
+            for (const CBMCall **h = hit; h < sites + n && js_call_site_cmp(h, &key) == 0; h++) {
+                CBMCall *call = &r->calls.items[*h - r->calls.items];
+                if (strcmp(rc->reason, "ts_value_not_constructor") == 0)
+                    call->requires_lsp_resolution = true;
+                else
+                    call->receiver_requires_lsp = true;
+            }
         }
     }
     free(sites);
