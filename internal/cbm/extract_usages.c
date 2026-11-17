@@ -869,6 +869,7 @@ static bool is_exact_language_binding(CBMExtractCtx *ctx, TSNode node, WalkState
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
     case CBM_LANG_ARKTS:
+        if (!ts_node_is_null(cbm_js_header_binding(node))) return true;
         for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
              parent = ts_node_parent(parent)) {
             const char *kind = ts_node_type(parent);
@@ -2079,6 +2080,10 @@ static bool js_var_binding(TSNode node) {
     for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
          parent = ts_node_parent(parent)) {
         const char *kind = ts_node_type(parent);
+        if (strcmp(kind, "for_in_statement") == 0) {
+            TSNode declaration = ts_node_child_by_field_name(parent, TS_FIELD("kind"));
+            return !ts_node_is_null(declaration) && strcmp(ts_node_type(declaration), "var") == 0;
+        }
         if (strcmp(kind, "variable_declaration") == 0) {
             return true;
         }
@@ -2092,6 +2097,9 @@ static bool js_var_binding(TSNode node) {
 /* Select the same AST scope as the same-name callable binder. Concrete
  * lexical IDs remain private to this walk, but their byte spans must agree. */
 static uint32_t js_declaration_scope_id(const WalkState *state, TSNode node, bool is_var) {
+    TSNode header = cbm_js_header_binding(node);
+    if (!ts_node_is_null(header) && strcmp(ts_node_type(header), "catch_clause") == 0)
+        return active_lexical_scope_id(state);
     for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
          parent = ts_node_parent(parent)) {
         TSNode owner = cbm_js_scope_node(parent, is_var);

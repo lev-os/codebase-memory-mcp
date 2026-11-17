@@ -14830,16 +14830,8 @@ static void js_twin_pattern_decls(js_twin_walk_t *w, TSNode pat, uint32_t lo, ui
         js_twin_add_decl(w, pat, lo, hi, (TSNode){0}, true);
         return;
     }
-    TSNode sub = {0};
-    if (strcmp(k, "required_parameter") == 0 || strcmp(k, "optional_parameter") == 0) {
-        sub = ts_node_child_by_field_name(pat, TS_FIELD("pattern"));
-    } else if (strcmp(k, "assignment_pattern") == 0 ||
-               strcmp(k, "object_assignment_pattern") == 0) {
-        sub = ts_node_child_by_field_name(pat, TS_FIELD("left"));
-    } else if (strcmp(k, "pair_pattern") == 0) {
-        sub = ts_node_child_by_field_name(pat, TS_FIELD("value"));
-    } else if (strcmp(k, "formal_parameters") == 0 || strcmp(k, "object_pattern") == 0 ||
-               strcmp(k, "array_pattern") == 0 || strcmp(k, "rest_pattern") == 0) {
+    TSNode sub = cbm_js_pattern_child(pat);
+    if (cbm_js_pattern_container(k)) {
         uint32_t nc = ts_node_named_child_count(pat);
         for (uint32_t i = 0; i < nc; i++) {
             js_twin_pattern_decls(w, ts_node_named_child(pat, i), lo, hi, depth + SKIP_ONE);

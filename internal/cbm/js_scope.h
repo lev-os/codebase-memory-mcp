@@ -30,6 +30,15 @@ static inline TSNode cbm_js_scope_node(TSNode node, bool var_scope) {
         return node;
     return (TSNode){0};
 }
+static inline bool cbm_js_program_is_module(TSNode root) {
+    for (uint32_t i = 0; i < ts_node_named_child_count(root); i++) {
+        const char *kind = ts_node_type(ts_node_named_child(root, i));
+        if (strcmp(kind, "import_statement") == 0 || strcmp(kind, "export_statement") == 0)
+            return true;
+    }
+    return false;
+}
+
 /* One pattern model for both same-name declarations and lexical bindings.
  * Keys and default-value expressions are not binding patterns. */
 static inline bool cbm_js_pattern_container(const char *kind) {
@@ -60,14 +69,23 @@ static inline bool cbm_js_pattern_binds(TSNode pattern, TSNode leaf, int depth) 
     return cbm_js_pattern_binds(cbm_js_pattern_child(pattern), leaf, depth + 1);
 }
 
-
-static inline bool cbm_js_program_is_module(TSNode root) {
-    for (uint32_t i = 0; i < ts_node_named_child_count(root); i++) {
-        const char *kind = ts_node_type(ts_node_named_child(root, i));
-        if (strcmp(kind, "import_statement") == 0 || strcmp(kind, "export_statement") == 0)
-            return true;
+/* Only declarations: `for (run of xs)` writes a name, it declares none. */
+static inline TSNode cbm_js_header_binding(TSNode leaf) {
+    for (TSNode parent = ts_node_parent(leaf); !ts_node_is_null(parent);
+         parent = ts_node_parent(parent)) {
+        const char *kind = ts_node_type(parent);
+        TSNode pattern = {0};
+        if (strcmp(kind, "catch_clause") == 0)
+            pattern = ts_node_child_by_field_name(parent, "parameter", 9);
+        else if (strcmp(kind, "for_in_statement") == 0 &&
+                 !ts_node_is_null(ts_node_child_by_field_name(parent, "kind", 4)))
+            pattern = ts_node_child_by_field_name(parent, "left", 4);
+        else if (strcmp(kind, "variable_declarator") == 0 || cbm_js_bodied_kind(kind))
+            return (TSNode){0};
+        if (!ts_node_is_null(pattern))
+            return cbm_js_pattern_binds(pattern, leaf, 0) ? parent : (TSNode){0};
     }
-    return false;
+    return (TSNode){0};
 }
 
 #endif

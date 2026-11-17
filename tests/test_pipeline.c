@@ -15899,6 +15899,30 @@ static int check_x11b_project_globals(bool parallel) {
 TEST(pipeline_x11b_project_globals) { return check_x11b_project_globals(false); }
 TEST(pipeline_x11b_project_globals_parallel) { return check_x11b_project_globals(true); }
 
+static int check_x11b_binding_scopes(bool parallel) {
+    static const ng_file_t files[] = {
+        {"src/bindings.js", "function run() { return 'decoy'; }\n"
+         "export function caught(cb) { try { throw cb; } catch (run) { run(); } }\n"
+         "export function caughtPattern(cb) { try { throw cb; } catch ({ run }) { run(); } }\n"
+         "export function each(cbs) { for (const run of cbs) run(); }\n"
+         "export function keys(cbs) { for (let run in cbs) run(); }\n"
+         "export function loop(cb) { for (let run = cb; run; ) { run(); break; } }\n"
+         "export function after(cbs) { for (const run of cbs) run(); return run(); }\n"},
+    };
+    static const ng_pair_t pairs[] = {
+        {"bindings.caught", "*", 0, "catch binding"},
+        {"bindings.caughtPattern", "*", 0, "catch pattern binding"},
+        {"bindings.each", "*", 0, "for-of binding"},
+        {"bindings.keys", "*", 0, "for-in binding"},
+        {"bindings.loop", "*", 0, "for header binding"},
+        {"bindings.after", "bindings.run", 1, "loop binding does not escape"},
+        {"bindings.after", "*", 1, "complete outgoing set"},
+    };
+    return ng_check(files, 1, pairs, 7, parallel);
+}
+TEST(pipeline_x11b_binding_scopes) { return check_x11b_binding_scopes(false); }
+TEST(pipeline_x11b_binding_scopes_parallel) { return check_x11b_binding_scopes(true); }
+
 /* A member call on a receiver the TS resolver typed as a built-in
  * (`const rows: number[] = []; rows.push(1)`, a `Map`, an array parameter)
  * names the built-in's method. Before, the resolver's Array.push had no graph
@@ -38237,6 +38261,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_x11b_import_values_parallel);
     RUN_TEST(pipeline_x11b_project_globals);
     RUN_TEST(pipeline_x11b_project_globals_parallel);
+    RUN_TEST(pipeline_x11b_binding_scopes);
+    RUN_TEST(pipeline_x11b_binding_scopes_parallel);
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
 #endif
     RUN_TEST(pipeline_x11b_reassigned);
