@@ -1563,10 +1563,15 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
         }
     }
 
-    /* A Rust call the LSP placed on an EXTERNAL symbol has no graph node. The
-     * textual registry must not bind it to a same-named project method. */
-    bool rust_external = lsp && cbm_pipeline_rust_external_target(
-                                    lang, lsp->strategy, lsp->callee_qn, ctx->project_name);
+    /* A Rust call the LSP placed on an EXTERNAL symbol, or a TS/JS call the TS
+     * resolver placed on a built-in method (Array.push), has no graph node.
+     * The textual registry must not bind it to a same-named project method.
+     * MUST match pass_parallel.c. */
+    bool rust_external =
+        lsp && (cbm_pipeline_rust_external_target(lang, lsp->strategy, lsp->callee_qn,
+                                                  ctx->project_name) ||
+                cbm_pipeline_ts_builtin_target(lang, lsp->strategy, lsp->callee_qn,
+                                               ctx->project_name));
     cbm_resolution_t res = {0};
     if (swift_candidates >= 0) {
         res = calls_registry_resolution(ctx, call, module_qn, imp_keys, imp_vals, imp_count, lang,

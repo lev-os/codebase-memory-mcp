@@ -1814,11 +1814,19 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
 /* 23: captured receiver types may use a proof that every write agrees. */
 /* 24: calls through an imported plain object literal resolve as namespace
  *     members again. */
-/* 25: exact JS/TS recursive invocations retain their self CALLS edge. */
-/* 26: JS/TS literal callable keys share unquoted names and keep numeric keys. */
-/* 27: JS/TS generator expressions own their definitions and call scopes. */
-/* 28: JS/TS keyword calls require binding; name guesses cannot call type aliases. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 28 };
+/* 25: TS/JS name guesses give the exact target or no edge: a call the TS
+ *     resolver placed on a built-in method, a method of an array literal or
+ *     of `new Map()`-style runtime instance, and `this.x()` in a class whose
+ *     base is no project class, bind no same-named project callable; a bare
+ *     call through a parameter or a local value binds none; an unbound bare
+ *     name of a module binds only a definition of its file, and a type, or
+ *     a method by a bare name, never. Unchanged files rebuild once to drop
+ *     those edges. */
+/* 26: exact JS/TS recursive invocations retain their self CALLS edge. */
+/* 27: JS/TS literal callable keys share unquoted names and keep numeric keys. */
+/* 28: JS/TS generator expressions own their definitions and call scopes. */
+/* 29: JS/TS keyword calls require binding; name guesses cannot call type aliases. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 29 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

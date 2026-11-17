@@ -935,6 +935,29 @@ static inline bool cbm_pipeline_rust_external_target(CBMLanguage lang, const cha
     return !(strncmp(callee_qn, project_name, proj_len) == 0 && callee_qn[proj_len] == '.');
 }
 
+/* TS/JS: true when the TS resolver typed the receiver as a built-in type of
+ * the runtime and placed the member call on that type's method
+ * (`rows.push(1)` on `rows: number[]` -> Array.push, `cache.get(k)` on a Map
+ * -> Map.get). The resolver registers its built-in methods under bare QNs
+ * ("Array.push") and every project definition under the project prefix, so
+ * such a row names no graph node. Before this gate the callers then fell back
+ * to the textual registry, whose same-module lookup dropped the receiver
+ * (`rows.push` -> this file's `push`) or whose qualified suffix matched an
+ * unrelated `rows.push` of another file. The call gets no CALLS edge, as for
+ * Rust above. A project-prefixed QN that only failed the graph lookup keeps
+ * the registry fallback, and so does every other strategy. Pure. */
+static inline bool cbm_pipeline_ts_builtin_target(CBMLanguage lang, const char *strategy,
+                                                  const char *callee_qn,
+                                                  const char *project_name) {
+    if ((lang != CBM_LANG_JAVASCRIPT && lang != CBM_LANG_TYPESCRIPT && lang != CBM_LANG_TSX) ||
+        !strategy || strcmp(strategy, "lsp_ts_method") != 0 || !callee_qn || !callee_qn[0] ||
+        !project_name || !project_name[0]) {
+        return false;
+    }
+    size_t proj_len = strlen(project_name);
+    return !(strncmp(callee_qn, project_name, proj_len) == 0 && callee_qn[proj_len] == '.');
+}
+
 /* Resolvers may report one graph target both project-relative and already
  * project-prefixed. Raw string inequality is not ambiguity when both spellings
  * resolve to the same materialized node; conversely, if both nodes exist they
