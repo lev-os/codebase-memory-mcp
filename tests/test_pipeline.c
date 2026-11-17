@@ -32814,7 +32814,7 @@ TEST(pipeline_python_namespace_change_admission) {
     }
     int body = -9, signature = -9, alias = -9, order = -9;
     int empty = -9, literal = -9, unknown = -9, deletion = -9, transition = -9;
-    const char *non_python = "{\"v\":4,\"lang\":0,\"lsp\":[],\"reg\":[],\"py\":null}";
+    const char *non_python = "{\"v\":5,\"lang\":0,\"lsp\":[],\"reg\":[],\"py\":null}";
     if (complete) {
         body = cbm_lsp_surface_python_change(json[0], json[1]);
         signature = cbm_lsp_surface_python_change(json[0], json[2]);
@@ -32945,24 +32945,24 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
      * it re-extracts in full. */
     const char *bad[] = {
         "{\"v\":1,\"lsp\":[]}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[]}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":null}",
-        "{\"v\":4,\"lang\":1.0,\"lsp\":[],\"py\":null}",
-        "{\"v\":4,\"v\":4,\"lang\":0,\"lsp\":[],\"py\":null}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[]}",
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":null}",
+        "{\"v\":5,\"lang\":1.0,\"lsp\":[],\"py\":null}",
+        "{\"v\":5,\"v\":5,\"lang\":0,\"lsp\":[],\"py\":null}",
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":3,\"failure\":2,\"events\":[]}}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":99,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":99,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\\u0000suffix\",\"status\":2,"
         "\"failure\":0,\"events\":[]}}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":999,\"d\":0,\"s\":0,\"r\":0,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":8,\"d\":0,\"s\":1,\"r\":0,\"f\":0,\"l\":4294967296,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
@@ -32982,7 +32982,7 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
         cbm_arena_destroy(&arena);
     }
     const char *unknown =
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":7,\"d\":0,\"s\":0,\"r\":7,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}";
@@ -33010,7 +33010,7 @@ TEST(pipeline_lsp_surface_large_object_array_decode) {
     const size_t capacity = (size_t)count * 192 + 64;
     char *json = malloc(capacity);
     ASSERT_NOT_NULL(json);
-    size_t used = (size_t)snprintf(json, capacity, "{\"v\":4,\"lang\":0,\"py\":null,\"lsp\":[");
+    size_t used = (size_t)snprintf(json, capacity, "{\"v\":5,\"lang\":0,\"py\":null,\"lsp\":[");
     for (int i = 0; i < count; i++) {
         int n = snprintf(json + used, capacity - used,
                          "%s{\"qn\":\"pkg.f%d\",\"sn\":\"f%d\",\"lb\":\"Function\","
@@ -33100,10 +33100,10 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
         ASSERT_TRUE(row_a->surface_sha && row_a->surface_sha[0]);
         if (round == 0) {
             snprintf(sha_baseline, sizeof(sha_baseline), "%s", row_a->surface_sha);
-            /* The row is the versioned codec envelope (codec version 4) with
+            /* The row is the versioned codec envelope (codec version 5) with
              * the def present. */
             snprintf(json_probe, sizeof(json_probe), "%.20s", row_a->defs_json);
-            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":4") != NULL);
+            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":5") != NULL);
             ASSERT_TRUE(strstr(row_a->defs_json, "surface_probe") != NULL);
         } else if (round == 1) {
             ASSERT_STR_EQ(row_a->surface_sha, sha_baseline);
@@ -36915,6 +36915,82 @@ TEST(pipeline_ts_factory_returns_keep_import_identity) {
     PASS();
 }
 
+/* An imported object literal owns its methods. A namespace, annotation,
+ * spread, accessor, computed/duplicate key or mutable value cannot borrow them. */
+TEST(pipeline_ts_object_exports_keep_owned_methods) {
+    char tmp[256] = "/tmp/cbm_ts_object_exports_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    const char *library = "export class Port { send() {} }\n"
+                          "export function send() {}\n"
+                          "export const api = { send() {}, close: () => {}, make(): Port { return "
+                          "new Port(); } %s };\n"
+                          "export const opaque: any = { send() {} };\n"
+                          "export const spread = { send() {}, ...outside };\n"
+                          "export const getter = { get send() { return outside; } };\n"
+                          "export const computed = { send() {}, [key]() {} };\n"
+                          "export const duplicate = { send() {}, send: outside };\n"
+                          "export let changing = { send() {} }; changing = outside;\n";
+    char lib[2048];
+    snprintf(lib, sizeof(lib), library, "");
+    write_temp_file(tmp, "lib.ts", lib);
+    write_temp_file(tmp, "decoy.ts", "export const api = { send() {}, close() {} };\n");
+    write_temp_file(tmp, "main.ts",
+                    "import { api as client, opaque, spread, getter, computed, duplicate, changing "
+                    "} from './lib';\n"
+                    "export function direct() { client.send(); }\n"
+                    "export function arrow() { client.close(); }\n"
+                    "export function chain() { client.make().send(); }\n"
+                    "export function unknown() { opaque.send(); }\n"
+                    "export function spreadCall() { spread.send(); }\n"
+                    "export function getterCall() { getter.send(); }\n"
+                    "export function computedCall() { computed.send(); }\n"
+                    "export function duplicateCall() { duplicate.send(); }\n"
+                    "export function mutableCall() { changing.send(); }\n");
+    write_temp_file(tmp, "namespace.ts",
+                    "import * as api from './lib';\n"
+                    "export function run() { api.send(); }\n");
+    char db[512], got[1024];
+    snprintf(db, sizeof(db), "%s/g.db", tmp);
+    bool ok = true;
+    for (int phase = 0; phase < 3; phase++) {
+        if (phase == 1)
+            write_temp_file(tmp, "later.ts",
+                            "import { api } from './lib';\n"
+                            "export function added() { api.send(); }\n");
+        if (phase == 2) {
+            snprintf(lib, sizeof(lib), library, ", ...outside");
+            write_temp_file(tmp, "lib.ts", lib);
+            char path[512];
+            snprintf(path, sizeof(path), "%s/lib.ts", tmp);
+            ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000, 0), 0);
+        }
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(p);
+        ASSERT_EQ(cbm_pipeline_run(p), 0);
+        const char *project = cbm_pipeline_project_name(p);
+        const char *targets[] = {"main.direct -> lib.api.send", "main.arrow -> lib.close",
+                                 "main.chain -> lib.Port.send; main.chain -> lib.make"};
+        for (int line = 2; line <= 10; line++) {
+            js_twin_calls_at(db, project, "main.ts", line, got, sizeof(got));
+            ok = js_twin_expect("object export", got,
+                                phase < 2 && line < 5 ? targets[line - 2] : "") &&
+                 ok;
+        }
+        js_twin_calls_at(db, project, "namespace.ts", 2, got, sizeof(got));
+        ok = js_twin_expect("namespace export", got, "namespace.run -> lib.send") && ok;
+        if (phase) {
+            js_twin_calls_at(db, project, "later.ts", 2, got, sizeof(got));
+            ok = js_twin_expect("cached object export", got,
+                                phase == 1 ? "later.added -> lib.api.send" : "") &&
+                 ok;
+        }
+        cbm_pipeline_free(p);
+    }
+    th_rmtree(tmp);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 TEST(pipeline_ts_return_utilities_follow_imports) {
     char tmp[256] = "/tmp/cbm_ts_return_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
@@ -37599,6 +37675,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_top_level_declaration_keeps_plain_name);
     RUN_TEST(pipeline_js_this_call_in_arrow_reaches_class_method);
     RUN_TEST(pipeline_ts_factory_returns_keep_import_identity);
+    RUN_TEST(pipeline_ts_object_exports_keep_owned_methods);
     RUN_TEST(pipeline_ts_return_utilities_follow_imports);
     RUN_TEST(pipeline_ts_index_file_resolver_matches_main);
     RUN_TEST(pipeline_js_this_in_nested_function_is_not_the_class);

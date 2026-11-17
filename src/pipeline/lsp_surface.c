@@ -39,8 +39,9 @@
 /* 3: Go defs carry their parsed result list `|`-joined in "ret" (F-G8 D1);
  * a version-2 surface holds the raw result text and must be re-extracted.
  * 4: Go identity aliases carry their target in "al" (#2033); a version-3
- * surface has no alias targets and must be re-extracted. */
-enum { SURFACE_CODEC_VERSION = 4 };
+ * surface has no alias targets and must be re-extracted.
+ * 5: JS/TS object-literal ownership is preserved in "jo". */
+enum { SURFACE_CODEC_VERSION = 5 };
 
 /* Labels the incremental name registry serves that pxc_map_label does NOT
  * carry into the CBMLSPDef set. Their (name, qn, label) triple must still
@@ -400,6 +401,7 @@ static char *surface_file_to_json(const CBMFileResult *result, CBMLanguage langu
         yyjson_mut_obj_add_bool(doc, o, "ab", d->is_abstract);
         add_str_array_or_null(doc, o, "dec", d->decorators, -1);
         add_str_or_null(doc, o, "al", d->alias_target);
+        yyjson_mut_obj_add_bool(doc, o, "jo", d->js_object_literal);
         yyjson_mut_arr_add_val(lsp, o);
     }
     yyjson_mut_obj_add_val(doc, root, "lsp", lsp);
@@ -749,6 +751,7 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
         int dec_count = 0;
         d->decorators = arena_str_array(arena, yyjson_obj_get(o, "dec"), true, &dec_count);
         d->alias_target = arena_str_or_null(arena, yyjson_obj_get(o, "al"));
+        d->js_object_literal = yyjson_get_bool(yyjson_obj_get(o, "jo"));
         if (!d->qualified_name || !d->short_name || !d->label) {
             /* A def the writer could not have produced: qn/sn/label are
              * unconditionally present in build_lsp_def output. Corrupt row. */

@@ -3042,16 +3042,33 @@ static const CBMType *ts_new_expression_type(TSLSPContext *ctx, TSNode node) {
                                       : cbm_type_named(ctx->arena, cname);
 }
 
-static bool ts_import_is_instance(TSLSPContext *ctx, const char *name) {
+static const CBMVarBinding *ts_import_value(TSLSPContext *ctx, const char *name,
+                                            const char **owner) {
+    if (owner)
+        *owner = NULL;
     if (ts_scope_has_binding(ctx->current_scope, name) ||
         !ts_scope_has_binding(ctx->named_imports, name))
-        return false;
+        return NULL;
     bool matched = false;
     const char *module = ts_import_module_for_local(ctx, name, &matched);
     if (!module)
-        return false;
+        return NULL;
     const char *qn = ts_import_symbol_qn(ctx, module, ts_import_export_name(ctx, name));
-    return ts_registry_value(ctx, qn) != NULL;
+    if (owner)
+        *owner = qn;
+    return ts_registry_value(ctx, qn);
+}
+
+/* A plain imported literal owns this exact callable. Do not reinterpret a
+ * nominal interface member, or use a leaf/suffix match when no owned function
+ * exists. Named-import aliases use the declaration's exported name. */
+static const CBMRegisteredFunc *ts_import_object_member(TSLSPContext *ctx,
+                                                        const CBMVarBinding *value, const char *qn,
+                                                        const char *member) {
+    if (!value || !qn || !member || !value->type || value->type->kind != CBM_TYPE_OBJECT_LIT ||
+        cbm_registry_lookup_type(ctx->registry, qn))
+        return NULL;
+    return cbm_registry_lookup_method(ctx->registry, qn, member);
 }
 
 static const CBMRegisteredFunc *ts_lookup_namespace_call(TSLSPContext *ctx, const char *object_name,
@@ -3127,8 +3144,13 @@ static const CBMType *ts_signature_for_call(TSLSPContext *ctx, TSNode function, 
 
         if (node_kind_is(object, "identifier")) {
             char *object_name = node_text(ctx, object);
-            if (!ts_scope_has_binding(ctx->current_scope, object_name) &&
-                !ts_import_is_instance(ctx, object_name)) {
+            const char *owner = NULL;
+            const CBMVarBinding *value = ts_import_value(ctx, object_name, &owner);
+            const CBMRegisteredFunc *owned =
+                ts_import_object_member(ctx, value, owner, method_name);
+            if (owned)
+                return owned->signature;
+            if (!ts_scope_has_binding(ctx->current_scope, object_name) && !value) {
                 bool is_import = false;
                 const CBMRegisteredFunc *namespace_func =
                     ts_lookup_namespace_call(ctx, object_name, method_name, args, &is_import);
@@ -4131,11 +4153,20 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
         if (!ts_node_is_null(obj) && !ts_node_is_null(prop)) {
             char *mname = node_text(ctx, prop);
             if (mname) {
+                const CBMVarBinding *imported_value = NULL;
                 // Identifier as namespace import: `name.fn()` or `mod.fn()`.
                 if (node_kind_is(obj, "identifier")) {
                     char *on = node_text(ctx, obj);
-                    if (on && !ts_scope_has_binding(ctx->current_scope, on) &&
-                        !ts_import_is_instance(ctx, on)) {
+                    const char *owner = NULL;
+                    imported_value = ts_import_value(ctx, on, &owner);
+                    const CBMRegisteredFunc *owned =
+                        ts_import_object_member(ctx, imported_value, owner, mname);
+                    if (owned) {
+                        ts_emit_resolved_call_at(ctx, owned->qualified_name, "lsp_ts_method", 0.95f,
+                                                 call_node);
+                        return;
+                    }
+                    if (on && !ts_scope_has_binding(ctx->current_scope, on) && !imported_value) {
                         bool is_import = false;
                         const CBMRegisteredFunc *f =
                             ts_lookup_namespace_call(ctx, on, mname, args, &is_import);
@@ -4161,12 +4192,9 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
                                              call_node);
                     return;
                 }
-                const char *object_name =
-                    node_kind_is(obj, "identifier") ? node_text(ctx, obj) : NULL;
                 ts_emit_unresolved_call_at(ctx, mname,
-                                           object_name && ts_import_is_instance(ctx, object_name)
-                                               ? "ts_import_value_receiver"
-                                               : "method_not_in_registry",
+                                           imported_value ? "ts_import_value_receiver"
+                                                          : "method_not_in_registry",
                                            call_node);
             }
         }
@@ -4833,7 +4861,7 @@ static void process_node_inner(TSLSPContext *ctx, TSNode node) {
     if (strcmp(kind, "new_expression") == 0) {
         TSNode ctor = ts_node_child_by_field_name(node, "constructor", 11);
         const char *name = node_kind_is(ctor, "identifier") ? node_text(ctx, ctor) : NULL;
-        if (name && ts_import_is_instance(ctx, name))
+        if (name && ts_import_value(ctx, name, NULL))
             ts_emit_unresolved_call_at(ctx, name, "ts_value_not_constructor", node);
     }
 
@@ -7530,8 +7558,9 @@ static void ts_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
             if (!reg->ts_values)
                 reg->ts_values = cbm_scope_push(arena, NULL);
             const CBMType *value =
-                d->return_types ? parse_ts_type_text(arena, d->return_types, d->def_module_qn)
-                                : cbm_type_unknown();
+                d->js_object_literal ? cbm_type_object_lit(arena, NULL, NULL, NULL, NULL)
+                : d->return_types    ? parse_ts_type_text(arena, d->return_types, d->def_module_qn)
+                                     : cbm_type_unknown();
             cbm_scope_bind(reg->ts_values, d->qualified_name, value);
         } else if (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Interface") == 0) {
             CBMRegisteredType rt;

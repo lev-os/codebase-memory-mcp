@@ -264,6 +264,7 @@ typedef struct {
     bool is_entry_point;
     bool ts_return_scope_safe;      // TS return spelling has no generic parameter shadow.
     bool ts_return_constructor;     // Inferred `new C()` result; C must prove a runtime class.
+    bool js_object_literal;         // Immutable unannotated plain object with owned callables.
     const char *structural_profile; // AST structural profile (arena-allocated) or NULL
     const char *body_tokens; // space-separated raw identifier tokens from body (arena) or NULL
     /* Rust only: raw trait path from the exact `impl Trait for Type` block
@@ -348,6 +349,7 @@ typedef struct {
      * Tail fields: zero-init stays valid. */
     const char *callable_sig;
     const char *callable_params;
+    const char *js_member_owner; // Module object binding that directly owns this callable.
 } CBMDefinition;
 
 /* extra_props key of a generated member, one the compiler writes and the

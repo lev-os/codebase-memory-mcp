@@ -284,6 +284,7 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
     cr_str(c, &d->alias_target);
     cr_str(c, &d->callable_sig);
     cr_str(c, &d->callable_params);
+    cr_str(c, &d->js_member_owner);
 }
 
 static void cr_walk_call(cr_ctx_t *c, CBMCall *call) {
