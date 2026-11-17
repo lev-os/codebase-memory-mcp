@@ -214,8 +214,8 @@ static const char *py_decorator_types[] = {"decorator", NULL};
 
 // ==================== JAVASCRIPT ====================
 static const char *js_func_types[] = {"function_declaration", "generator_function_declaration",
-                                      "function_expression",  "arrow_function",
-                                      "method_definition",    NULL};
+                                      "function_expression", "generator_function",
+                                      "arrow_function", "method_definition", NULL};
 static const char *js_class_types[] = {"class_declaration", "class", NULL};
 static const char *js_module_types[] = {"program", NULL};
 static const char *js_call_types[] = {"call_expression", "new_expression", NULL};
@@ -239,6 +239,7 @@ static const char *js_throw_types[] = {"throw_statement", NULL};
 static const char *ts_func_types[] = {"function_declaration",
                                       "generator_function_declaration",
                                       "function_expression",
+                                      "generator_function",
                                       "arrow_function",
                                       "method_definition",
                                       "function_signature",

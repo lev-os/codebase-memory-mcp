@@ -36705,6 +36705,42 @@ TEST(pipeline_js_quoted_key_keeps_lexical_binding) {
     PASS();
 }
 
+TEST(pipeline_js_generator_expressions) {
+    static const char *const exts[] = {"js", "ts", "tsx"};
+    bool ok = true;
+    for (int x = 0; x < 3; x++) {
+        char tmp[256] = "/tmp/cbm_js_generator_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        char file[32], db[512];
+        snprintf(file, sizeof(file), "main.%s", exts[x]);
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        write_temp_file(tmp, file,
+            "function work() {} function halt() {}\n"
+            "const stream = async function* () { work(); yield 1; };\n"
+            "const g = function* () { halt(); yield 2; };\n"
+            "function useStream() { stream(); }\n"
+            "function useG() { g(); }\n");
+        cbm_pipeline_t *p = js_twin_index(tmp, db);
+        ASSERT_NOT_NULL(p);
+        const char *project = cbm_pipeline_project_name(p);
+        char got[1024];
+        js_twin_qn_at(db, project, file, "stream", 2, got, sizeof(got));
+        ok = js_twin_expect("async generator node", got, "main.stream") && ok;
+        js_twin_qn_at(db, project, file, "g", 3, got, sizeof(got));
+        ok = js_twin_expect("generator node", got, "main.g") && ok;
+        const char *expected[] = {"main.stream -> main.work", "main.g -> main.halt",
+                                 "main.useStream -> main.stream", "main.useG -> main.g"};
+        for (int i = 0; i < 4; i++) {
+            js_twin_calls_at(db, project, file, i + 2, got, sizeof(got));
+            ok = js_twin_expect("generator caller and target", got, expected[i]) && ok;
+        }
+        cbm_pipeline_free(p);
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 
 
 /* Exact recursion survives both writers and an incremental repair. Unknown
@@ -37871,6 +37907,7 @@ TEST(pipeline_js_twin_callables_scale) {
 SUITE(pipeline) {
     RUN_TEST(pipeline_js_quoted_callable_names);
     RUN_TEST(pipeline_js_quoted_key_keeps_lexical_binding);
+    RUN_TEST(pipeline_js_generator_expressions);
     RUN_TEST(pipeline_js_exact_recursion);
     RUN_TEST(pipeline_js_module_binding_keeps_plain_name);
     RUN_TEST(pipeline_js_local_callee_is_nearest_binding);

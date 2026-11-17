@@ -1816,7 +1816,8 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *     members again. */
 /* 25: exact JS/TS recursive invocations retain their self CALLS edge. */
 /* 26: JS/TS literal callable keys share unquoted names and keep numeric keys. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 26 };
+/* 27: JS/TS generator expressions own their definitions and call scopes. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 27 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
