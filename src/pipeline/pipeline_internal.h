@@ -1814,7 +1814,9 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
 /* 23: captured receiver types may use a proof that every write agrees. */
 /* 24: calls through an imported plain object literal resolve as namespace
  *     members again. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 24 };
+/* 25: constructor proofs, captured writes and default/literal values changed
+ *     CALLS for unchanged importers; rebuild stored graphs once. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 25 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

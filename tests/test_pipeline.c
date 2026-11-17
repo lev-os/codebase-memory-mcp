@@ -10134,8 +10134,13 @@ TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode) {
     return pipeline_exact_inputs_migrate_metadata_and_mode(1);
 }
 
-/* Published branch version 8 predates language doc links and diagrams.
- * Unchanged inputs still need a rebuild, followed by an exact no-op. */
+/* Version 24 predates the corrected constructor and value facts. */
+TEST(pipeline_semantic_version_24_index_is_rebuilt_once) {
+    return pipeline_exact_inputs_migrate_metadata_and_mode(24);
+}
+
+
+/* Published branch version 8 predates language doc links and diagrams. */
 TEST(pipeline_semantic_version_8_index_is_rebuilt_once) {
     return pipeline_exact_inputs_migrate_metadata_and_mode(8);
 }
@@ -36767,9 +36772,105 @@ TEST(pipeline_js_this_call_in_arrow_reaches_class_method) {
 
 /* Return facts survive imports, provider edits and unchanged-provider reuse.
  * An unknown constructor or a value/type name collision cannot supply a method. */
+static atomic_bool g_x9c_parallel_seen;
+static void x9c_mode_sink(const char *line) {
+    if (line && strstr(line, "pipeline.mode") && strstr(line, "parallel"))
+        atomic_store(&g_x9c_parallel_seen, true);
+}
+
+static int x9c_parallel_run(cbm_pipeline_t *p, bool require_parallel) {
+    CBMLogLevel level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_INFO);
+    atomic_store(&g_x9c_parallel_seen, false);
+    cbm_log_set_sink_ex(x9c_mode_sink, CBM_LOG_SINK_REPLACE);
+    int rc = cbm_pipeline_run(p);
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(level);
+    if (require_parallel && !atomic_load(&g_x9c_parallel_seen)) {
+        fprintf(stderr, "factory fixture did not take the parallel route\n");
+        return -1;
+    }
+    return rc;
+}
+
+static void x9c_parallel_fixture(const char *tmp) {
+    for (int i = 0; i < 64; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "x9c_pad_%02d.ts", i);
+        write_temp_file(tmp, name, "export const padding = 0;\n");
+    }
+}
+
+static bool x9c_fresh_calls_equal(const char *tmp, const char *db, const char *project, int phase) {
+    char before[16384], after[16384], fresh[512];
+    const char *sql =
+        "SELECT s.qualified_name || ':' || coalesce(json_extract(e.properties, '$.line'), 0), "
+        "t.qualified_name "
+        "FROM edges e JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id "
+        "WHERE e.project = ?1 AND e.type = 'CALLS' AND ?2 = ?2 AND ?3 = ?3 AND ?4 = ?4 ORDER BY 1, "
+        "2";
+    js_twin_rows(db, project, sql, 0, "", "", true, before, sizeof(before));
+    snprintf(fresh, sizeof(fresh), "%s/fresh-%d.db", tmp, phase);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, fresh, CBM_MODE_FULL);
+    if (!p)
+        return false;
+    int rc = x9c_parallel_run(p, true);
+    js_twin_rows(fresh, cbm_pipeline_project_name(p), sql, 0, "", "", true, after, sizeof(after));
+    bool ok = rc == 0 && js_twin_expect("provider edit equals fresh CALLS", before, after);
+    cbm_pipeline_free(p);
+    return ok;
+}
+
+TEST(pipeline_x9c_provider_edits_invalidate_return_proof) {
+    char tmp[256] = "/tmp/cbm_x9c_provider_XXXXXX", db[512], body[1024], got[1024];
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    XlangEnvSave env = xlang_env_select(true);
+    x9c_parallel_fixture(tmp);
+    write_temp_file(
+        tmp, "main.ts",
+        "import { make } from './lib';\nexport function use() { make(true).send(); }\n");
+    snprintf(db, sizeof(db), "%s/g.db", tmp);
+    const char *tails[] = {"function reset() {}", "function reset() { make = replacement; }",
+                           "function reset() { Port = Other; }", "function reset() {}"};
+    bool ok = true;
+    for (int phase = 0; phase < 4; phase++) {
+        snprintf(body, sizeof(body),
+                 "export class Port { send() {} }\nclass Other { send() {} }\nexport function "
+                 "make(flag) { %sreturn new Port(); }\nfunction replacement() { return new "
+                 "Other(); }\n%s\n",
+                 phase == 3 ? "if (flag) " : "", tails[phase]);
+        write_temp_file(tmp, "lib.ts", body);
+        char path[512];
+        snprintf(path, sizeof(path), "%s/lib.ts", tmp);
+        ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000 + phase * 100, 0), 0);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(p);
+        ASSERT_EQ(x9c_parallel_run(p, phase == 0), 0);
+        if (phase)
+            ASSERT_EQ(cbm_pipeline_incremental_test_last_route(),
+                      CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+        const char *project = cbm_pipeline_project_name(p);
+        js_twin_calls_at(db, project, "main.ts", 2, got, sizeof(got));
+        ok = js_twin_expect("provider binding proof", got,
+                            phase ? "main.use -> lib.make"
+                                  : "main.use -> lib.Port.send; main.use -> lib.make") &&
+             ok;
+        if (phase)
+            ok = x9c_fresh_calls_equal(tmp, db, project, phase) && ok;
+        cbm_pipeline_free(p);
+    }
+    xlang_env_restore(&env);
+    th_rmtree(tmp);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+
 TEST(pipeline_ts_factory_returns_keep_import_identity) {
     char tmp[256] = "/tmp/cbm_ts_factory_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    XlangEnvSave env = xlang_env_select(true);
+    x9c_parallel_fixture(tmp);
     write_temp_file(tmp, "types.ts",
                     "export class Port { send() {} }\n"
                     "export class Other { send() {} }\n"
@@ -36834,13 +36935,36 @@ TEST(pipeline_ts_factory_returns_keep_import_identity) {
                     "export function constructed() { new seed().send(); }\n");
     char db[512], got[1024];
     snprintf(db, sizeof(db), "%s/g.db", tmp);
-    const char *callers[] = {"inferred", "awaited", "typed",   "method", NULL, NULL, NULL,
-                             NULL,       NULL,      "utility", "chain",  NULL, NULL, NULL};
+    const char *callers[] = {"inferred",  "awaited", "typed",     "method",      "pending",
+                             "ambiguous", "unknown", "dynamic",   "catchShadow", "utility",
+                             "chain",     "mutable", "parameter", "constructed"};
+    const char *calls[] = {
+        "make",   "later",  "declared", "Builder.make",    "later", "mixed",   "opaque",
+        "shadow", "caught", NULL,       "Builder.context", NULL,    "generic", NULL};
+    const bool sends[] = {true,  true,  true, true, false, false, false,
+                          false, false, true, true, false, false, false};
     bool ok = true;
     for (int phase = 0; phase < 3; phase++) {
         if (phase == 1) {
-            snprintf(factory, sizeof(factory),
-                     "import { Other as Wire, Other } from './types';\n%s", factory_body);
+            snprintf(factory, sizeof(factory), "import { Port as Wire, Other } from './types';\n%s",
+                     factory_body);
+            const char *from[] = {
+                "function make() { return new Wire(); }", "function later() { return new Wire(); }",
+                "function declared(): Wire { return new Wire(); }", "make() { return new Wire();",
+                "function produce(): Wire { return new Wire(); }"};
+            const char *to[] = {"function make() { return new Other(); }",
+                                "function later() { return new Other(); }",
+                                "function declared(): Other { return new Other(); }",
+                                "make() { return new Other();",
+                                "function produce(): Other { return new Other(); }"};
+            for (int r = 0; r < 5; r++) {
+                char changed[2048];
+                const char *at = strstr(factory, from[r]);
+                ASSERT_NOT_NULL(at);
+                snprintf(changed, sizeof(changed), "%.*s%s%s", (int)(at - factory), factory, to[r],
+                         at + strlen(from[r]));
+                snprintf(factory, sizeof(factory), "%s", changed);
+            }
             write_temp_file(tmp, "factory.ts", factory);
         }
         if (phase == 1) {
@@ -36856,61 +36980,61 @@ TEST(pipeline_ts_factory_returns_keep_import_identity) {
                 "export function rejected() { unproven().send(); }\n");
         cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
         ASSERT_NOT_NULL(p);
-        ASSERT_EQ(cbm_pipeline_run(p), 0);
+        ASSERT_EQ(x9c_parallel_run(p, phase == 0), 0);
+        if (phase == 1)
+            ASSERT_EQ(cbm_pipeline_incremental_test_last_route(),
+                      CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
         const char *project = cbm_pipeline_project_name(p);
         for (int i = 0; i < 14; i++) {
-            js_twin_rows(db, project,
-                         "SELECT s.qualified_name, t.qualified_name FROM edges e "
-                         "JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id "
-                         "WHERE e.project = ?1 AND e.type = 'CALLS' "
-                         "AND json_extract(e.properties, '$.line') = ?2 "
-                         "AND substr(s.file_path, -length(?3)) = ?3 AND t.label = 'Method' "
-                         "AND (?4 = '' OR t.name = ?4) ORDER BY 1, 2",
-                         i + 2, "main.ts", callers[i] ? "send" : "", true, got, sizeof(got));
-            char want[256] = "";
-            if (callers[i])
-                snprintf(want, sizeof(want), "main.%s -> types.%s.send", callers[i],
-                         phase ? "Other" : "Port");
-            ok = js_twin_expect("factory return", got, want) && ok;
-            if (i == 11 || i == 13) {
-                js_twin_calls_at(db, project, "main.ts", i + 2, got, sizeof(got));
-                ok = js_twin_expect("unknown imported instance", got, "") && ok;
+            js_twin_calls_at(db, project, "main.ts", i + 2, got, sizeof(got));
+            char want[1024] = "";
+            if (calls[i])
+                snprintf(want, sizeof(want), "main.%s -> factory.%s", callers[i], calls[i]);
+            if (i == 10)
+                strcat(want, "; main.chain -> factory.Builder.make");
+            if (sends[i]) {
+                size_t len = strlen(want);
+                snprintf(want + len, sizeof(want) - len, "%smain.%s -> types.%s.send",
+                         len ? "; " : "", callers[i], phase ? "Other" : "Port");
             }
+            ok = js_twin_expect("factory full CALLS", got, want) && ok;
         }
-        const char *extra_callers[] = {"throughNamespace", "throughType", "throughSameStem", NULL,
-                                       NULL};
-        const char *extra_types[] = {phase ? "Other" : "Port", "Shared", "Port", NULL, NULL};
+        const char *extra_callers[] = {"throughNamespace", "throughType", "throughSameStem",
+                                       "foreignQuery", "throughUnknownCtor"};
         for (int i = 0; i < 5; i++) {
-            js_twin_rows(db, project,
-                         "SELECT s.qualified_name, t.qualified_name FROM edges e "
-                         "JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id "
-                         "WHERE e.project = ?1 AND e.type = 'CALLS' "
-                         "AND json_extract(e.properties, '$.line') = ?2 "
-                         "AND substr(s.file_path, -length(?3)) = ?3 AND t.name = ?4 ORDER BY 1, 2",
-                         i + 7, "namespaces.ts", "send", true, got, sizeof(got));
-            char want[256] = "";
-            if (extra_callers[i])
-                snprintf(want, sizeof(want), "namespaces.%s -> types.%s.send", extra_callers[i],
-                         extra_types[i]);
-            ok = js_twin_expect("return namespace", got, want) && ok;
+            char want[1024] = "";
+            if (i == 0)
+                snprintf(want, sizeof(want),
+                         "namespaces.throughNamespace -> factory.declared; "
+                         "namespaces.throughNamespace -> types.%s.send",
+                         phase ? "Other" : "Port");
+            if (i == 1)
+                snprintf(want, sizeof(want), "namespaces.%s -> types.Shared.send",
+                         extra_callers[i]);
+            if (i == 2)
+                snprintf(want, sizeof(want), "namespaces.%s -> types.Port.send", extra_callers[i]);
+            if (i == 3)
+                snprintf(want, sizeof(want), "namespaces.%s -> factory.deferred", extra_callers[i]);
+            if (i == 4)
+                snprintf(want, sizeof(want), "namespaces.%s -> types.unproven", extra_callers[i]);
+            js_twin_calls_at(db, project, "namespaces.ts", i + 7, got, sizeof(got));
+            ok = js_twin_expect("namespace full CALLS", got, want) && ok;
         }
         if (phase == 2) {
             for (int line = 2; line <= 3; line++) {
-                js_twin_rows(
-                    db, project,
-                    "SELECT s.qualified_name, t.qualified_name FROM edges e "
-                    "JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id "
-                    "WHERE e.project = ?1 AND e.type = 'CALLS' "
-                    "AND json_extract(e.properties, '$.line') = ?2 "
-                    "AND substr(s.file_path, -length(?3)) = ?3 AND t.name = ?4 ORDER BY 1, 2",
-                    line, "later.ts", "send", true, got, sizeof(got));
-                ok = js_twin_expect("persisted factory return", got,
-                                    line == 2 ? "later.added -> types.Other.send" : "") &&
+                js_twin_calls_at(db, project, "later.ts", line, got, sizeof(got));
+                ok = js_twin_expect(
+                         "persisted factory full CALLS", got,
+                         line == 2 ? "later.added -> factory.make; later.added -> types.Other.send"
+                                   : "later.rejected -> types.unproven") &&
                      ok;
             }
         }
+        if (phase == 1)
+            ok = x9c_fresh_calls_equal(tmp, db, project, phase) && ok;
         cbm_pipeline_free(p);
     }
+    xlang_env_restore(&env);
     th_rmtree(tmp);
     ASSERT_TRUE(ok);
     PASS();
@@ -36919,6 +37043,8 @@ TEST(pipeline_ts_factory_returns_keep_import_identity) {
 TEST(pipeline_ts_captured_receiver_tracks_every_write) {
     char tmp[256] = "/tmp/cbm_ts_captured_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    XlangEnvSave env = xlang_env_select(true);
+    x9c_parallel_fixture(tmp);
     write_temp_file(tmp, "lib.ts",
                     "export class Port { send() {} }\n"
                     "export class Decoy { send() {} }\n"
@@ -36926,7 +37052,7 @@ TEST(pipeline_ts_captured_receiver_tracks_every_write) {
     char source[1536], db[512], got[1024];
     snprintf(db, sizeof(db), "%s/g.db", tmp);
     bool ok = true;
-    for (int phase = 0; phase < 2; phase++) {
+    for (int phase = 0; phase < 3; phase++) {
         snprintf(source, sizeof(source),
                  "import { Port, Decoy, make } from './lib';\n"
                  "let item = make();\n"
@@ -36935,23 +37061,41 @@ TEST(pipeline_ts_captured_receiver_tracks_every_write) {
                  "let bad = new Port(); function unknown(Port: any) { bad = new Port(); }\n"
                  "export function reject() { bad.send(); }\n",
                  phase ? "Decoy" : "Port");
-        write_temp_file(tmp, "main.ts", source);
-        if (phase) {
+        if (phase < 2)
+            write_temp_file(tmp, "main.ts", source);
+        if (phase == 2) {
+            write_temp_file(tmp, "lib.ts",
+                            "export class Port { send() {} }\nexport class Decoy { send() {} "
+                            "}\nexport function make(): Decoy { return new Decoy(); }\n");
+            char path[512];
+            snprintf(path, sizeof(path), "%s/lib.ts", tmp);
+            ASSERT_EQ(pipeline_test_set_mtime(path, 2000000100, 0), 0);
+        }
+        if (phase == 1) {
             char path[512];
             snprintf(path, sizeof(path), "%s/main.ts", tmp);
             ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000, 0), 0);
         }
         cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
         ASSERT_NOT_NULL(p);
-        ASSERT_EQ(cbm_pipeline_run(p), 0);
+        ASSERT_EQ(x9c_parallel_run(p, phase == 0), 0);
+        if (phase == 2)
+            ASSERT_EQ(cbm_pipeline_incremental_test_last_route(),
+                      CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
         const char *project = cbm_pipeline_project_name(p);
         js_twin_calls_at(db, project, "main.ts", 4, got, sizeof(got));
-        ok = js_twin_expect("captured receiver", got, phase ? "" : "main.read -> lib.Port.send") &&
+        ok = js_twin_expect("captured receiver", got,
+                            phase == 0   ? "main.read -> lib.Port.send"
+                            : phase == 1 ? ""
+                                         : "main.read -> lib.Decoy.send") &&
              ok;
         js_twin_calls_at(db, project, "main.ts", 6, got, sizeof(got));
         ok = js_twin_expect("shadowed constructor", got, "") && ok;
+        if (phase == 2)
+            ok = x9c_fresh_calls_equal(tmp, db, project, phase) && ok;
         cbm_pipeline_free(p);
     }
+    xlang_env_restore(&env);
     th_rmtree(tmp);
     ASSERT_TRUE(ok);
     PASS();
@@ -37008,6 +37152,8 @@ TEST(pipeline_js_object_literal_export_is_namespace) {
     for (int x = 0; x < 2; x++) {
         char tmp[256] = "/tmp/cbm_js_object_ns_XXXXXX";
         ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        XlangEnvSave env = xlang_env_select(true);
+        x9c_parallel_fixture(tmp);
         static const char *const importer = "import { api, made } from './lib';\n"
                                             "export function first() { api.run(); }\n"
                                             "export function second() { api.stop(); }\n"
@@ -37033,7 +37179,10 @@ TEST(pipeline_js_object_literal_export_is_namespace) {
             ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000 + phase * 100, 0), 0);
             cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
             ASSERT_NOT_NULL(p);
-            ASSERT_EQ(cbm_pipeline_run(p), 0);
+            ASSERT_EQ(x9c_parallel_run(p, phase == 0), 0);
+            if (phase == 1 || phase == 2)
+                ASSERT_EQ(cbm_pipeline_incremental_test_last_route(),
+                          CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
             const char *project = cbm_pipeline_project_name(p);
             /* In the last run, `made.halt(api.run())` has one target: the argument. */
             const char *want[] = {phase == 1 ? "" : "main.first -> lib.run",
@@ -37044,8 +37193,11 @@ TEST(pipeline_js_object_literal_export_is_namespace) {
                 js_twin_calls_at(db, project, main_name, i + 2, got, sizeof(got));
                 ok = js_twin_expect(what, got, want[i]) && ok;
             }
+            if (phase == 1 || phase == 2)
+                ok = x9c_fresh_calls_equal(tmp, db, project, phase) && ok;
             cbm_pipeline_free(p);
         }
+        xlang_env_restore(&env);
         th_rmtree(tmp);
     }
     ASSERT_TRUE(ok);
@@ -37694,11 +37846,10 @@ TEST(pipeline_js_twin_callables_scale) {
 }
 
 TEST(pipeline_x9c_imported_class_write_withholds_factory) {
-    char tmp[256] = "/tmp/cbm_x9c_class_write_XXXXXX", db[512], got[1024];
+    char tmp[256] = "/tmp/cbm_x9c_class_write_XXXXXX", db[512], lib[512], got[1024];
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-    write_temp_file(tmp, "lib.ts",
-                    "export class Port { send() {} }\nclass Other { send() {} }\nfunction reset() "
-                    "{ Port = Other; }\n");
+    XlangEnvSave env = xlang_env_select(true);
+    x9c_parallel_fixture(tmp);
     write_temp_file(tmp, "factory.ts",
                     "import { Port } from './lib';\nexport function make() { return new Port(); "
                     "}\nexport function local() { make().send(); }\n");
@@ -37706,16 +37857,39 @@ TEST(pipeline_x9c_imported_class_write_withholds_factory) {
         tmp, "main.ts",
         "import { make } from './factory';\nexport function use() { make().send(); }\n");
     snprintf(db, sizeof(db), "%s/g.db", tmp);
-    cbm_pipeline_t *p = js_twin_index(tmp, db);
-    ASSERT_NOT_NULL(p);
-    const char *project = cbm_pipeline_project_name(p);
-    js_twin_calls_at(db, project, "main.ts", 2, got, sizeof(got));
-    bool ok = js_twin_expect("imported written class", got, "main.use -> factory.make");
-    js_twin_calls_at(db, project, "factory.ts", 3, got, sizeof(got));
-    ok = js_twin_expect("local factory from written imported class", got,
-                        "factory.local -> factory.make") &&
-         ok;
-    cbm_pipeline_free(p);
+    bool ok = true;
+    for (int phase = 0; phase < 3; phase++) {
+        snprintf(
+            lib, sizeof(lib),
+            "export class Port { send() {} }\nclass Other { send() {} }\nfunction reset() { %s }\n",
+            phase == 1 ? "Port = Other;" : "");
+        write_temp_file(tmp, "lib.ts", lib);
+        char path[512];
+        snprintf(path, sizeof(path), "%s/lib.ts", tmp);
+        ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000 + phase * 100, 0), 0);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(p);
+        ASSERT_EQ(x9c_parallel_run(p, phase == 0), 0);
+        if (phase)
+            ASSERT_EQ(cbm_pipeline_incremental_test_last_route(),
+                      CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+        const char *project = cbm_pipeline_project_name(p);
+        js_twin_calls_at(db, project, "main.ts", 2, got, sizeof(got));
+        ok = js_twin_expect("imported written class", got,
+                            phase == 1 ? "main.use -> factory.make"
+                                       : "main.use -> factory.make; main.use -> lib.Port.send") &&
+             ok;
+        js_twin_calls_at(db, project, "factory.ts", 3, got, sizeof(got));
+        ok = js_twin_expect(
+                 "local factory from written imported class", got,
+                 phase == 1 ? "factory.local -> factory.make"
+                            : "factory.local -> factory.make; factory.local -> lib.Port.send") &&
+             ok;
+        if (phase)
+            ok = x9c_fresh_calls_equal(tmp, db, project, phase) && ok;
+        cbm_pipeline_free(p);
+    }
+    xlang_env_restore(&env);
     th_rmtree(tmp);
     ASSERT_TRUE(ok);
     PASS();
@@ -37869,6 +38043,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_twin_insert_incremental_equals_full);
     RUN_TEST(pipeline_js_top_level_declaration_keeps_plain_name);
     RUN_TEST(pipeline_js_this_call_in_arrow_reaches_class_method);
+    RUN_TEST(pipeline_x9c_provider_edits_invalidate_return_proof);
     RUN_TEST(pipeline_ts_factory_returns_keep_import_identity);
     RUN_TEST(pipeline_js_object_literal_export_is_namespace);
     RUN_TEST(pipeline_ts_captured_receiver_tracks_every_write);
@@ -38548,6 +38723,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_source_addition_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_tsconfig_mutation_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode);
+    RUN_TEST(pipeline_semantic_version_24_index_is_rebuilt_once);
     RUN_TEST(pipeline_semantic_version_8_index_is_rebuilt_once);
     RUN_TEST(pipeline_semantic_version_10_index_is_rebuilt_once);
     RUN_TEST(pipeline_semantic_version_13_index_is_rebuilt_once);
