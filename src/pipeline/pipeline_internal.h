@@ -954,6 +954,11 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                                                         const CBMImport *imp,
                                                         CBMHashTable *namespace_map);
 
+/* Resolve a constant local's call-scoped imported value without name guessing. */
+cbm_resolution_t cbm_pipeline_js_import_value(const cbm_gbuf_t *gbuf, const char *project,
+                                              const char *rel, const CBMCall *call,
+                                              const char **keys, const char **vals, int count);
+
 /* PHP binding arrays borrow current result and graph strings. Free before
  * releasing/reloading the result; never cache this state across files. */
 typedef CBMPHPImportBindings cbm_php_vendor_names_t;

@@ -118,6 +118,13 @@ typedef struct {
     uint32_t active_start;
     uint32_t active_end;
     const char *name;
+    TSNode js_initializer;
+    const char *js_import_root;
+    const char *js_import_module;
+    const char *js_import_member;
+    const char *js_import_select;
+    bool js_const;
+    uint8_t js_import_checked;
     uint8_t value_kind;    /* CBMBindingValueKind; JS/TS only, else VALUE */
     const char *ctor_name; /* CBM_BINDING_NEW_INSTANCE: the constructor's name */
     uint32_t ctor_start;   /* and where it is written */

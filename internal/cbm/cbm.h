@@ -494,6 +494,11 @@ typedef struct {
     uint8_t trailing_closure_count;
     bool trailing_closure_truncated;
     const char **trailing_closure_labels;
+    /* A constant local's proven import provenance, scoped to this call site.
+     * root is the original import-map key, NULL for a direct require. */
+    const char *js_import_root;
+    const char *js_import_module;
+    const char *js_import_member;
 } CBMCall;
 
 // What an import statement names, when the syntax says so. Only PHP's

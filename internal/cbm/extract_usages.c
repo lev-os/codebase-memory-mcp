@@ -865,6 +865,18 @@ static bool cfml_argument_tag_name_binding(CBMExtractCtx *ctx, TSNode node) {
 static bool is_exact_language_binding(CBMExtractCtx *ctx, TSNode node, WalkState *state) {
     const char *kind = ts_node_type(node);
     switch (ctx->language) {
+    case CBM_LANG_JAVASCRIPT:
+    case CBM_LANG_TYPESCRIPT:
+    case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
+        for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
+             parent = ts_node_parent(parent)) {
+            const char *kind = ts_node_type(parent);
+            if (strcmp(kind, "variable_declarator") == 0)
+                return cbm_js_pattern_binds(ts_node_child_by_field_name(parent, TS_FIELD("name")), node, 0);
+            if (cbm_js_bodied_kind(kind)) break;
+        }
+        return false;
     case CBM_LANG_OCAML: {
         if (strcmp(kind, "value_pattern") != 0) {
             return false;
@@ -2399,6 +2411,53 @@ static void js_classify_binding(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
     }
 }
 
+/* Keep provenance on the binding, never in a file-wide alias map: a sibling
+ * function may bind the same local name to an unknown parameter. */
+static void js_record_import_origin(CBMExtractCtx *ctx, CBMLexicalBinding *binding,
+                                   TSNode node, bool parameter, bool import_binding) {
+    if (!js_call_classifier_lang(ctx->language) || parameter) return;
+    if (import_binding) {
+        for (int i = 0; i < ctx->result->imports.count; i++) {
+            const CBMImport *imp = &ctx->result->imports.items[i];
+            if (!cbm_import_binds_runtime_name(imp) || !imp->local_name ||
+                strcmp(imp->local_name, binding->name) != 0) continue;
+            binding->js_import_root = imp->local_name;
+            binding->js_import_module = imp->module_path;
+            binding->js_import_member = imp->is_default ? "default" : imp->member;
+            binding->js_const = true;
+            binding->js_import_checked = 2;
+            return;
+        }
+        return;
+    }
+    TSNode declaration = ts_node_parent(node);
+    const char *select = NULL;
+    for (int depth = 0; !ts_node_is_null(declaration) && depth < 16; depth++) {
+        const char *kind = ts_node_type(declaration);
+        if (strcmp(kind, "variable_declarator") == 0) break;
+        if (strcmp(kind, "array_pattern") == 0 || cbm_js_bodied_kind(kind)) return;
+        if (strcmp(kind, "object_pattern") == 0) {
+            if (select) return; /* nested destructuring needs a longer member path */
+            TSNode parent = ts_node_parent(node);
+            TSNode key = !ts_node_is_null(parent) && strcmp(ts_node_type(parent), "pair_pattern") == 0
+                             ? ts_node_child_by_field_name(parent, TS_FIELD("key")) : node;
+            if (strcmp(ts_node_type(key), "identifier") != 0 &&
+                strcmp(ts_node_type(key), "property_identifier") != 0 &&
+                strcmp(ts_node_type(key), "shorthand_property_identifier_pattern") != 0) return;
+            select = cbm_node_text(ctx->arena, key, ctx->source);
+        }
+        declaration = ts_node_parent(declaration);
+    }
+    if (ts_node_is_null(declaration) ||
+        strcmp(ts_node_type(declaration), "variable_declarator") != 0) return;
+    TSNode container = ts_node_parent(declaration);
+    TSNode kind = ts_node_child_by_field_name(container, TS_FIELD("kind"));
+    if (ts_node_is_null(kind) || !text_equals(ctx, kind, "const")) return;
+    binding->js_const = true;
+    binding->js_initializer = ts_node_child_by_field_name(declaration, TS_FIELD("value"));
+    binding->js_import_select = select;
+}
+
 static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode node,
                                    const CBMLangSpec *spec, const char *raw_name,
                                    bool import_binding) {
@@ -2515,6 +2574,7 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
         return;
     }
     CBMLexicalBinding *binding = &state->lexical_bindings[state->lexical_binding_count++];
+    memset(binding, 0, sizeof(*binding));
     binding->scope_id = scope_id;
     binding->active_start = whole_scope ? scope->start_byte : ts_node_end_byte(node);
     /* Zero means "the finalized end of this concrete scope". Split
@@ -2523,6 +2583,7 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
     binding->name = name;
     js_classify_binding(ctx, node, spec, parameter, function_declaration, class_declaration,
                         binding);
+    js_record_import_origin(ctx, binding, node, parameter, import_binding);
 }
 
 static int compare_lexical_bindings(const void *left_ptr, const void *right_ptr) {
@@ -2662,12 +2723,83 @@ static void js_invalidate_written_bindings(WalkState *state) {
         if (!owner) continue;
         for (int j = first; j < end; j++) {
             CBMLexicalBinding *binding = &state->lexical_bindings[j];
+            binding->js_const = false;
+            binding->js_import_module = NULL;
             if (binding->value_kind == CBM_BINDING_ARRAY_LITERAL ||
                 binding->value_kind == CBM_BINDING_NEW_INSTANCE) {
                 binding->value_kind = CBM_BINDING_VALUE;
             }
         }
     }
+}
+
+typedef struct {
+    const char *root;
+    const char *module;
+    const char *member;
+} js_import_fact_t;
+static bool js_import_value_at(CBMExtractCtx *ctx, WalkState *state, TSNode value,
+                               uint32_t scope, int depth, js_import_fact_t *out);
+
+static bool js_binding_import_fact(CBMExtractCtx *ctx, WalkState *state,
+                                   CBMLexicalBinding *binding, int depth, js_import_fact_t *out) {
+    if (!binding->js_const || depth > 16) return false;
+    if (!binding->js_import_checked) {
+        binding->js_import_checked = 1; /* cycles and unknowns fail closed */
+        js_import_fact_t fact = {0};
+        if (js_import_value_at(ctx, state, binding->js_initializer, binding->scope_id,
+                               depth + 1, &fact)) {
+            if (binding->js_import_select) {
+                if (fact.member) return false;
+                fact.member = binding->js_import_select;
+            }
+            binding->js_import_root = fact.root;
+            binding->js_import_module = fact.module;
+            binding->js_import_member = fact.member;
+            binding->js_import_checked = 2;
+        }
+    }
+    if (binding->js_import_checked != 2 || !binding->js_import_module) return false;
+    *out = (js_import_fact_t){binding->js_import_root, binding->js_import_module,
+                             binding->js_import_member};
+    return true;
+}
+
+static bool js_import_value_at(CBMExtractCtx *ctx, WalkState *state, TSNode value,
+                               uint32_t scope, int depth, js_import_fact_t *out) {
+    if (ts_node_is_null(value) || depth > 16) return false;
+    const char *kind = ts_node_type(value);
+    if (strcmp(kind, "identifier") == 0) {
+        const char *name = cbm_node_text(ctx->arena, value, ctx->source);
+        int first = 0, end = 0;
+        const CBMLexicalScope *owner = name ? lexical_binding_owner_at(
+            state, scope, name, ts_node_start_byte(value), &first, &end) : NULL;
+        return owner && end == first + 1 &&
+               js_binding_import_fact(ctx, state, &state->lexical_bindings[first], depth + 1, out);
+    }
+    if (strcmp(kind, "member_expression") == 0) {
+        TSNode object = ts_node_child_by_field_name(value, TS_FIELD("object"));
+        TSNode property = ts_node_child_by_field_name(value, TS_FIELD("property"));
+        if (ts_node_is_null(property) || strcmp(ts_node_type(property), "property_identifier") != 0 ||
+            !js_import_value_at(ctx, state, object, scope, depth + 1, out) || out->member) return false;
+        out->member = cbm_node_text(ctx->arena, property, ctx->source);
+        return out->member != NULL;
+    }
+    if (strcmp(kind, "call_expression") != 0) return false;
+    TSNode fn = ts_node_child_by_field_name(value, TS_FIELD("function"));
+    TSNode args = ts_node_child_by_field_name(value, TS_FIELD("arguments"));
+    int first = 0, end = 0;
+    if (ts_node_is_null(fn) || !text_equals(ctx, fn, "require") ||
+        lexical_binding_owner_at(state, scope, "require", ts_node_start_byte(value), &first, &end) ||
+        ts_node_is_null(args) || ts_node_named_child_count(args) != 1) return false;
+    TSNode arg = ts_node_named_child(args, 0);
+    if (strcmp(ts_node_type(arg), "string") != 0) return false;
+    uint32_t start = ts_node_start_byte(arg), stop = ts_node_end_byte(arg);
+    if (stop <= start + 2) return false;
+    out->module = cbm_arena_strndup(ctx->arena, ctx->source + start + 1, stop - start - 2);
+    out->root = NULL;
+    out->member = NULL;
+    return out->module != NULL;
 }
 
 /* Does every binding of `owner` in [first, end) that holds at `position` have
@@ -2840,7 +2972,16 @@ static void classify_js_calls(CBMExtractCtx *ctx, WalkState *state) {
         int end = 0;
         const CBMLexicalScope *owner = lexical_binding_owner_at(
             state, call->lexical_scope_id, call->callee_name, call->site_start_byte, &first, &end);
-        if (js_bare_callee_is_local_value(state, call, owner, first, end)) {
+        js_import_fact_t imported = {0};
+        if (owner && end == first + 1 &&
+            !ts_node_is_null(state->lexical_bindings[first].js_initializer) &&
+            js_binding_import_fact(ctx, state, &state->lexical_bindings[first], 0, &imported) &&
+            imported.member) {
+            call->js_import_root = imported.root;
+            call->js_import_module = imported.module;
+            call->js_import_member = imported.member;
+            call->callee_is_locally_bound = true; /* exact import target or no edge */
+        } else if (js_bare_callee_is_local_value(state, call, owner, first, end)) {
             call->callee_is_locally_bound = true;
         } else if (js_bare_callee_is_unbound(ctx, owner, &module_file)) {
             call->callee_is_unbound = true;
@@ -3127,7 +3268,7 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
     if (state->inside_import) {
         if (is_import_binding_occurrence(ctx, node, spec)) {
             char *binding_name = reference_name(ctx, node);
-            if (binding_name && binding_name[0] && !cbm_is_keyword(binding_name, ctx->language)) {
+            if (binding_name && binding_name[0] && (js_call_classifier_lang(ctx->language) || !cbm_is_keyword(binding_name, ctx->language))) {
                 record_lexical_binding(ctx, state, node, spec, binding_name, true);
             }
         }
@@ -3138,7 +3279,7 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
         ctx->language == CBM_LANG_PYTHON && python_scope_directive_kind(ctx, state, node) != 0;
     if (python_scope_directive || is_binding_occurrence(ctx, node, spec, state)) {
         char *binding_name = reference_name(ctx, node);
-        if (binding_name && binding_name[0] && !cbm_is_keyword(binding_name, ctx->language)) {
+        if (binding_name && binding_name[0] && (js_call_classifier_lang(ctx->language) || !cbm_is_keyword(binding_name, ctx->language))) {
             record_lexical_binding(ctx, state, node, spec, binding_name, false);
         }
         return;

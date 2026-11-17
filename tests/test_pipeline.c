@@ -15825,6 +15825,41 @@ static int check_x11b_default_scope(bool parallel) {
 TEST(pipeline_x11b_default_scope) { return check_x11b_default_scope(false); }
 TEST(pipeline_x11b_default_scope_parallel) { return check_x11b_default_scope(true); }
 
+static int check_x11b_import_values(bool parallel) {
+    static const ng_file_t files[] = {
+        {"src/value_lib.js", "export function run() { return 1; }\n"},
+        {"src/values.js", "import * as ops from './value_lib';\n"
+         "import { run as imported } from './value_lib';\n"
+         "export function unpack() { const { run } = ops; return run(); }\n"
+         "export function alias() { const run = imported; return run(); }\n"
+         "export function chain() { const first = imported; const run = first; return run(); }\n"
+         "export function renamed() { const { run: local } = ops; return local(); }\n"
+         "export function unknown(ops) { const { run } = ops; return run(); }\n"
+         "export function parameter(run) { return run(); }\n"},
+        {"src/required.js", "export function unpack() { const { run } = require('./value_lib'); return run(); }\n"
+         "export function alias() { const ops = require('./value_lib'); const run = ops.run; return run(); }\n"},
+    };
+    static const ng_pair_t pairs[] = {
+        {"values.unpack", "value_lib.run", 1, "import namespace destructuring"},
+        {"values.unpack", "*", 1, "complete outgoing set"},
+        {"values.alias", "value_lib.run", 1, "imported name alias"},
+        {"values.alias", "*", 1, "complete outgoing set"},
+        {"values.chain", "value_lib.run", 1, "constant alias chain"},
+        {"values.chain", "*", 1, "complete outgoing set"},
+        {"values.renamed", "value_lib.run", 1, "renamed destructuring"},
+        {"values.renamed", "*", 1, "complete outgoing set"},
+        {"values.unknown", "*", 0, "unknown namespace stays unresolved"},
+        {"values.parameter", "*", 0, "parameter stays unresolved"},
+        {"required.unpack", "value_lib.run", 1, "require destructuring"},
+        {"required.unpack", "*", 1, "complete outgoing set"},
+        {"required.alias", "value_lib.run", 1, "require namespace alias"},
+        {"required.alias", "*", 1, "complete outgoing set"},
+    };
+    return ng_check(files, 3, pairs, 14, parallel);
+}
+TEST(pipeline_x11b_import_values) { return check_x11b_import_values(false); }
+TEST(pipeline_x11b_import_values_parallel) { return check_x11b_import_values(true); }
+
 /* A member call on a receiver the TS resolver typed as a built-in
  * (`const rows: number[] = []; rows.push(1)`, a `Map`, an array parameter)
  * names the built-in's method. Before, the resolver's Array.push had no graph
@@ -38159,6 +38194,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_tsjs_same_module_bound_receiver_not_bound_parallel);
     RUN_TEST(pipeline_x11b_default_scope);
     RUN_TEST(pipeline_x11b_default_scope_parallel);
+    RUN_TEST(pipeline_x11b_import_values);
+    RUN_TEST(pipeline_x11b_import_values_parallel);
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
 #endif
     RUN_TEST(pipeline_x11b_reassigned);

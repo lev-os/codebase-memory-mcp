@@ -1562,7 +1562,10 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
                                                ctx->project_name));
     cbm_resolution_t res = {0};
     if (swift_candidates >= 0) {
-        res = calls_registry_resolution(ctx, call, module_qn, imp_keys, imp_vals, imp_count, lang,
+        if (call->js_import_module)
+            res = cbm_pipeline_js_import_value(ctx->gbuf, ctx->project_name, rel, call,
+                                               imp_keys, imp_vals, imp_count);
+        else res = calls_registry_resolution(ctx, call, module_qn, imp_keys, imp_vals, imp_count, lang,
                                         rust_external, php_vendor_call, java_external,
                                         cbm_pipeline_caller_is_test(source_node, rel, lang));
     }

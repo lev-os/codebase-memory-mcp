@@ -30,4 +30,35 @@ static inline TSNode cbm_js_scope_node(TSNode node, bool var_scope) {
         return node;
     return (TSNode){0};
 }
+/* One pattern model for both same-name declarations and lexical bindings.
+ * Keys and default-value expressions are not binding patterns. */
+static inline bool cbm_js_pattern_container(const char *kind) {
+    return strcmp(kind, "formal_parameters") == 0 || strcmp(kind, "object_pattern") == 0 ||
+           strcmp(kind, "array_pattern") == 0 || strcmp(kind, "rest_pattern") == 0;
+}
+static inline TSNode cbm_js_pattern_child(TSNode node) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "required_parameter") == 0 || strcmp(kind, "optional_parameter") == 0)
+        return ts_node_child_by_field_name(node, "pattern", 7);
+    if (strcmp(kind, "assignment_pattern") == 0 || strcmp(kind, "object_assignment_pattern") == 0)
+        return ts_node_child_by_field_name(node, "left", 4);
+    if (strcmp(kind, "pair_pattern") == 0)
+        return ts_node_child_by_field_name(node, "value", 5);
+    return (TSNode){0};
+}
+static inline bool cbm_js_pattern_binds(TSNode pattern, TSNode leaf, int depth) {
+    if (ts_node_is_null(pattern) || depth > 32) return false;
+    const char *kind = ts_node_type(pattern);
+    if (strcmp(kind, "identifier") == 0 ||
+        strcmp(kind, "shorthand_property_identifier_pattern") == 0)
+        return ts_node_eq(pattern, leaf);
+    if (cbm_js_pattern_container(kind)) {
+        for (uint32_t i = 0; i < ts_node_named_child_count(pattern); i++)
+            if (cbm_js_pattern_binds(ts_node_named_child(pattern, i), leaf, depth + 1)) return true;
+        return false;
+    }
+    return cbm_js_pattern_binds(cbm_js_pattern_child(pattern), leaf, depth + 1);
+}
+
+
 #endif

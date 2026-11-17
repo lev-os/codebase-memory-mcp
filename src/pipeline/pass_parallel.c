@@ -3510,7 +3510,10 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution &&
             !rust_external && !php_vendor_call && !java_external && count == 0) {
             /* Python LEGB fallback first (MUST match pass_calls.c). */
-            res = cbm_registry_resolve_call_scoped(
+            if (call->js_import_module)
+                res = cbm_pipeline_js_import_value(rc->main_gbuf, rc->project_name, rel, call,
+                                                   imp_keys, imp_vals, imp_count);
+            else res = cbm_registry_resolve_call_scoped(
                 rc->registry, call, module_qn, imp_keys, imp_vals, imp_count, lang,
                 cbm_pipeline_caller_is_test(source_node, rel, lang));
         }

@@ -5652,6 +5652,37 @@ static bool js_guess_refuted(const cbm_registry_t *r, const CBMCall *call, const
     return false;
 }
 
+cbm_resolution_t cbm_pipeline_js_import_value(const cbm_gbuf_t *gbuf, const char *project,
+                                              const char *rel, const CBMCall *call,
+                                              const char **keys, const char **vals, int count) {
+    if (!call->js_import_module || !call->js_import_member) return empty_result();
+    const cbm_gbuf_node_t *base = NULL;
+    if (call->js_import_root) {
+        for (int i = 0; i < count; i++) {
+            if (strcmp(keys[i], call->js_import_root) == 0) {
+                base = cbm_gbuf_find_by_qn(gbuf, vals[i]);
+                break;
+            }
+        }
+    } else {
+        cbm_pipeline_ctx_t ctx = {.gbuf = (cbm_gbuf_t *)gbuf, .project_name = project};
+        char *qn = cbm_pipeline_resolve_module(&ctx, rel, call->js_import_module);
+        base = qn ? cbm_gbuf_find_by_qn(gbuf, qn) : NULL;
+        free(qn);
+    }
+    if (!base) return empty_result();
+    const cbm_gbuf_node_t *target = base;
+    if (strcmp(base->label, "Module") == 0) {
+        char qn[CBM_SZ_1K];
+        int n = snprintf(qn, sizeof(qn), "%s.%s", base->qualified_name, call->js_import_member);
+        target = n > 0 && (size_t)n < sizeof(qn) ? cbm_gbuf_find_by_qn(gbuf, qn) : NULL;
+    }
+    if (!target || (strcmp(target->label, "Function") != 0 && strcmp(target->label, "Class") != 0))
+        return empty_result();
+    return (cbm_resolution_t){.qualified_name = target->qualified_name, .confidence = 0.95,
+                              .strategy = "import_binding", .candidate_count = 1};
+}
+
 /* The registry step both call resolvers (pass_calls.c, pass_parallel.c) run
  * once the LSP has not answered: a Python bare name bound in an enclosing def
  * first (the LSP binds those locals itself; this covers the sites it did not
