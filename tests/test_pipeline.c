@@ -36915,6 +36915,47 @@ TEST(pipeline_ts_factory_returns_keep_import_identity) {
     PASS();
 }
 
+TEST(pipeline_ts_captured_receiver_tracks_every_write) {
+    char tmp[256] = "/tmp/cbm_ts_captured_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "lib.ts",
+                    "export class Port { send() {} }\n"
+                    "export class Decoy { send() {} }\n"
+                    "export function make(): Port { return new Port(); }\n");
+    char source[1536], db[512], got[1024];
+    snprintf(db, sizeof(db), "%s/g.db", tmp);
+    bool ok = true;
+    for (int phase = 0; phase < 2; phase++) {
+        snprintf(source, sizeof(source),
+                 "import { Port, Decoy, make } from './lib';\n"
+                 "let item = make();\n"
+                 "function reset() { item = new %s(); }\n"
+                 "export function read() { item.send(); }\n"
+                 "let bad = new Port(); function unknown(Port: any) { bad = new Port(); }\n"
+                 "export function reject() { bad.send(); }\n",
+                 phase ? "Decoy" : "Port");
+        write_temp_file(tmp, "main.ts", source);
+        if (phase) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/main.ts", tmp);
+            ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000, 0), 0);
+        }
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(p);
+        ASSERT_EQ(cbm_pipeline_run(p), 0);
+        const char *project = cbm_pipeline_project_name(p);
+        js_twin_calls_at(db, project, "main.ts", 4, got, sizeof(got));
+        ok = js_twin_expect("captured receiver", got, phase ? "" : "main.read -> lib.Port.send") &&
+             ok;
+        js_twin_calls_at(db, project, "main.ts", 6, got, sizeof(got));
+        ok = js_twin_expect("shadowed constructor", got, "") && ok;
+        cbm_pipeline_free(p);
+    }
+    th_rmtree(tmp);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 TEST(pipeline_ts_return_utilities_follow_imports) {
     char tmp[256] = "/tmp/cbm_ts_return_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
@@ -37599,6 +37640,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_top_level_declaration_keeps_plain_name);
     RUN_TEST(pipeline_js_this_call_in_arrow_reaches_class_method);
     RUN_TEST(pipeline_ts_factory_returns_keep_import_identity);
+    RUN_TEST(pipeline_ts_captured_receiver_tracks_every_write);
     RUN_TEST(pipeline_ts_return_utilities_follow_imports);
     RUN_TEST(pipeline_ts_index_file_resolver_matches_main);
     RUN_TEST(pipeline_js_this_in_nested_function_is_not_the_class);

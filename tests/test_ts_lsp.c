@@ -5804,7 +5804,60 @@ TEST(tslsp_factory_return_scope_and_unknowns) {
     PASS();
 }
 
+TEST(tslsp_captured_receiver_requires_all_writes_to_agree) {
+    const char *source =
+        "class Port { send() {} }\n"
+        "class Decoy { send() {} }\n"
+        "function make(): Port { return new Port(); }\n"
+        "async function later(): Promise<Port> { return new Port(); }\n"
+        "let direct = new Port(); direct = new Port(); const rd = () => direct.send();\n"
+        "let nested = new Port(); function write() { nested = new Port(); } const rn = () => "
+        "nested.send();\n"
+        "let factory = make(); factory = make(); const rf = () => factory.send();\n"
+        "let awaited = new Port(); async function load() { awaited = await later(); } const ra = "
+        "() => awaited.send();\n"
+        "let mixed = new Port(); mixed = new Decoy(); const rm = () => mixed.send();\n"
+        "let opaque = new Port(); function bad(Port: any) { opaque = new Port(); } const ro = () "
+        "=> opaque.send();\n"
+        "let unpacked = new Port(); [unpacked] = outside; const ru = () => unpacked.send();\n"
+        "let updated = new Port(); updated++; const rx = () => updated.send();\n"
+        "let unknown = new Port(); unknown = outside; const rz = () => unknown.send();\n"
+        "let annotated: unknown = new Port(); annotated = new Port(); const rt = () => "
+        "annotated.send();\n"
+        "function local() { let p = make(); p = make(); const read = () => p.send(); }\n"
+        "let hidden = make(); function shadow(make: any) { hidden = make(); } const rh = () => "
+        "hidden.send();\n"
+        "const anyValue: unknown = new Port(); anyValue.send();\n"
+        "let cast = new Port(); cast = new Port(); (cast as any) = outside; const rcast = () => "
+        "cast.send();\n"
+        "let asserted = new Port(); asserted = new Port(); asserted! = outside; asserted.send();\n"
+        "function origin() { class Port { send() {} } let p = new Port(); p = make(); const read = "
+        "() => p.send(); }\n";
+    const TsLineTarget cases[] = {
+        {5, "test.main.Port.send"},
+        {6, "test.main.Port.send"},
+        {7, "test.main.Port.send"},
+        {8, "test.main.Port.send"},
+        {9, NULL},
+        {10, NULL},
+        {11, NULL},
+        {12, NULL},
+        {13, NULL},
+        {14, NULL},
+        {15, "test.main.Port.send"},
+        {16, NULL},
+        {17, NULL},
+        {18, NULL},
+        {19, NULL},
+        {20, NULL},
+    };
+    ASSERT_TRUE(
+        ts_check_line_targets("captured writes", source, cases, sizeof(cases) / sizeof(cases[0])));
+    PASS();
+}
+
 SUITE(ts_lsp) {
+    RUN_TEST(tslsp_captured_receiver_requires_all_writes_to_agree);
     RUN_TEST(tslsp_factory_return_scope_and_unknowns);
     RUN_TEST(tslsp_return_utilities_preserve_receiver_identity);
     RUN_TEST(tslsp_unknown_named_lookup_work_is_linear);
