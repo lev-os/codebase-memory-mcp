@@ -7195,15 +7195,17 @@ static const CBMType *ts_annotation_field_type(TSLSPContext *ctx, TSNode owner) 
 
 /* Declared type of a class field (`public_field_definition`) or interface
  * property: the annotation when present, else, for an unannotated field
- * initialized by a constructor or a call, the proven expression type.
- * Unknown annotations still win over an initializer. */
+ * initialised with `new C()`, the type of that instance (#514). No other
+ * initializer is inferred: `new` names its type exactly, arbitrary
+ * expressions do not. */
 static const CBMType *ts_field_decl_type(TSLSPContext *ctx, TSNode m) {
     if (!ts_node_is_null(ts_node_child_by_field_name(m, "type", TS_LSP_FIELD_LEN("type"))))
         return ts_annotation_field_type(ctx, m);
     TSNode val = ts_node_child_by_field_name(m, "value", TS_LSP_FIELD_LEN("value"));
-    if (!node_kind_is(val, "new_expression") && !node_kind_is(val, "call_expression"))
+    if (ts_node_is_null(val) || strcmp(ts_node_type(val), "new_expression") != 0)
         return cbm_type_unknown();
-    return ts_eval_expr_type(ctx, val);
+    const CBMType *nt = ts_new_expression_type(ctx, val);
+    return nt ? nt : cbm_type_unknown();
 }
 
 /* A constructor parameter is a TS parameter property, i.e. also declares a
@@ -7376,25 +7378,6 @@ static void ast_sweep_shapes(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *re
 
             // Constructor parameter properties are class fields too (#514).
             if (!is_interface && strcmp(mk, "method_definition") == 0) {
-                bool getter = false, is_static = false;
-                for (uint32_t j = 0; j < ts_node_child_count(m); j++) {
-                    TSNode part = ts_node_child(m, j);
-                    getter = getter || node_kind_is(part, "get");
-                    is_static = is_static || node_kind_is(part, "static");
-                }
-                if (getter && !is_static) {
-                    TSNode name = ts_node_child_by_field_name(m, "name", 4);
-                    TSNode type = ts_node_child_by_field_name(m, "return_type", 11);
-                    if (!ts_node_is_null(name)) {
-                        field_names[field_count] = node_text(ctx, name);
-                        if (node_kind_is(type, "type_annotation"))
-                            type = ts_node_named_child(type, 0);
-                        field_types[field_count++] = ts_node_is_null(type)
-                                                         ? cbm_type_unknown()
-                                                         : ts_parse_type_node(ctx, type);
-                    }
-                    continue;
-                }
                 field_count =
                     ts_collect_param_properties(ctx, m, field_names, field_types, field_count, 63);
                 continue;

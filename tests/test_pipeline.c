@@ -11987,15 +11987,11 @@ TEST(pipeline_ts_param_property_injection_issue514) {
         "  private fresh = new CatService();\n"
         "  private annotated: BaseService = new CatService();\n"
         "  private factory = makeService();\n"
-        "  get exposed(): CatService { return makeService(); }\n"
-        "  get concealed(): unknown { return makeService(); }\n"
         "  constructor(protected cats: CatService) {}\n"
         "  reportInjected() { return this.cats.findAll(); }\n"
         "  reportLocal() { return this.fresh.findAll(); }\n"
         "  reportAnnotated() { return this.annotated.findAll(); }\n"
         "  reportFactory() { return this.factory.findAll(); }\n"
-        "  reportGetter() { return this.exposed.findAll(); }\n"
-        "  reportUnknownGetter() { return this.concealed.findAll(); }\n"
         "}\n",
     };
     static const struct {
@@ -12019,10 +12015,6 @@ TEST(pipeline_ts_param_property_injection_issue514) {
         {1, "CatController.viaPlain", "this.plain.findAll()", "this.plain.findAll",
          "CatService.findAll", 0},
         {2, "CatReporter.reportFactory", "this.factory.findAll()", "this.factory.findAll",
-         "CatService.findAll", 1},
-        {2, "CatReporter.reportGetter", "this.exposed.findAll()", "this.exposed.findAll",
-         "CatService.findAll", 1},
-        {2, "CatReporter.reportUnknownGetter", "this.concealed.findAll()", "this.concealed.findAll",
          "CatService.findAll", 0},
     };
     enum { NCASES = (int)(sizeof(cases) / sizeof(cases[0])) };
@@ -12089,14 +12081,12 @@ TEST(pipeline_ts_param_property_injection_issue514) {
     }
     int run_rc[2] = {-1, -1}, files[2] = {-1, -1};
     int edges[2][NCASES], source_nodes[2][NCASES], target_nodes[2][NCASES];
-    int unresolved_calls[2][NCASES];
+    int unresolved_calls[2][2] = {{-1, -1}, {-1, -1}};
     int self_loop[2] = {-1, -1}, annotation_wrong[2] = {-1, -1};
     bool configured[2] = {false, false}, opened[2] = {false, false};
     for (int mode = 0; mode < 2; mode++) {
-        for (int i = 0; i < NCASES; i++) {
+        for (int i = 0; i < NCASES; i++)
             edges[mode][i] = source_nodes[mode][i] = target_nodes[mode][i] = -1;
-            unresolved_calls[mode][i] = -1;
-        }
         cbm_setenv("CBM_WORKERS", "4", 1);
         if (mode == 0)
             cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
@@ -12132,7 +12122,7 @@ TEST(pipeline_ts_param_property_injection_issue514) {
                     tgt,     paths[0], cases[i].want ? "lsp_ts_method" : ""};
                 edges[mode][i] = ts514_pipeline_count(store, edge_sql, edge_values, 6);
                 if (!cases[i].want)
-                    unresolved_calls[mode][i] = ts514_pipeline_count(
+                    unresolved_calls[mode][i - 5] = ts514_pipeline_count(
                         store,
                         "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
                         "WHERE e.project=?1 AND e.type='CALLS' "
@@ -12190,9 +12180,9 @@ TEST(pipeline_ts_param_property_injection_issue514) {
             ASSERT_EQ(source_nodes[mode][i], 1);
             ASSERT_EQ(target_nodes[mode][i], 1);
             ASSERT_EQ(edges[mode][i], cases[i].want);
-            if (!cases[i].want)
-                ASSERT_EQ(unresolved_calls[mode][i], 0);
         }
+        ASSERT_EQ(unresolved_calls[mode][0], 0);
+        ASSERT_EQ(unresolved_calls[mode][1], 0);
         ASSERT_EQ(self_loop[mode], 0);
         ASSERT_EQ(annotation_wrong[mode], 0);
     }
