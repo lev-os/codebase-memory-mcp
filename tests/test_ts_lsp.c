@@ -6021,7 +6021,23 @@ TEST(tslsp_x9c_normal_exits_return_class) {
     PASS();
 }
 
+TEST(tslsp_x9c_async_return_awaits_promise) {
+    const char *source = "class Port { send() {} }\n"
+                         "function later(): Promise<Port> { return null; }\n"
+                         "async function relay() { return later(); }\n"
+                         "async function use() { (await relay()).send(); }\n"
+                         "function pending() { relay().send(); }\n"
+                         "function nested(): Promise<Promise<Port>> { return null; }\n"
+                         "async function twice() { (await nested()).send(); }\n";
+    const TsLineTarget cases[] = {
+        {4, "test.main.Port.send"}, {5, NULL}, {7, "test.main.Port.send"}};
+    ASSERT_TRUE(ts_check_line_targets("async flatten", source, cases, 3));
+    PASS();
+}
+
 SUITE(ts_lsp) {
+    RUN_TEST(tslsp_x9c_async_return_awaits_promise);
+
     RUN_TEST(tslsp_x9c_normal_exits_return_class);
 
     RUN_TEST(tslsp_x9c_provider_binding_writes);

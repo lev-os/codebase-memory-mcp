@@ -1509,6 +1509,8 @@ static const CBMType *eval_conditional(TSLSPContext *ctx, const CBMType *t, int 
 
 // Resolve a CBMType against the registry's alias chain when it's a NAMED type that's a
 // pure alias (`type Foo = Bar`). Also evaluates inline conditional types.
+static const CBMType *ts_awaited_type_at(TSLSPContext *ctx, const CBMType *value, int depth);
+
 static const CBMType *simplify_type_at(TSLSPContext *ctx, const CBMType *t, int depth) {
     if (!t || !ctx || !ctx->registry)
         return t;
@@ -1541,20 +1543,8 @@ static const CBMType *simplify_type_at(TSLSPContext *ctx, const CBMType *t, int 
                 return cbm_type_unknown();
             return simplify_type_at(ctx, fn->data.func.return_types[0], depth + 1);
         }
-        if (strcmp(name, "Awaited") == 0) {
-            const CBMType *value =
-                simplify_type_at(ctx, t->data.template_type.template_args[0], depth + 1);
-            while (value && value->kind == CBM_TYPE_TEMPLATE &&
-                   value->data.template_type.template_name &&
-                   strcmp(value->data.template_type.template_name, "Promise") == 0 &&
-                   value->data.template_type.arg_count == 1 &&
-                   value->data.template_type.template_args) {
-                if (++depth >= 32)
-                    return cbm_type_unknown();
-                value = simplify_type_at(ctx, value->data.template_type.template_args[0], depth);
-            }
-            return value;
-        }
+        if (strcmp(name, "Awaited") == 0)
+            return ts_awaited_type_at(ctx, t->data.template_type.template_args[0], depth + 1);
     }
     if (t->kind == CBM_TYPE_CONDITIONAL) {
         const CBMType *evaluated = eval_conditional(ctx, t, 0);
@@ -1576,6 +1566,19 @@ static const CBMType *simplify_type_at(TSLSPContext *ctx, const CBMType *t, int 
         t = cbm_type_named(ctx->arena, rt->alias_of);
     }
     return t;
+}
+
+/* Await and async return adoption share the same bounded recursive unwrap. */
+static const CBMType *ts_awaited_type_at(TSLSPContext *ctx, const CBMType *value, int depth) {
+    value = simplify_type_at(ctx, value, depth + 1);
+    while (value && value->kind == CBM_TYPE_TEMPLATE && value->data.template_type.template_name &&
+           strcmp(value->data.template_type.template_name, "Promise") == 0 &&
+           value->data.template_type.arg_count == 1 && value->data.template_type.template_args) {
+        if (++depth >= 32)
+            return cbm_type_unknown();
+        value = simplify_type_at(ctx, value->data.template_type.template_args[0], depth);
+    }
+    return value;
 }
 
 static const CBMType *simplify_type(TSLSPContext *ctx, const CBMType *t) {
@@ -3431,14 +3434,7 @@ const CBMType *ts_eval_expr_type(TSLSPContext *ctx, TSNode node) {
     } else if (strcmp(kind, "await_expression") == 0) {
         TSNode inner = ts_node_named_child(node, 0);
         const CBMType *t = ts_eval_expr_type(ctx, inner);
-        // Promise<T> → T.
-        if (t && t->kind == CBM_TYPE_TEMPLATE && t->data.template_type.template_name &&
-            strcmp(t->data.template_type.template_name, "Promise") == 0 &&
-            t->data.template_type.arg_count >= 1 && t->data.template_type.template_args) {
-            result = t->data.template_type.template_args[0];
-        } else {
-            result = t;
-        }
+        result = ts_awaited_type_at(ctx, t, 0);
     } else if (strcmp(kind, "string") == 0 || strcmp(kind, "template_string") == 0) {
         result = cbm_type_builtin(ctx->arena, "string");
     } else if (strcmp(kind, "number") == 0) {
@@ -7334,7 +7330,7 @@ static void infer_implicit_returns(TSLSPContext *ctx, TSNode root, CBMTypeRegist
             continue;
         for (uint32_t j = 0; j < ts_node_child_count(decl); j++) {
             if (node_kind_is(ts_node_child(decl, j), "async")) {
-                const CBMType *args[] = {inferred, NULL};
+                const CBMType *args[] = {ts_awaited_type_at(ctx, inferred, 0), NULL};
                 inferred = cbm_type_template(ctx->arena, "Promise", args, 1);
                 break;
             }
