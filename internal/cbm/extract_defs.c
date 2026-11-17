@@ -5887,7 +5887,8 @@ static const char *ts_constructor_return(CBMExtractCtx *ctx, TSNode fn) {
             return NULL;
     }
     TSNode body = ts_node_child_by_field_name(fn, TS_FIELD("body"));
-    if (ts_node_is_null(body))
+    if (ts_node_is_null(body) || (strcmp(ts_node_type(body), "statement_block") == 0 &&
+                                  !cbm_ts_returns_on_normal_exit(body, 0)))
         return NULL;
     /* Most unannotated callables contain no constructor at all. Avoid a
      * second syntax walk for that common case. */

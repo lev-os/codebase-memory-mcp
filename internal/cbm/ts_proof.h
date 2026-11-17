@@ -36,4 +36,28 @@ static inline TSNode cbm_ts_return_binding(TSNode node) {
     return (TSNode){0};
 }
 
+/* Prove that control cannot reach the end normally. Unsupported control flow
+ * withholds inference; returning and throwing both terminate a normal path. */
+static inline bool cbm_ts_returns_on_normal_exit(TSNode node, int depth) {
+    if (ts_node_is_null(node) || depth > 64)
+        return false;
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "return_statement") == 0 || strcmp(kind, "throw_statement") == 0)
+        return true;
+    if (strcmp(kind, "if_statement") == 0)
+        return cbm_ts_returns_on_normal_exit(ts_node_child_by_field_name(node, "consequence", 11),
+                                             depth + 1) &&
+               cbm_ts_returns_on_normal_exit(ts_node_child_by_field_name(node, "alternative", 11),
+                                             depth + 1);
+    if (strcmp(kind, "else_clause") == 0)
+        return cbm_ts_returns_on_normal_exit(ts_node_named_child(node, 0), depth + 1);
+    if (strcmp(kind, "statement_block") == 0) {
+        uint32_t count = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < count; i++)
+            if (cbm_ts_returns_on_normal_exit(ts_node_named_child(node, i), depth + 1))
+                return true;
+    }
+    return false;
+}
+
 #endif

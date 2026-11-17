@@ -6002,7 +6002,28 @@ TEST(tslsp_x9c_dynamic_scope_withholds_constructor_facts) {
     PASS();
 }
 
+TEST(tslsp_x9c_normal_exits_return_class) {
+    const char *source =
+        "export class Port { send() {} }\n"
+        "export function make(flag) { if (flag) return new Port(); }\n"
+        "function use() { make(true).send(); }\n"
+        "function total(flag) { if (flag) return new Port(); else return new Port(); }\n"
+        "function keep() { total(true).send(); }\n"
+        "function throws(flag) { if (flag) throw 0; return new Port(); }\n"
+        "function keepThrow() { throws(false).send(); }\n"
+        "function loop(xs) { for (const x of xs) return new Port(); }\n"
+        "function rejectLoop() { loop([]).send(); }\n";
+    const TsLineTarget cases[] = {
+        {3, NULL}, {5, "test.main.Port.send"}, {7, "test.main.Port.send"}, {9, NULL}};
+    bool fact = x9c_factory_fact(source, false);
+    bool body = ts_check_line_targets("normal exits", source, cases, 4);
+    ASSERT_TRUE(fact && body);
+    PASS();
+}
+
 SUITE(ts_lsp) {
+    RUN_TEST(tslsp_x9c_normal_exits_return_class);
+
     RUN_TEST(tslsp_x9c_provider_binding_writes);
     RUN_TEST(tslsp_x9c_mutable_class_keeps_async_promise);
     RUN_TEST(tslsp_x9c_dynamic_scope_withholds_constructor_facts);

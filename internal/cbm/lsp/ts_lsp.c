@@ -6649,7 +6649,7 @@ done:
 /* Infer only when every return in this callable proves the same type.
  * Nested callables own their returns; traversal order never chooses a type. */
 static const CBMType *infer_return_type_from_body(TSLSPContext *ctx, TSNode body) {
-    if (ts_node_is_null(body))
+    if (ts_node_is_null(body) || !cbm_ts_returns_on_normal_exit(body, 0))
         return cbm_type_unknown();
 
     TSNode inline_stack[TS_WALK_STACK_INLINE];
