@@ -1,3 +1,4 @@
+#include "js_scope.h"
 #include "callable_overload.h"
 #include "cbm.h"
 #include "callable_sig.h"
@@ -14388,13 +14389,6 @@ static bool js_twin_lang(CBMLanguage lang) {
 }
 
 /* Callable kinds with a body, which a call can sit in. */
-static bool js_twin_bodied_kind(const char *k) {
-    return strcmp(k, "function_declaration") == 0 ||
-           strcmp(k, "generator_function_declaration") == 0 ||
-           strcmp(k, "function_expression") == 0 || strcmp(k, "function") == 0 ||
-           strcmp(k, "generator_function") == 0 || strcmp(k, "arrow_function") == 0 ||
-           strcmp(k, "method_definition") == 0;
-}
 
 static bool js_twin_function_value_kind(const char *k) {
     return strcmp(k, "function_expression") == 0 || strcmp(k, "function") == 0 ||
@@ -14406,7 +14400,7 @@ static bool js_twin_function_value_kind(const char *k) {
 static bool js_twin_in_body(const TSNode *anc, int depth) {
     for (int i = 0; i < depth; i++) {
         const char *k = ts_node_type(anc[i]);
-        if (js_twin_bodied_kind(k) || strcmp(k, "class_static_block") == 0) {
+        if (cbm_js_bodied_kind(k) || strcmp(k, "class_static_block") == 0) {
             return true;
         }
     }
@@ -14658,7 +14652,7 @@ static const char *js_twin_owner(CBMExtractCtx *ctx, const TSNode *anc, int dept
             }
             continue;
         }
-        if (js_twin_bodied_kind(k)) {
+        if (cbm_js_bodied_kind(k)) {
             if (js_twin_callable_name(ctx, x, parent, &seg[n], &seg_len[n])) {
                 n++;
                 named = true;
@@ -14860,20 +14854,8 @@ static void js_twin_pattern_decls(js_twin_walk_t *w, TSNode pat, uint32_t lo, ui
 static bool js_twin_scope(const TSNode *anc, int depth, bool var_scope, uint32_t *lo,
                           uint32_t *hi) {
     for (int i = depth - SKIP_ONE; i >= 0; i--) {
-        const char *k = ts_node_type(anc[i]);
-        bool hit = strcmp(k, "program") == 0 || strcmp(k, "class_static_block") == 0;
-        TSNode at = anc[i];
-        if (var_scope) {
-            if (js_twin_bodied_kind(k)) {
-                TSNode body = ts_node_child_by_field_name(anc[i], TS_FIELD("body"));
-                hit = true;
-                at = ts_node_is_null(body) ? anc[i] : body;
-            }
-        } else {
-            hit = hit || strcmp(k, "statement_block") == 0 || strcmp(k, "switch_body") == 0 ||
-                  strcmp(k, "for_statement") == 0 || strcmp(k, "for_in_statement") == 0;
-        }
-        if (hit) {
+        TSNode at = cbm_js_scope_node(anc[i], var_scope);
+        if (!ts_node_is_null(at)) {
             *lo = ts_node_start_byte(at);
             *hi = ts_node_end_byte(at);
             return true;
@@ -14887,7 +14869,7 @@ static void js_twin_node_decls(js_twin_walk_t *w, TSNode n, const char *k, const
                                int depth) {
     uint32_t lo = 0;
     uint32_t hi = 0;
-    if (js_twin_bodied_kind(k)) {
+    if (cbm_js_bodied_kind(k)) {
         /* Parameters bind in the callable; a function expression's own name
          * only inside it; a declaration's in the block around it. */
         TSNode params = ts_node_child_by_field_name(n, TS_FIELD("parameters"));
@@ -14910,7 +14892,7 @@ static void js_twin_node_decls(js_twin_walk_t *w, TSNode n, const char *k, const
         TSNode name = ts_node_child_by_field_name(n, TS_FIELD("name"));
         TSNode value = ts_node_child_by_field_name(n, TS_FIELD("value"));
         if (!ts_node_is_null(name) && strcmp(ts_node_type(name), "identifier") == 0) {
-            bool callable = !ts_node_is_null(value) && js_twin_bodied_kind(ts_node_type(value));
+            bool callable = !ts_node_is_null(value) && cbm_js_bodied_kind(ts_node_type(value));
             js_twin_add_decl(w, name, lo, hi, callable ? value : (TSNode){0}, true);
         } else {
             js_twin_pattern_decls(w, name, lo, hi, 0);
@@ -14962,7 +14944,7 @@ static bool js_twin_walk(js_twin_walk_t *w) {
     for (;;) {
         TSNode n = ts_tree_cursor_current_node(&cur);
         const char *k = ts_node_is_named(n) ? ts_node_type(n) : NULL;
-        if (k && js_twin_bodied_kind(k)) {
+        if (k && cbm_js_bodied_kind(k)) {
             uint32_t byte = ts_node_start_byte(n);
             js_twin_member_t *m = bsearch(&byte, w->members, (size_t)w->nmembers,
                                           sizeof(*w->members), js_twin_member_start_cmp);

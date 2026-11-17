@@ -1,3 +1,4 @@
+#include "js_scope.h"
 #include "cbm.h"
 #include "helpers.h"
 #include "lang_specs.h"
@@ -2076,6 +2077,26 @@ static bool js_var_binding(TSNode node) {
     return false;
 }
 
+/* Select the same AST scope as the same-name callable binder. Concrete
+ * lexical IDs remain private to this walk, but their byte spans must agree. */
+static uint32_t js_declaration_scope_id(const WalkState *state, TSNode node, bool is_var) {
+    for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
+         parent = ts_node_parent(parent)) {
+        TSNode owner = cbm_js_scope_node(parent, is_var);
+        if (ts_node_is_null(owner)) continue;
+        uint32_t id = active_lexical_scope_id(state);
+        while (id) {
+            const CBMLexicalScope *scope = usage_lexical_scope(state, id);
+            if (!scope) break;
+            if (scope->start_byte == ts_node_start_byte(owner) &&
+                scope->end_byte == ts_node_end_byte(owner)) return id;
+            id = scope->parent_id;
+        }
+        return state->root_lexical_scope_id;
+    }
+    return state->root_lexical_scope_id;
+}
+
 static bool import_kind_matches(TSNode node, const CBMLangSpec *spec) {
     return (spec->import_node_types && cbm_kind_in_set(node, spec->import_node_types)) ||
            (spec->import_from_types && cbm_kind_in_set(node, spec->import_from_types));
@@ -2472,14 +2493,7 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
         whole_scope = true;
     } else if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
                ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) {
-        bool is_var = js_var_binding(node);
-        scope_id = lexical_ancestor_of_kind(state, current_id, is_var, !is_var);
-        if (scope_id == 0) {
-            scope_id = lexical_ancestor_of_kind(state, current_id, true, false);
-        }
-        if (scope_id == 0) {
-            scope_id = state->root_lexical_scope_id;
-        }
+        scope_id = js_declaration_scope_id(state, node, js_var_binding(node));
         whole_scope = true; /* var hoisting and let/const TDZ */
     } else if (ctx->language == CBM_LANG_RUST && import_binding) {
         scope_id = lexical_import_scope(state, current_id);

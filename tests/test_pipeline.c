@@ -15811,6 +15811,20 @@ static int check_x11b_reassigned(bool parallel) {
 TEST(pipeline_x11b_reassigned) { return check_x11b_reassigned(false); }
 TEST(pipeline_x11b_reassigned_parallel) { return check_x11b_reassigned(true); }
 
+static int check_x11b_default_scope(bool parallel) {
+    static const ng_file_t files[] = {
+        {"src/defaults.js", "function run() { return 1; }\n"
+         "export function use(value = run()) { var run = 0; return value; }\n"},
+    };
+    static const ng_pair_t pairs[] = {
+        {"defaults.use", "defaults.run", 1, "body var is invisible in defaults"},
+        {"defaults.use", "*", 1, "complete outgoing set"},
+    };
+    return ng_check(files, 1, pairs, 2, parallel);
+}
+TEST(pipeline_x11b_default_scope) { return check_x11b_default_scope(false); }
+TEST(pipeline_x11b_default_scope_parallel) { return check_x11b_default_scope(true); }
+
 /* A member call on a receiver the TS resolver typed as a built-in
  * (`const rows: number[] = []; rows.push(1)`, a `Map`, an array parameter)
  * names the built-in's method. Before, the resolver's Array.push had no graph
@@ -38143,6 +38157,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_module_callers_parallel);
     RUN_TEST(pipeline_tsjs_same_module_bound_receiver_not_bound);
     RUN_TEST(pipeline_tsjs_same_module_bound_receiver_not_bound_parallel);
+    RUN_TEST(pipeline_x11b_default_scope);
+    RUN_TEST(pipeline_x11b_default_scope_parallel);
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
 #endif
     RUN_TEST(pipeline_x11b_reassigned);
