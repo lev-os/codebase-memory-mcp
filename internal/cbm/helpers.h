@@ -121,6 +121,12 @@ TSNode cbm_c_macro_wrapped_name_node(TSNode decl);
 // language for that reason; every caller must pass ctx->language.
 char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source, CBMLanguage lang);
 
+// A JS/TS property key written as a string or number literal. Its definition is
+// named by cbm_js_literal_key_name (quotes removed, the empty key `""`), and
+// cbm_func_name_node_text gives its escaped QN segment.
+bool cbm_js_literal_key_node(TSNode name_node, CBMLanguage lang);
+char *cbm_js_literal_key_name(CBMArena *a, TSNode name_node, const char *source);
+
 // ── Nix attrpath helpers ──
 // A Nix binding's name is a PATH (`a.b.c = …`) whose segments may be quoted or
 // interpolated. Shared by the defs and unified (call-scope) extractors so both

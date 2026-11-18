@@ -7779,6 +7779,43 @@ static void ast_sweep_shapes(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *re
     }
 }
 
+static int ts_name_ptr_cmp(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* Mark each bare call whose name no assignment in the file writes and no
+ * `var` declares (closures included). Only such a call keeps a self CALLS
+ * edge: `walk = other; walk();` inside walk reaches other, not walk. An
+ * incomplete site set marks nothing, so the self edge fails closed. */
+static void ts_mark_unwritten_callees(TSLSPContext *ctx, CBMFileResult *result) {
+    const struct TsAssignSites *s = ctx->assign_sites;
+    if (!s || !s->complete)
+        return;
+    const char **vars = NULL;
+    if (s->hoisted_count) {
+        vars = (const char **)cbm_arena_alloc(ctx->arena,
+                                              (size_t)s->hoisted_count * sizeof(*vars));
+        if (!vars)
+            return;
+        for (int i = 0; i < s->hoisted_count; i++)
+            vars[i] = s->hoisted[i].name;
+        qsort(vars, (size_t)s->hoisted_count, sizeof(*vars), ts_name_ptr_cmp);
+    }
+    for (int i = 0; i < result->calls.count; i++) {
+        CBMCall *call = &result->calls.items[i];
+        const char *name = call->callee_name;
+        if (!name || !name[0] || strchr(name, '.'))
+            continue;
+        int at = ts_proof_first_name(s->by_name, s->count, name);
+        if (at < s->count && strcmp(s->by_name[at].name, name) == 0)
+            continue;
+        if (vars && bsearch(&name, vars, (size_t)s->hoisted_count, sizeof(*vars),
+                            ts_name_ptr_cmp))
+            continue;
+        call->callee_never_written = true;
+    }
+}
+
 void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
                     TSNode root, bool js_mode, bool jsx_mode, bool dts_mode) {
     if (!arena || !result || !source || ts_node_is_null(root))
@@ -7836,6 +7873,7 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     reg.index_first_registered = true;
     cbm_registry_finalize_into(&reg, &idx_arena);
     ts_lsp_process_file(&ctx, root);
+    ts_mark_unwritten_callees(&ctx, result);
     cbm_arena_destroy(&idx_arena);
 }
 

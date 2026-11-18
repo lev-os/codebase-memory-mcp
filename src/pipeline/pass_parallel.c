@@ -2486,9 +2486,9 @@ static void emit_config_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                              const cbm_gbuf_node_t *target, const CBMCall *call,
                              const cbm_resolution_t *res, const char *arg) {
     /* emit_service_edge may be reached with target==NULL on the HTTP/ASYNC
-     * external-client bypass (#523); a CONFIGURES edge needs a real target, so
+     * external-client bypass (#523); a CONFIGURES edge needs a real, distinct target, so
      * never deref a NULL target here. */
-    if (!target) {
+    if (!target || source->id == target->id) {
         return;
     }
     char esc_c[CBM_SZ_256];
@@ -2912,6 +2912,16 @@ static bool emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                               const cbm_gbuf_t *main_gbuf, const char **imp_keys,
                               const char **imp_vals, int imp_count, bool suppress_plain_calls,
                               const char *route_mount, CBMLanguage lang) {
+    /* Match emit_classified_edge: exact recursion bypasses classifiers. */
+    if (target && source->id == target->id) {
+        if (cbm_pipeline_exact_self_call(lang, call, res)) {
+            return !suppress_plain_calls &&
+                   emit_normal_calls_edge(gbuf, source, target, call, res);
+        }
+        /* Unresolved routes use the source as a placeholder target. Keep
+         * classification onto real route/service nodes, never a self call. */
+        suppress_plain_calls = true;
+    }
     cbm_svc_kind_t svc = cbm_service_pattern_match_in_project(
         res->qualified_name, target ? target->name : NULL,
         target && res->qualified_name && strcmp(target->qualified_name, res->qualified_name) == 0
@@ -3433,8 +3443,16 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             !exact_key_ambiguous) {
             lsp = lsp_idx_lookup(lsp_legacy_idx, call, false, &legacy_key_built, NULL);
         }
-        if (!lsp && (!lsp_legacy_idx_complete || !legacy_key_built || allow_tail ||
-                     call->requires_lsp_resolution)) {
+        /* A call that needs a binding matches only a row at its own site
+         * (cbm_pipeline_invocation_site_rank), so an authoritative exact
+         * index is its full answer, a miss included: an unresolved built-in
+         * such as setTimeout(...) must not scan every resolver row. */
+        bool exact_answered =
+            exact_index_authoritative && !exact_key_ambiguous &&
+            cbm_pipeline_source_site_present(call->site_start_byte, call->site_end_byte);
+        if (!lsp && (allow_tail || (call->requires_lsp_resolution
+                                        ? !exact_answered
+                                        : !lsp_legacy_idx_complete || !legacy_key_built))) {
             /* Fallback to the linear scan for edge cases the index may
              * miss (e.g. callee_name that wasn't the registered short
              * name). Keeps semantics identical. */
@@ -3492,8 +3510,13 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * pass_calls.c; the service fallbacks below still see the call. */
         bool php_vendor_call = cbm_pipeline_php_vendor_call(php_vendor, result, call) ||
                                (lsp && !lsp_target && cbm_pipeline_lsp_external_receiver(lsp));
-        bool rust_external = lsp && cbm_pipeline_rust_external_target(
-                                        lang, lsp->strategy, lsp->callee_qn, rc->project_name);
+        /* The same holds for a TS/JS call the TS resolver placed on a built-in
+         * method (Array.push). Mirrors pass_calls.c. */
+        bool rust_external =
+            lsp && (cbm_pipeline_rust_external_target(lang, lsp->strategy, lsp->callee_qn,
+                                                      rc->project_name) ||
+                    cbm_pipeline_ts_builtin_target(lang, lsp->strategy, lsp->callee_qn,
+                                                   rc->project_name));
         /* Typed Swift calls must not scan the global name bucket first. */
         const char *candidates[CBM_SZ_256];
         int count = 0;
@@ -3532,7 +3555,11 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         /* A synthetic semantic candidate is an invocation only when the LSP
          * resolved it to a concrete graph node. Never let registry, field-name,
          * route, or service heuristics manufacture a target for it. */
-        if (call->requires_lsp_resolution && !lsp_target) {
+        /* JS/TS keeps the service, route and configuration classification
+         * below: the registry skipped the call, so res stays empty and no
+         * plain CALLS target exists. MUST match pass_calls.c. */
+        if (call->requires_lsp_resolution && !lsp_target && lang != CBM_LANG_JAVASCRIPT &&
+            lang != CBM_LANG_TYPESCRIPT && lang != CBM_LANG_TSX && lang != CBM_LANG_ARKTS) {
             continue;
         }
 
@@ -3799,6 +3826,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
         atomic_fetch_add_explicit(&rc->time_ns_rc_target, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
+        if (!lsp_target && cbm_pipeline_js_type_only_target(lang, target_node)) {
+            drop_plain_call = true;
+        }
         /* A call that resolved onto a struct Field: refused across languages
          * and for a bare C call; a C/C++ member call takes the Field its
          * object's type names. Mirrors the sequential twin (pass_calls.c). */
@@ -3846,7 +3876,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
              * never a package init or a method found by name alone. */
             continue;
         }
-        if (!target_node || source_node->id == target_node->id) {
+        if (!target_node || (source_node->id == target_node->id &&
+                             !cbm_pipeline_exact_self_call(lang, call, &res))) {
             /* HTTP/ASYNC calls to an EXTERNAL client library (`requests.get(url)`)
              * resolve to an unindexed QN (target_node == NULL), but their edge
              * target is a synthesized route node, not the library — emit them
@@ -3875,6 +3906,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         const cbm_gbuf_node_t *ovl[CBM_OVERLOAD_TARGETS_MAX];
         int novl = cbm_pipeline_overload_targets(rc->main_gbuf, target_node, call, lang, ovl,
                                                  CBM_OVERLOAD_TARGETS_MAX);
+        if (novl > 1 && target_node->id == source_node->id) {
+            continue; /* no exact member of this recursive overload group */
+        }
         if (novl > 1) {
             res.strategy = CBM_OVERLOAD_AMBIGUOUS_STRATEGY;
             if (res.confidence > CBM_OVERLOAD_AMBIGUOUS_CONFIDENCE) {
@@ -3890,7 +3924,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
         if (novl > 0) {
             target_node = ovl[0];
-            if (target_node->id == source_node->id) {
+            if (target_node->id == source_node->id && !cbm_pipeline_exact_self_call(lang, call, &res)) {
                 continue;
             }
         }

@@ -478,6 +478,7 @@ static bool push_scope(WalkState *state, uint8_t kind, uint32_t depth, const cha
     }
     CBMWalkScope *f = &state->scopes[state->scope_top];
     f->prev_py_param_stack_count = state->py_param_stack_count;
+    f->prev_active_lexical_scope_id = state->active_lexical_scope_id;
     f->kind = kind;
     f->depth = depth;
     f->qn = qn;
@@ -536,8 +537,11 @@ static bool push_lexical_scope(WalkState *state, uint8_t walk_kind, uint32_t dep
     if (walk_kind == SCOPE_CLASS || walk_kind == SCOPE_NAMESPACE) {
         state->enclosing_class_node = node;
     }
-    state->scopes[state->scope_top - SKIP_ONE].lexical_scope_id =
-        add_lexical_scope(state, node, lexical_kind);
+    uint32_t id = add_lexical_scope(state, node, lexical_kind);
+    state->scopes[state->scope_top - SKIP_ONE].lexical_scope_id = id;
+    if (id != 0) {
+        state->active_lexical_scope_id = id;
+    }
     return true;
 }
 
@@ -549,6 +553,7 @@ static bool push_existing_lexical_scope(WalkState *state, uint8_t walk_kind, uin
         return false;
     }
     state->scopes[state->scope_top - SKIP_ONE].lexical_scope_id = lexical_scope_id;
+    state->active_lexical_scope_id = lexical_scope_id;
     uint32_t end_byte = ts_node_end_byte(node);
     if (end_byte > scope->end_byte) {
         scope->end_byte = end_byte;
@@ -621,6 +626,7 @@ static void pop_expired_scopes(WalkState *state, uint32_t cur_depth) {
         state->inside_import = f->prev_inside_import;
         state->loop_depth = f->prev_loop_depth;
         state->branch_depth = f->prev_branch_depth;
+        state->active_lexical_scope_id = f->prev_active_lexical_scope_id;
         py_param_unwind_to(state, f->prev_py_param_stack_count);
     }
 }
@@ -3025,6 +3031,8 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     state.py_param_tracking_failed = false;
     state.usage_start_index = ctx->result->usages.count;
     state.root_lexical_scope_id = add_lexical_scope(&state, ctx->root, CBM_LEXICAL_SCOPE_MODULE);
+    state.active_lexical_scope_id = state.root_lexical_scope_id;
+    state.call_start_index = ctx->result->calls.count;
     /* Base walk-state tuple (previously established by the first
      * recompute_state call): module scope, nothing else active. */
     state.enclosing_func_qn = ctx->module_qn;

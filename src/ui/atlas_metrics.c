@@ -499,7 +499,7 @@ static char *mx_build_json(cbm_store_t *store, const char *project, const char *
     }
 
     /* C. Dead code (candidates only; entry/test/exported excluded, matching
-     * the galaxy's classifier). */
+     * the galaxy's classifier). A self call is not use. */
     long long dead = 0;
     if (sqlite3_prepare_v2(db,
                            "SELECT COUNT(*) FROM nodes n WHERE n.project=?1 AND n.label IN "
@@ -508,7 +508,8 @@ static char *mx_build_json(cbm_store_t *store, const char *project, const char *
                            "COALESCE(json_extract(n.properties,'$.is_test'),0)=0 AND "
                            "COALESCE(json_extract(n.properties,'$.is_exported'),0)=0 AND "
                            "NOT EXISTS (SELECT 1 FROM edges e WHERE e.project=n.project AND "
-                           "e.target_id=n.id AND e.type IN ('CALLS','CALL_REFERENCE','USAGE'))",
+                           "e.target_id=n.id AND e.source_id<>n.id AND "
+                           "e.type IN ('CALLS','CALL_REFERENCE','USAGE'))",
                            -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_text(st, 1, project, -1, SQLITE_STATIC);
         if (sqlite3_step(st) == SQLITE_ROW)

@@ -5241,12 +5241,26 @@ static CBMPrimaryCalleeSelection select_primary_callee(CBMExtractCtx *ctx, TSNod
     return selection;
 }
 
+/* A JS/TS contextual keyword can be a local function identifier. Retain
+ * the candidate for lexical resolution, but never let a name-only registry
+ * fallback turn an unbound keyword into a call to a distant definition. */
+static bool js_keyword_call_candidate(const CBMExtractCtx *ctx,
+                                      const CBMPrimaryCalleeSelection *callee) {
+    return (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
+            ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) &&
+           callee->name && !ts_node_is_null(callee->expr) &&
+           strcmp(ts_node_type(callee->expr), "identifier") == 0 &&
+           cbm_is_keyword(callee->name, ctx->language) &&
+           !cbm_is_resolvable_builtin(callee->name, ctx->language);
+}
+
 static bool primary_callee_name_is_allowed(const CBMExtractCtx *ctx,
                                            const CBMPrimaryCalleeSelection *callee) {
     if (!callee->name || !callee->name[0]) {
         return false;
     }
-    if (!cbm_is_keyword(callee->name, ctx->language) ||
+    if (js_keyword_call_candidate(ctx, callee) ||
+        !cbm_is_keyword(callee->name, ctx->language) ||
         cbm_is_resolvable_builtin(callee->name, ctx->language)) {
         return true;
     }
@@ -5464,6 +5478,7 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
         // ...) so the LSP-resolved builtin call still forms a CALLS edge.
         if (primary_callee_name_is_allowed(ctx, &callee)) {
             CBMCall call = {0};
+            call.requires_lsp_resolution = js_keyword_call_candidate(ctx, &callee);
             call.callee_name = callee.name;
             call.enclosing_func_qn = state->enclosing_func_qn;
             call.loop_depth = state->loop_depth;     // enclosing loop nesting at this call
@@ -5527,6 +5542,12 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                         }
                     }
                 }
+            }
+            // The bare-call classifier (cbm_finalize_lexical_usages) reads the
+            // scope a JS/TS call sits in once every binding of the file is known.
+            if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
+                ctx->language == CBM_LANG_TSX) {
+                call.lexical_scope_id = state->active_lexical_scope_id;
             }
             // Go receiver-aware guard (same direction as the TS/JS flag above).
             // Flag a selector call x.foo(). The Go AST cannot separate a method

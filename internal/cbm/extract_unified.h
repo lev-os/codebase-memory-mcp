@@ -88,6 +88,8 @@ typedef struct {
     /* #1912: py_param_stack height on entry. Pop unwinds back to it, so a
      * frame unbinds exactly the parameters it bound and nothing else. */
     int prev_py_param_stack_count;
+    /* The innermost open lexical scope on entry. Pop restores it. */
+    uint32_t prev_active_lexical_scope_id;
 } CBMWalkScope;
 
 typedef enum {
@@ -116,7 +118,27 @@ typedef struct {
     uint32_t active_start;
     uint32_t active_end;
     const char *name;
+    uint8_t value_kind;    /* CBMBindingValueKind; JS/TS only, else VALUE */
+    const char *ctor_name; /* CBM_BINDING_NEW_INSTANCE: the constructor's name */
+    uint32_t ctor_start;   /* and where it is written */
 } CBMLexicalBinding;
+
+/* What a JS/TS binding holds, for the call classifier at the end of the walk:
+ * a callable the extractor makes a definition of (a nested function or class
+ * declaration, `const run = () => 1`), an array literal, an instance made by
+ * `new Name(...)`, any other value (a parameter, `const x = f()`), or nothing
+ * at run time (a parameter name a type writes: `(tick: number) => void`).
+ * A name a destructuring shorthand binds (`{ onRequest }`) holds a value too,
+ * but only the classifier reads it: the usage lookup skips it, as it did
+ * before such names were recorded. */
+typedef enum {
+    CBM_BINDING_VALUE = 0,
+    CBM_BINDING_CALLABLE,
+    CBM_BINDING_ARRAY_LITERAL,
+    CBM_BINDING_NEW_INSTANCE,
+    CBM_BINDING_TYPE_ONLY,
+    CBM_BINDING_DESTRUCTURED,
+} CBMBindingValueKind;
 
 typedef enum {
     CBM_PYTHON_DIRECTIVE_GLOBAL = 1,
@@ -155,6 +177,11 @@ typedef struct {
     int lexical_scope_capacity;
     int lexical_scope_count;
     uint32_t root_lexical_scope_id;
+    /* The innermost open lexical scope, kept by push and pop. Call frames sit
+     * between lexical frames, so a scan of the frame stack per call would be
+     * quadratic down f(f(f(...))); this read is O(1). */
+    uint32_t active_lexical_scope_id;
+    int call_start_index; /* this walk's first call in ctx->result->calls */
     uint32_t split_function_scope_id;
     uint32_t split_signature_start_byte;
     uint32_t split_signature_end_byte;

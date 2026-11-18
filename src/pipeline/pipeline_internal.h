@@ -1814,9 +1814,25 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
 /* 23: captured receiver types may use a proof that every write agrees. */
 /* 24: calls through an imported plain object literal resolve as namespace
  *     members again. */
-/* 25: constructor proofs, captured writes and default/literal values changed
+/* 25: TS/JS name guesses give the exact target or no edge: a call the TS
+ *     resolver placed on a built-in method, a method of an array literal or
+ *     of `new Map()`-style runtime instance, and `this.x()` in a class whose
+ *     base is no project class, bind no same-named project callable; a bare
+ *     call through a parameter or a local value binds none; an unbound bare
+ *     name of a module binds only a definition of its file, and a type, or
+ *     a method by a bare name, never. Unchanged files rebuild once to drop
+ *     those edges. */
+/* 26: exact JS/TS recursive invocations retain their self CALLS edge. */
+/* 27: JS/TS literal callable keys share unquoted names and keep numeric keys. */
+/* 28: JS/TS generator expressions own their definitions and call scopes. */
+/* 29: JS/TS keyword calls require binding; name guesses cannot call type aliases. */
+/* 30: a self CALLS edge needs a JS/TS callable that no assignment rebinds; a
+ *     JS/TS call that needs a binding keeps its HTTP/route/config edges; the
+ *     empty and `function` literal keys get nodes, and '.', '%' and '"' are
+ *     escaped in a literal key's QN segment. */
+/* 31: constructor proofs, captured writes and default/literal values changed
  *     CALLS for unchanged importers; rebuild stored graphs once. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 25 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 31 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

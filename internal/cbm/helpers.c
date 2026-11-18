@@ -1193,6 +1193,58 @@ bool cbm_is_c_preprocessor_lang(CBMLanguage lang) {
            lang == CBM_LANG_GLSL || lang == CBM_LANG_OBJC || lang == CBM_LANG_ISPC;
 }
 
+bool cbm_js_literal_key_node(TSNode name_node, CBMLanguage lang) {
+    if (ts_node_is_null(name_node) ||
+        (lang != CBM_LANG_JAVASCRIPT && lang != CBM_LANG_TYPESCRIPT && lang != CBM_LANG_TSX &&
+         lang != CBM_LANG_ARKTS)) {
+        return false;
+    }
+    const char *kind = ts_node_type(name_node);
+    return strcmp(kind, "string") == 0 || strcmp(kind, "number") == 0;
+}
+
+/* Leave escaped strings intact instead of guessing their decoded value;
+ * numeric property tokens already have no delimiters. The empty key is a
+ * valid name, spelled `""` so that it stays usable and stable. */
+char *cbm_js_literal_key_name(CBMArena *a, TSNode name_node, const char *source) {
+    char *text = cbm_node_text(a, name_node, source);
+    if (!text || strcmp(ts_node_type(name_node), "string") != 0 || strchr(text, '\\')) {
+        return text;
+    }
+    size_t len = strlen(text);
+    if (len >= 2 && (text[0] == '\'' || text[0] == '"') && text[len - 1] == text[0]) {
+        if (len == 2) {
+            return cbm_arena_strdup(a, "\"\"");
+        }
+        memmove(text, text + 1, len - 2);
+        text[len - 2] = '\0';
+    }
+    return text;
+}
+
+/* One QN segment per key: '%', '.' and a key's own '"' are percent-escaped,
+ * so `'a.b'` is not `a: { b }`, and no key is spelled like the empty `""`. */
+static char *js_literal_key_segment(CBMArena *a, char *key) {
+    if (!key || strcmp(key, "\"\"") == 0 || !strpbrk(key, "%.\"")) {
+        return key;
+    }
+    size_t len = strlen(key);
+    char *out = (char *)cbm_arena_alloc(a, len * 3 + 1);
+    if (!out) {
+        return NULL;
+    }
+    char *o = out;
+    for (const char *k = key; *k; k++) {
+        if (*k == '%' || *k == '.' || *k == '"') {
+            o += snprintf(o, 4, "%%%02X", (unsigned)(unsigned char)*k);
+        } else {
+            *o++ = *k;
+        }
+    }
+    *o = '\0';
+    return out;
+}
+
 // Convert a resolved function/method name node to its name string. Most nodes
 // map directly to their text, but a C++ conversion-operator's `operator_cast`
 // node spans the full "operator bool() const" — this grammar folds the parameter
@@ -1227,6 +1279,11 @@ char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source,
             }
             *paren = '\0';
         }
+    }
+    /* Literal JS/TS property names have one spelling in definitions and
+     * caller scopes: the QN segment of cbm_js_literal_key_name. */
+    if (text && cbm_js_literal_key_node(name_node, lang)) {
+        return js_literal_key_segment(a, cbm_js_literal_key_name(a, name_node, source));
     }
     /* Nix quoted attrpath segment: `"kebab-case" = a: a;` and `services."my.svc" = …`
      * are ordinary names that merely need quoting in source. The node text carries

@@ -304,6 +304,9 @@ typedef struct {
      * QN from that same node, so the pair names one definition exactly (JS/TS
      * same-name twins, cbm_js_split_twin_callables). 0 when not recorded. */
     uint32_t node_start_byte;
+    /* JS/TS callable name proven by a string/number property-key AST node.
+     * This extraction-only fact keeps literal keys out of the junk-name filter. */
+    bool literal_member_name;
     /* Call matching: defaulted parameters, indexed in declaration order. */
     uint64_t param_default_mask;
     uint8_t selector_param_count;
@@ -442,12 +445,25 @@ typedef struct {
                                      // C++ operator or static `this` with an instance-only
                                      // member). Never fall back to textual resolution.
     bool receiver_requires_lsp; // No plain CALLS fallback; independent service facts remain valid.
+                                // JS/TS: the call classifier (extract_usages.c) sets it
+                                // for a receiver bound to an array literal or to
+                                // `new Name()` of a runtime constructor.
     bool callee_is_locally_bound;    // bare call foo() whose callee identifier is bound as a
                                      // parameter of an enclosing function, so it cannot be the
                                      // module-level foo. Python: read by the weak-local-binding
                                      // guard. JS/TS: a parameter, variable or catch clause is
                                      // the nearest binding (cbm_js_twin_bind_local_callees), and
-                                     // the registry step gives no edge. Default false.
+                                     // the registry step gives no edge; the call classifier
+                                     // (extract_usages.c) sets it too for a parameter or a
+                                     // local value. Default false.
+    uint32_t lexical_scope_id;       // JS/TS: the walk's innermost lexical scope at the call,
+                                     // read by the call classifier (extract_usages.c) at the
+                                     // end of the walk. Extraction only; 0 = none.
+    bool callee_is_unbound;          // JS/TS bare call foo() / new Foo() in a module file
+                                     // (it imports or exports) whose name no scope, no
+                                     // declaration and no import of the file binds: a
+                                     // global. Only a definition of this file can be the
+                                     // callee (registry.c). Default false.
     bool receiver_is_amd_dependency; // JS/TS member call x.foo() whose receiver root x is a
                                      // parameter the factory of an enclosing AMD
                                      // define([...], fn) / require([...], fn) binds to a
@@ -466,6 +482,10 @@ typedef struct {
     const char *js_this_class_qn;
     const char *js_this_base;
     uint8_t js_this;
+    /* JS/TS bare call whose name no assignment in the file writes (closures
+     * and `var` included). Set by the TS resolver; a bare self CALLS edge
+     * needs it, since a write can rebind the callable before the call. */
+    bool callee_never_written;
     /* Java/Kotlin: the arguments written at the site, one entry each,
      * comma-separated: the Kotlin argument name or "_", and "*" for a
      * trailing lambda ("" = no arguments). NULL = not recorded. Read

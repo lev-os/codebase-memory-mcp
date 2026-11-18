@@ -42,6 +42,43 @@
  * (Go, C/C++, Python, PHP). */
 #define CBM_LSP_CONFIDENCE_FLOOR 0.6f
 
+/* A self CALLS edge requires an exact JS/TS binding, never a name guess.
+ * Keep this allow-list shared by both writers and overload handling. New
+ * resolver strategies must prove their binding before joining this list.
+ * Only the TS resolver proves a binding has no write, so other languages
+ * get no self edge; a bare name must have no write in its file (cbm.h). */
+static inline bool cbm_pipeline_exact_self_call(CBMLanguage lang, const CBMCall *call,
+                                                const cbm_resolution_t *res) {
+    if (lang != CBM_LANG_JAVASCRIPT && lang != CBM_LANG_TYPESCRIPT && lang != CBM_LANG_TSX) {
+        return false;
+    }
+    if (!call || !call->callee_name ||
+        (!strchr(call->callee_name, '.') && !call->callee_never_written)) {
+        return false;
+    }
+    if (!res || !res->strategy || res->candidate_count != 1) {
+        return false;
+    }
+    static const char *const exact[] = {
+        "lsp_ts_local_scope", "lsp_ts_local", "lsp_ts_method", "lsp_ts_import",
+        "lsp_import_alias", "lsp_ts_namespace", "this_member"};
+    for (size_t i = 0; i < sizeof(exact) / sizeof(exact[0]); i++) {
+        if (strcmp(res->strategy, exact[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A registry name match onto a JS/TS type alias does not prove a runtime
+ * callable. Semantic targets take their existing resolution path separately. */
+static inline bool cbm_pipeline_js_type_only_target(CBMLanguage lang,
+                                                    const cbm_gbuf_node_t *target) {
+    bool js = lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
+              lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS;
+    return js && target && target->label && strcmp(target->label, "Type") == 0;
+}
+
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
 /* Test-build-only operation counter implemented by pass_usages.c. Keeping the
  * increment behind this seam lets the regression measure the real sequential
@@ -902,6 +939,29 @@ static inline bool cbm_pipeline_rust_external_target(CBMLanguage lang, const cha
         }
     }
     if (!registered_target) {
+        return false;
+    }
+    size_t proj_len = strlen(project_name);
+    return !(strncmp(callee_qn, project_name, proj_len) == 0 && callee_qn[proj_len] == '.');
+}
+
+/* TS/JS: true when the TS resolver typed the receiver as a built-in type of
+ * the runtime and placed the member call on that type's method
+ * (`rows.push(1)` on `rows: number[]` -> Array.push, `cache.get(k)` on a Map
+ * -> Map.get). The resolver registers its built-in methods under bare QNs
+ * ("Array.push") and every project definition under the project prefix, so
+ * such a row names no graph node. Before this gate the callers then fell back
+ * to the textual registry, whose same-module lookup dropped the receiver
+ * (`rows.push` -> this file's `push`) or whose qualified suffix matched an
+ * unrelated `rows.push` of another file. The call gets no CALLS edge, as for
+ * Rust above. A project-prefixed QN that only failed the graph lookup keeps
+ * the registry fallback, and so does every other strategy. Pure. */
+static inline bool cbm_pipeline_ts_builtin_target(CBMLanguage lang, const char *strategy,
+                                                  const char *callee_qn,
+                                                  const char *project_name) {
+    if ((lang != CBM_LANG_JAVASCRIPT && lang != CBM_LANG_TYPESCRIPT && lang != CBM_LANG_TSX) ||
+        !strategy || strcmp(strategy, "lsp_ts_method") != 0 || !callee_qn || !callee_qn[0] ||
+        !project_name || !project_name[0]) {
         return false;
     }
     size_t proj_len = strlen(project_name);

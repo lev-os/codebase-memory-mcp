@@ -1048,6 +1048,8 @@ static void free_one_rel_pattern(cbm_rel_pattern_t *r) {
 /* Parse a bounded EXISTS predicate: EXISTS { (anchor)-[:TYPE]->() } — a
  * single-hop, edge-type-specific existence check anchored on a bound variable
  * (e.g. WHERE NOT EXISTS { (f)<-[:CALLS]-() } finds functions with no callers).
+ * A self-loop never satisfies it: a function that only calls itself has no
+ * caller (eval_exists_condition).
  * Multi-hop / nested-WHERE EXISTS is intentionally unsupported. */
 static cbm_expr_t *parse_exists_predicate(parser_t *p, bool negated) {
     advance(p); /* EXISTS */
@@ -2773,8 +2775,19 @@ static bool eval_comparison_op(const char *op, const char *actual, const char *e
 
 enum { EXISTS_DIR_OUT = 0, EXISTS_DIR_IN = 1 };
 
+/* A self-loop is no caller and no callee: recursion is not use. */
+static bool exists_edge_to_other(const cbm_edge_t *edges, int cnt) {
+    for (int i = 0; i < cnt; i++) {
+        if (edges[i].source_id != edges[i].target_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* EXISTS { (var)-[:TYPE]->() }: does the bound node have any edge of the
- * given type in the requested direction? (dir 0=out, 1=in, 2=any) */
+ * given type in the requested direction to another node? A self-loop does
+ * not count. (dir 0=out, 1=in, 2=any) */
 static bool eval_exists_condition(const cbm_condition_t *c, binding_t *b) {
     cbm_node_t *n = binding_get(b, c->variable);
     bool result = false;
@@ -2787,7 +2800,7 @@ static bool eval_exists_condition(const cbm_condition_t *c, binding_t *b) {
             } else {
                 cbm_store_find_edges_by_source(b->store, n->id, &edges, &cnt);
             }
-            result = cnt > 0;
+            result = exists_edge_to_other(edges, cnt);
             cbm_store_free_edges(edges, cnt);
         }
         if (!result && c->exists_dir != EXISTS_DIR_OUT) { /* inbound or any */
@@ -2798,7 +2811,7 @@ static bool eval_exists_condition(const cbm_condition_t *c, binding_t *b) {
             } else {
                 cbm_store_find_edges_by_target(b->store, n->id, &edges, &cnt);
             }
-            result = cnt > 0;
+            result = exists_edge_to_other(edges, cnt);
             cbm_store_free_edges(edges, cnt);
         }
     }
