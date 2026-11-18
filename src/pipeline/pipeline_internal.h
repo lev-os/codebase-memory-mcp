@@ -1834,7 +1834,9 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *     CALLS for unchanged importers; rebuild stored graphs once. */
 /* 32: self edges require unwritten member/global/alias targets; unchanged
  *     files rebuild to remove spelling-only recursion and repair literal keys. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 32 };
+/* 33: unknown member keys no longer invalidate lexical type proofs; member
+ *     self calls require complete property-write evidence on unchanged files. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 33 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

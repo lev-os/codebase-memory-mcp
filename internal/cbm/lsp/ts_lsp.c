@@ -1628,6 +1628,7 @@ struct TsAssignSites {
     TsAssignSite **by_start; /* the same sites, sorted by start */
     int count;
     bool complete; /* false: a write may be missing, so every write is a closure write */
+    bool unknown_member_key; /* only member/global-property self proofs must fail closed */
     /* Every name a `var` declares, by the function it hoists to, sorted by
      * (fn_start, fn_end, start). */
     TsAssignSite *hoisted;
@@ -1662,6 +1663,7 @@ typedef struct {
     int count;
     int cap;
     bool failed;
+    bool unknown_member_key;
 } TsSiteVec;
 
 static bool ts_write_wrapper(TSNode node) {
@@ -1765,6 +1767,10 @@ static void ts_site_push_pattern(TSLSPContext *ctx, TsSiteVec *v, TSNode pattern
             prefix = "globalThis.";
         }
         if (prefix) {
+            if (node_kind_is(pattern, "subscript_expression") && !node_kind_is(prop, "string")) {
+                v->unknown_member_key = true;
+                return;
+            }
             int before = v->count;
             ts_site_push(ctx, v, prop, fs, fe);
             if (v->failed || v->count == before)
@@ -1773,13 +1779,11 @@ static void ts_site_push_pattern(TSLSPContext *ctx, TsSiteVec *v, TSNode pattern
             if (node_kind_is(prop, "string")) {
                 size_t len = strlen(name);
                 if (len < 2 || strchr(name, '\\')) {
-                    v->failed = true;
+                    v->count = before;
+                    v->unknown_member_key = true;
                     return;
                 }
                 name = cbm_arena_strndup(ctx->arena, name + 1, len - 2);
-            } else if (node_kind_is(pattern, "subscript_expression")) {
-                v->failed = true; /* an unknown key may replace any method/global */
-                return;
             }
             const char *key = name ? cbm_arena_sprintf(ctx->arena, "%s%s", prefix, name) : NULL;
             if (!key) {
@@ -1964,6 +1968,7 @@ static void ts_collect_assign_sites(TSLSPContext *ctx, TSNode root) {
             by_start[i] = &v.items[i];
         qsort(by_start, (size_t)v.count, sizeof(*by_start), ts_site_start_cmp);
     }
+    sites->unknown_member_key = v.unknown_member_key;
     sites->by_name = v.items;
     sites->by_start = by_start;
     sites->count = v.count;
@@ -7881,7 +7886,8 @@ static void ts_mark_unwritten_callees(TSLSPContext *ctx, CBMFileResult *result) 
         const char *leaf = strrchr(name, '.');
         if (leaf) {
             const char *member = cbm_arena_sprintf(ctx->arena, "this.%s", leaf + 1);
-            call->callee_never_written = member && ts_name_unwritten(s, vars, member);
+            call->callee_never_written =
+                !s->unknown_member_key && member && ts_name_unwritten(s, vars, member);
             continue;
         }
         if (!ts_name_unwritten(s, vars, name))
@@ -7902,7 +7908,7 @@ static void ts_mark_unwritten_callees(TSLSPContext *ctx, CBMFileResult *result) 
             continue;
         if (script) {
             const char *global = cbm_arena_sprintf(ctx->arena, "globalThis.%s", target);
-            if (!global || !ts_name_unwritten(s, vars, global))
+            if (s->unknown_member_key || !global || !ts_name_unwritten(s, vars, global))
                 continue;
         }
         call->callee_never_written = true;

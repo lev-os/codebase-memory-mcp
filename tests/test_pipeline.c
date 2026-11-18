@@ -38785,6 +38785,56 @@ TEST(pipeline_js_twin_callables_scale) {
     PASS();
 }
 
+TEST(pipeline_unknown_member_write_preserves_local_types) {
+    const char *writes[] = {
+        "for (const k in o) this[k] = o[k];",
+        "window[name] = replacement;",
+        "Foo.prototype[Symbol.iterator] = replacement;",
+        "this['w\\\\alk'] = replacement;",
+    };
+    const char *files[9] = {0};
+    char sources[4][1024], paths[4][32];
+    for (int i = 0; i < 4; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "case%d.js", i);
+        snprintf(sources[i], sizeof(sources[i]),
+                 "class Foo { bar() {} walk() { this.walk(); } }\n"
+                 "function mutate(o, name, replacement) { %s }\n"
+                 "function useConst() { const x = new Foo(); x.bar(); }\n"
+                 "function useLet() { let y = new Foo(); y.bar(); }\n"
+                 "function make() { return new Foo(); }\n"
+                 "function useFactory() { make().bar(); }\n", writes[i]);
+        files[2 * i] = paths[i];
+        files[2 * i + 1] = sources[i];
+    }
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        js_exact_run_t run;
+        ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+        for (int i = 0; i < 4; i++) {
+            const char *users[] = {"useConst", "useLet", "useFactory"};
+            const int lines[] = {3, 4, 6};
+            for (int j = 0; j < 3; j++) {
+                char got[1024], want[256], what[128];
+                snprintf(what, sizeof(what), "unknown key mode=%d case=%d %s", mode, i, users[j]);
+                snprintf(want, sizeof(want), "case%d.%s -> case%d.Foo; case%d.%s -> case%d.Foo.bar",
+                         i, users[j], i, i, users[j], i);
+                if (j == 2)
+                    snprintf(want, sizeof(want),
+                             "case%d.useFactory -> case%d.Foo.bar; case%d.useFactory -> case%d.make",
+                             i, i, i, i);
+                js_twin_calls_at(run.db, run.project, paths[i], lines[j], got, sizeof(got));
+                ok = js_twin_expect(what, got, want) && ok;
+            }
+            char got[1024];
+            js_twin_calls_at(run.db, run.project, paths[i], 1, got, sizeof(got));
+            ok = js_twin_expect("unknown key cannot certify member self call", got, "") && ok;
+        }
+        js_exact_done(&run);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 TEST(pipeline_js_self_edge_requires_unwritten_binding) {
     static const char *const files[] = {
         "member.js",
@@ -39105,6 +39155,7 @@ TEST(pipeline_x9c_named_class_static_members_are_values) {
 }
 
 SUITE(pipeline) {
+    RUN_TEST(pipeline_unknown_member_write_preserves_local_types);
     RUN_TEST(pipeline_js_self_edge_requires_unwritten_binding);
     RUN_TEST(pipeline_js_empty_and_quote_keys_are_distinct);
     RUN_TEST(pipeline_x9c_named_class_static_members_are_values);
