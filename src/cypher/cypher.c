@@ -1047,10 +1047,9 @@ static void free_one_rel_pattern(cbm_rel_pattern_t *r) {
 
 /* Parse a bounded EXISTS predicate: EXISTS { (anchor)-[:TYPE]->() } — a
  * single-hop, edge-type-specific existence check anchored on a bound variable
- * (e.g. WHERE NOT EXISTS { (f)<-[:CALLS]-() } finds functions with no callers).
- * A self-loop never satisfies it: a function that only calls itself has no
- * caller (eval_exists_condition).
- * Multi-hop / nested-WHERE EXISTS is intentionally unsupported. */
+ * An optional WHERE other <> anchor excludes self relationships explicitly,
+ * for caller summaries. All other nested predicates and multi-hop patterns
+ * remain unsupported; plain EXISTS retains every stored relationship. */
 static cbm_expr_t *parse_exists_predicate(parser_t *p, bool negated) {
     advance(p); /* EXISTS */
     if (!match(p, TOK_LBRACE)) {
@@ -1069,9 +1068,29 @@ static cbm_expr_t *parse_exists_predicate(parser_t *p, bool negated) {
                  "'(var)-[:TYPE]->()' is supported");
         return NULL;
     }
+    bool exclude_self = false;
+    if (match(p, TOK_WHERE)) {
+        const cbm_token_t *lhs = expect(p, TOK_IDENT);
+        const cbm_token_t *op = expect(p, TOK_NEQ);
+        const cbm_token_t *rhs = expect(p, TOK_IDENT);
+        if (!lhs || !op || !rhs || !anchor.variable || !far_node.variable ||
+            strcmp(anchor.variable, far_node.variable) == 0 ||
+            !((strcmp(lhs->text, far_node.variable) == 0 &&
+               strcmp(rhs->text, anchor.variable) == 0) ||
+              (strcmp(lhs->text, anchor.variable) == 0 &&
+               strcmp(rhs->text, far_node.variable) == 0))) {
+            free_one_node_pattern(&anchor);
+            free_one_rel_pattern(&rel);
+            free_one_node_pattern(&far_node);
+            snprintf(p->error, sizeof(p->error), "EXISTS only supports WHERE other <> anchor");
+            return NULL;
+        }
+        exclude_self = true;
+    }
     expect(p, TOK_RBRACE);
 
     cbm_condition_t c = {0};
+    c.exists_exclude_self = exclude_self;
     c.negated = negated;
     c.op = heap_strdup("EXISTS");
     c.variable = heap_strdup(anchor.variable ? anchor.variable : "");
@@ -2775,10 +2794,10 @@ static bool eval_comparison_op(const char *op, const char *actual, const char *e
 
 enum { EXISTS_DIR_OUT = 0, EXISTS_DIR_IN = 1 };
 
-/* A self-loop is no caller and no callee: recursion is not use. */
-static bool exists_edge_to_other(const cbm_edge_t *edges, int cnt) {
+/* Generic EXISTS is structural; only an explicit inequality omits self edges. */
+static bool exists_edge_matches(const cbm_edge_t *edges, int cnt, bool exclude_self) {
     for (int i = 0; i < cnt; i++) {
-        if (edges[i].source_id != edges[i].target_id) {
+        if (!exclude_self || edges[i].source_id != edges[i].target_id) {
             return true;
         }
     }
@@ -2786,8 +2805,7 @@ static bool exists_edge_to_other(const cbm_edge_t *edges, int cnt) {
 }
 
 /* EXISTS { (var)-[:TYPE]->() }: does the bound node have any edge of the
- * given type in the requested direction to another node? A self-loop does
- * not count. (dir 0=out, 1=in, 2=any) */
+ * given type in the requested direction? (dir 0=out, 1=in, 2=any) */
 static bool eval_exists_condition(const cbm_condition_t *c, binding_t *b) {
     cbm_node_t *n = binding_get(b, c->variable);
     bool result = false;
@@ -2800,7 +2818,7 @@ static bool eval_exists_condition(const cbm_condition_t *c, binding_t *b) {
             } else {
                 cbm_store_find_edges_by_source(b->store, n->id, &edges, &cnt);
             }
-            result = exists_edge_to_other(edges, cnt);
+            result = exists_edge_matches(edges, cnt, c->exists_exclude_self);
             cbm_store_free_edges(edges, cnt);
         }
         if (!result && c->exists_dir != EXISTS_DIR_OUT) { /* inbound or any */
@@ -2811,7 +2829,7 @@ static bool eval_exists_condition(const cbm_condition_t *c, binding_t *b) {
             } else {
                 cbm_store_find_edges_by_target(b->store, n->id, &edges, &cnt);
             }
-            result = exists_edge_to_other(edges, cnt);
+            result = exists_edge_matches(edges, cnt, c->exists_exclude_self);
             cbm_store_free_edges(edges, cnt);
         }
     }

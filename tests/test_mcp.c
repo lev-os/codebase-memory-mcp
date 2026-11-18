@@ -8492,9 +8492,10 @@ TEST(tool_trace_path_stored_self_edge_is_bounded) {
     yyjson_doc_free(doc);
     free(inner);
     free(response);
-    response = cbm_mcp_handle_tool(srv, "query_graph",
+    response = cbm_mcp_handle_tool(
+        srv, "query_graph",
         "{\"project\":\"self-edge\",\"query\":\"MATCH (f:Function) WHERE NOT EXISTS "
-        "{ (f)<-[:CALLS]-() } RETURN f.name\",\"format\":\"json\"}");
+        "{ (f)<-[:CALLS]-(caller) WHERE caller <> f } RETURN f.name\",\"format\":\"json\"}");
     inner = extract_text_content(response);
     ASSERT_NOT_NULL(inner);
     ASSERT_NULL(strstr(response, "\"isError\":true"));

@@ -6455,7 +6455,71 @@ TEST(cypher_stream_default_chunk_boundary) {
 
 /* ══════════════════════════════════════════════════════════════════ */
 
+TEST(cypher_exists_retains_stored_self_relationships) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "p", "/tmp/p"), CBM_STORE_OK);
+    cbm_node_t n = {
+        .project = "p", .label = "Function", .name = "walk", .qualified_name = "p.walk"};
+    int64_t id = cbm_store_upsert_node(s, &n);
+    const char *types[] = {"CALLS", "USAGE"};
+    const char *patterns[] = {"(f)-[:%s]->()", "(f)<-[:%s]-()", "(f)-[:%s]-()"};
+    for (int t = 0; t < 2; t++) {
+        cbm_edge_t e = {.project = "p", .source_id = id, .target_id = id, .type = types[t]};
+        ASSERT_GT(cbm_store_insert_edge(s, &e), 0);
+        for (int d = 0; d < 3; d++) {
+            char pattern[128], query[256];
+            snprintf(pattern, sizeof(pattern), patterns[d], types[t]);
+            snprintf(query, sizeof(query), "MATCH (f:Function) WHERE EXISTS { %s } RETURN f.name",
+                     pattern);
+            cbm_cypher_result_t r = {0};
+            ASSERT_EQ(cbm_cypher_execute(s, query, "p", 0, &r), 0);
+            printf("  structural EXISTS %s rows=%d\n", pattern, r.row_count);
+            ASSERT_EQ(r.row_count, 1);
+            cbm_cypher_result_free(&r);
+        }
+    }
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_dead_code_excludes_only_self_callers) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "p", "/tmp/p"), CBM_STORE_OK);
+    const char *names[] = {"alone", "used", "caller"};
+    int64_t ids[3];
+    for (int i = 0; i < 3; i++) {
+        cbm_node_t n = {
+            .project = "p", .label = "Function", .name = names[i], .qualified_name = names[i]};
+        ids[i] = cbm_store_upsert_node(s, &n);
+    }
+    for (int i = 0; i < 3; i++) {
+        cbm_edge_t e = {.project = "p",
+                        .source_id = ids[i == 2 ? 2 : i],
+                        .target_id = ids[i == 2 ? 1 : i],
+                        .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(s, &e), 0);
+    }
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) WHERE NOT EXISTS { (f)<-[:CALLS]-(caller) "
+                                "WHERE caller <> f } RETURN f.name ORDER BY f.name",
+                                "p", 0, &r);
+    printf("  explicit other-caller EXISTS rc=%d rows=%d\n", rc, r.row_count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_STR_EQ(r.rows[0][0], "alone");
+    ASSERT_STR_EQ(r.rows[1][0], "caller");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 SUITE(cypher) {
+    RUN_TEST(cypher_exists_retains_stored_self_relationships);
+    RUN_TEST(cypher_dead_code_excludes_only_self_callers);
+
     /* Lexer */
     RUN_TEST(cypher_lex_simple_match);
     RUN_TEST(cypher_lex_relationship);
