@@ -1838,7 +1838,9 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *     self calls require complete property-write evidence on unchanged files. */
 /* 34: default-export identity, await adoption, member stability and literal
  *     object members change CALLS for unchanged importers. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 34 };
+/* 35: nullable awaited unions keep their receiver; unchanged importers of an
+ *     async provider gain the member edges once. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 35 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

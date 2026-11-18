@@ -1569,22 +1569,42 @@ static const CBMType *simplify_type_at(TSLSPContext *ctx, const CBMType *t, int 
     return t;
 }
 
-/* Await and async return adoption share the same bounded recursive unwrap. */
+static bool ts_type_is_empty_value(const CBMType *t);
+
+/* Await and async return adoption share the same bounded recursive unwrap.
+ * A union awaits each arm. Empty arms (null, undefined, void, never) stay in
+ * the result, out of the agreement: every other arm must prove one type. */
 static const CBMType *ts_awaited_type_at(TSLSPContext *ctx, const CBMType *value, int depth) {
     if (depth >= 32)
         return cbm_type_unknown();
     value = simplify_type_at(ctx, value, depth + 1);
     if (value && value->kind == CBM_TYPE_UNION) {
+        const CBMType *arms[17];
+        int empty = 0;
         const CBMType *agreed = NULL;
         if (!value->data.union_type.members || value->data.union_type.count <= 0)
             return cbm_type_unknown();
         for (int i = 0; i < value->data.union_type.count; i++) {
             const CBMType *arm = ts_awaited_type_at(ctx, value->data.union_type.members[i], depth + 1);
-            if (!arm || cbm_type_is_unknown(arm) || (agreed && !cbm_type_equal(agreed, arm)))
-                return cbm_type_unknown();
-            agreed = arm;
+            /* An awaited union is one agreed arm beside its empty arms. */
+            bool nested = arm && arm->kind == CBM_TYPE_UNION;
+            for (int j = 0; j < (nested ? arm->data.union_type.count : 1); j++) {
+                const CBMType *part = nested ? arm->data.union_type.members[j] : arm;
+                if (part && ts_type_is_empty_value(part)) {
+                    if (empty == 16)
+                        return cbm_type_unknown();
+                    arms[++empty] = part;
+                    continue;
+                }
+                if (!part || cbm_type_is_unknown(part) || (agreed && !cbm_type_equal(agreed, part)))
+                    return cbm_type_unknown();
+                agreed = part;
+            }
         }
-        return agreed;
+        if (!agreed)
+            return cbm_type_unknown();
+        arms[0] = agreed;
+        return empty ? cbm_type_union(ctx->arena, arms, empty + 1) : agreed;
     }
     while (value && value->kind == CBM_TYPE_TEMPLATE && value->data.template_type.template_name &&
            strcmp(value->data.template_type.template_name, "Promise") == 0 &&

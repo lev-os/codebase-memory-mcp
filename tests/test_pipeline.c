@@ -39401,7 +39401,37 @@ TEST(pipeline_x9d_static_writes_keep_constructor_binding) {
     PASS();
 }
 
+/* Every x9e provider declares the replacement and a same-name decoy method. */
+static bool x9e_calls(const char *provider, const char *call, const char *want) {
+    char source[4096];
+    snprintf(source, sizeof(source),
+             "export function replacement() {}\nexport class Other { send() {} }\n%s\n", provider);
+    return x9d_calls(source, call, want);
+}
+
+TEST(pipeline_x9e_nullable_await) {
+    const char *returns[] = {
+        "Promise<Port | null>", "Promise<Port | undefined>", "Promise<null | Port | undefined>",
+        "Promise<Port | null> | Port", "Promise<Port> | null",
+        "Promise<Port | Other | null>", "Promise<Port | Missing | null>", "Promise<null>",
+        "Promise<Thenable | null>",
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(returns) / sizeof(returns[0]); i++) {
+        char provider[512];
+        snprintf(provider, sizeof(provider),
+                 "export class Port { send() {} }\nexport class Thenable { then() {} send() {} }\n"
+                 "export async function make(): %s { return null; }", returns[i]);
+        ok = x9e_calls(provider, "const x = await make(); if (!x) return; x.send();",
+                       i < 5 ? "main.use -> lib.Port.send; main.use -> lib.make"
+                             : "main.use -> lib.make") && ok;
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_x9e_nullable_await);
     RUN_TEST(pipeline_x9d_static_writes_keep_constructor_binding);
     RUN_TEST(pipeline_x9d_side_effect_import);
     RUN_TEST(pipeline_x9d_finally_returns);
