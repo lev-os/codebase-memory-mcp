@@ -1864,13 +1864,7 @@ static void ts_collect_assign_sites(TSLSPContext *ctx, TSNode root) {
     TSTreeCursor cursor = ts_tree_cursor_new(root);
     for (bool done = false; !done && !v.failed;) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
-        TSNode called = node_kind_is(node, "call_expression")
-                            ? ts_node_child_by_field_name(node, "function", 8)
-                            : (TSNode){0};
-        if (node_kind_is(node, "with_statement") ||
-            (node_kind_is(node, "call_expression") && node_kind_is(called, "identifier") &&
-             ts_node_end_byte(called) - ts_node_start_byte(called) == 4 &&
-             memcmp(ctx->source + ts_node_start_byte(called), "eval", 4) == 0)) {
+        if (node_kind_is(node, "with_statement") || cbm_ts_direct_eval(node, ctx->source)) {
             v.failed = true;
             break;
         }

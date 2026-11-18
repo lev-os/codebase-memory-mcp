@@ -15793,13 +15793,7 @@ static void js_invalidate_written_returns(CBMExtractCtx *ctx) {
     while (complete) {
         TSNode node = ts_tree_cursor_current_node(&cursor), target = {0};
         const char *kind = ts_node_type(node);
-        TSNode called = strcmp(kind, "call_expression") == 0
-                            ? ts_node_child_by_field_name(node, "function", 8)
-                            : (TSNode){0};
-        if (strcmp(kind, "with_statement") == 0 ||
-            (strcmp(kind, "call_expression") == 0 && !ts_node_is_null(called) &&
-             strcmp(ts_node_type(called), "identifier") == 0 &&
-             js_node_text_is(called, ctx->source, "eval"))) {
+        if (strcmp(kind, "with_statement") == 0 || cbm_ts_direct_eval(node, ctx->source)) {
             complete = false;
             break; /* Dynamic scope cannot prove that module bindings stay unchanged. */
         }

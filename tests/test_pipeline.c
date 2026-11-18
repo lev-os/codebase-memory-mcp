@@ -39064,7 +39064,26 @@ TEST(pipeline_x9d_await_adoption) {
     PASS();
 }
 
+TEST(pipeline_x9d_eval_binding) {
+    const char *sources[] = {
+        "export class Port { send() {} } export function make() { return new Port(); } (eval)('Port = Other');",
+        "export class Port { send() {} } export function make() { return new Port(); } function local(eval) { eval('text'); }",
+        "export class Port { send() {} } export function make() { return new Port(); } const eval = (x) => x; (eval)('text');",
+        "export class Port { send() {} } export function make() { return new Port(); } function local(eval) {} (eval)('Port = Other');",
+        "export class Port { send() {} } export function make() { return new Port(); } var eval = (x) => x; var eval; eval('text');",
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        ok = x9d_calls(sources[i], "make().send();", i == 1 || i == 2 || i == 4
+                        ? "main.use -> lib.Port.send; main.use -> lib.make"
+                        : "main.use -> lib.make") && ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_x9d_eval_binding);
+
     RUN_TEST(pipeline_x9d_await_adoption);
 
     RUN_TEST(pipeline_x9d_generator_returns);
