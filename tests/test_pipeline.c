@@ -38822,6 +38822,14 @@ TEST(pipeline_unknown_member_write_preserves_local_types) {
                     snprintf(want, sizeof(want),
                              "case%d.useFactory -> case%d.Foo.bar; case%d.useFactory -> case%d.make",
                              i, i, i, i);
+                if (i == 2) {
+                    /* This computed key has no proven runtime identity. A write
+                     * to Foo.prototype can replace bar, so both writers retain
+                     * the constructor/factory call but withhold Foo.bar. The
+                     * unrelated writes in cases 0, 1 and 3 keep lexical types. */
+                    snprintf(want, sizeof(want), "case%d.%s -> case%d.%s", i, users[j], i,
+                             j == 2 ? "make" : "Foo");
+                }
                 js_twin_calls_at(run.db, run.project, paths[i], lines[j], got, sizeof(got));
                 ok = js_twin_expect(what, got, want) && ok;
             }
