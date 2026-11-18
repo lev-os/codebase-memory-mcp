@@ -881,6 +881,8 @@ static bool is_exact_language_binding(CBMExtractCtx *ctx, TSNode node, WalkState
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
     case CBM_LANG_ARKTS:
+        if (strcmp(kind, "identifier") != 0 &&
+            strcmp(kind, "shorthand_property_identifier_pattern") != 0) return false;
         if (!ts_node_is_null(cbm_js_header_binding(node))) return true;
         for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
              parent = ts_node_parent(parent)) {
@@ -2990,7 +2992,7 @@ static bool js_unbound_object(CBMExtractCtx *ctx, const WalkState *state, TSNode
 
 /* CommonJS exports are module bindings too. A local object called `exports`
  * or `module` does not establish that boundary. Inspect syntax once per file. */
-static bool js_commonjs_module(CBMExtractCtx *ctx, const WalkState *state) {
+static bool js_program_is_module(CBMExtractCtx *ctx, const WalkState *state) {
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     uint64_t steps = 0;
     bool module = false;
@@ -3000,6 +3002,14 @@ static bool js_commonjs_module(CBMExtractCtx *ctx, const WalkState *state) {
             break;
         }
         TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (ts_node_is_named(node) &&
+            (strcmp(ts_node_type(node), "import_statement") == 0 ||
+             strcmp(ts_node_type(node), "export_statement") == 0) &&
+            ts_node_eq(ts_node_parent(node), ctx->root)) {
+            module = true;
+            break;
+        }
+
         if (ts_node_is_named(node) && strcmp(ts_node_type(node), "assignment_expression") == 0) {
             TSNode left = ts_node_child_by_field_name(node, TS_FIELD("left"));
             while (!ts_node_is_null(left) &&
@@ -3037,90 +3047,137 @@ static bool js_commonjs_module(CBMExtractCtx *ctx, const WalkState *state) {
 /* Global visibility is a source fact, retained for incremental registry
  * seeding. Bindings are complete here, so a local `window` or `globalThis`
  * cannot be mistaken for the global object. */
+static void js_mark_global_definition(CBMExtractCtx *ctx, const WalkState *state,
+                                      CBMDefinition *def, TSNode node, bool module, bool dts) {
+    const char *kind = ts_node_type(node);
+    const char *global = NULL;
+    const char *decl_name = NULL;
+    bool declaration = strcmp(kind, "function_declaration") == 0 ||
+                       strcmp(kind, "generator_function_declaration") == 0 ||
+                       strcmp(kind, "function_signature") == 0 ||
+                       strcmp(kind, "class_declaration") == 0 ||
+                       strcmp(kind, "abstract_class_declaration") == 0;
+    if (declaration) decl_name = def->name;
+    TSNode parent = ts_node_parent(node);
+    if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "variable_declarator") == 0) {
+        TSNode name = ts_node_child_by_field_name(parent, TS_FIELD("name"));
+        if (!ts_node_is_null(name) && strcmp(ts_node_type(name), "identifier") == 0)
+            decl_name = cbm_node_text(ctx->arena, name, ctx->source);
+    }
+    if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "assignment_expression") == 0) {
+        TSNode left = ts_node_child_by_field_name(parent, TS_FIELD("left"));
+        if (!ts_node_is_null(left) && strcmp(ts_node_type(left), "member_expression") == 0) {
+            TSNode object = ts_node_child_by_field_name(left, TS_FIELD("object"));
+            TSNode property = ts_node_child_by_field_name(left, TS_FIELD("property"));
+            const char *root = cbm_node_text(ctx->arena, object, ctx->source);
+            uint32_t position = ts_node_start_byte(left);
+            uint32_t scope_id = js_scope_at(state, position);
+            int first = 0, end = 0;
+            if (root && (strcmp(root, "globalThis") == 0 || strcmp(root, "window") == 0) &&
+                !lexical_binding_owner_at(state, scope_id, root, position, &first, &end) &&
+                !ts_node_is_null(property) && strcmp(ts_node_type(property), "property_identifier") == 0)
+                global = cbm_node_text(ctx->arena, property, ctx->source);
+        }
+    }
+    bool top = true, ambient_global = false;
+    for (TSNode at = parent; !global && !ts_node_is_null(at); at = ts_node_parent(at)) {
+        const char *ancestor = ts_node_type(at);
+        if (strcmp(ancestor, "program") == 0) break;
+        TSNode ambient = at;
+        if (strcmp(ancestor, "statement_block") == 0) ambient = ts_node_parent(at);
+        if (dts && !ts_node_is_null(ambient) && strcmp(ts_node_type(ambient), "internal_module") == 0) {
+            TSNode name = ts_node_child_by_field_name(ambient, TS_FIELD("name"));
+            if (!ts_node_is_null(name) && text_equals(ctx, name, "global")) {
+                ambient_global = true;
+                break;
+            }
+        }
+        if (cbm_js_bodied_kind(ancestor) || strcmp(ancestor, "statement_block") == 0 ||
+            strcmp(ancestor, "class_body") == 0 || strcmp(ancestor, "export_statement") == 0 ||
+            strcmp(ancestor, "internal_module") == 0) {
+            top = false;
+            break;
+        }
+    }
+    if (!global && decl_name && top && (!module || ambient_global)) global = decl_name;
+    if (!global) return;
+    int n = 0;
+    while (def->extra_props && def->extra_props[n]) n++;
+    const char **props = cbm_arena_alloc(ctx->arena, (size_t)(n + 3) * sizeof(char *));
+    if (!props) return;
+    for (int j = 0; j < n; j++) props[j] = def->extra_props[j];
+    props[n] = CBM_PROP_JS_GLOBAL_NAME;
+    props[n + 1] = global;
+    props[n + 2] = NULL;
+    def->extra_props = props;
+}
+
+typedef struct {
+    uint32_t start;
+    CBMDefinition *def;
+} js_global_entry_t;
+
+static int js_global_entry_cmp(const void *a, const void *b) {
+    uint32_t x = ((const js_global_entry_t *)a)->start;
+    uint32_t y = ((const js_global_entry_t *)b)->start;
+    return (x > y) - (x < y);
+}
+
+/* One tree walk joins syntax to definitions by start byte. Repeating
+ * descendant_for_byte_range for every definition scans wide sibling lists
+ * repeatedly; indexed child lookup in the module check does the same. */
 static void js_mark_globals(CBMExtractCtx *ctx, const WalkState *state) {
-    bool module = cbm_js_program_is_module(ctx->root) || js_commonjs_module(ctx, state);
+    int count = 0;
+    for (int i = 0; i < ctx->result->defs.count; i++) {
+        const CBMDefinition *def = &ctx->result->defs.items[i];
+        if (def->name && def->label &&
+            (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Class") == 0))
+            count++;
+    }
+    if (!count) return;
+    bool module = js_program_is_module(ctx, state);
     size_t path_len = ctx->rel_path ? strlen(ctx->rel_path) : 0;
     bool dts = path_len >= 5 && strcmp(ctx->rel_path + path_len - 5, ".d.ts") == 0;
     if (module && !cbm_memmem(ctx->source, (size_t)ctx->source_len, "globalThis", 10) &&
         !cbm_memmem(ctx->source, (size_t)ctx->source_len, "window", 6) && !dts)
         return;
-    const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
+    js_global_entry_t *entries = cbm_arena_alloc(ctx->arena, (size_t)count * sizeof(*entries));
+    if (!entries) return;
+    int used = 0;
     for (int i = 0; i < ctx->result->defs.count; i++) {
         CBMDefinition *def = &ctx->result->defs.items[i];
-        if (!def->name || !def->label ||
-            (strcmp(def->label, "Function") != 0 && strcmp(def->label, "Class") != 0))
-            continue;
-        TSNode node = ts_node_descendant_for_byte_range(ctx->root, def->node_start_byte,
-                                                       def->node_start_byte + 1);
-        while (!ts_node_is_null(node) &&
-               (!ts_node_is_named(node) ||
-                (!cbm_js_bodied_kind(ts_node_type(node)) &&
-                 strcmp(ts_node_type(node), "function_signature") != 0 &&
-                 !(spec->class_node_types && cbm_kind_in_set(node, spec->class_node_types)))))
-            node = ts_node_parent(node);
-        if (ts_node_is_null(node)) continue;
-        const char *kind = ts_node_type(node);
-        const char *global = NULL;
-        const char *decl_name = NULL;
-        bool declaration = strcmp(kind, "function_declaration") == 0 ||
-                           strcmp(kind, "generator_function_declaration") == 0 ||
-                           strcmp(kind, "function_signature") == 0 ||
-                           strcmp(kind, "class_declaration") == 0 ||
-                           strcmp(kind, "abstract_class_declaration") == 0;
-        if (declaration) decl_name = def->name;
-        TSNode parent = ts_node_parent(node);
-        if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "variable_declarator") == 0) {
-            TSNode name = ts_node_child_by_field_name(parent, TS_FIELD("name"));
-            if (!ts_node_is_null(name) && strcmp(ts_node_type(name), "identifier") == 0)
-                decl_name = cbm_node_text(ctx->arena, name, ctx->source);
-        }
-        if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "assignment_expression") == 0) {
-            TSNode left = ts_node_child_by_field_name(parent, TS_FIELD("left"));
-            if (!ts_node_is_null(left) && strcmp(ts_node_type(left), "member_expression") == 0) {
-                TSNode object = ts_node_child_by_field_name(left, TS_FIELD("object"));
-                TSNode property = ts_node_child_by_field_name(left, TS_FIELD("property"));
-                const char *root = cbm_node_text(ctx->arena, object, ctx->source);
-                uint32_t position = ts_node_start_byte(left);
-                uint32_t scope_id = js_scope_at(state, position);
-                int first = 0, end = 0;
-                if (root && (strcmp(root, "globalThis") == 0 || strcmp(root, "window") == 0) &&
-                    !lexical_binding_owner_at(state, scope_id, root, position, &first, &end) &&
-                    !ts_node_is_null(property) && strcmp(ts_node_type(property), "property_identifier") == 0)
-                    global = cbm_node_text(ctx->arena, property, ctx->source);
-            }
-        }
-        bool top = true, ambient_global = false;
-        for (TSNode at = parent; !global && !ts_node_is_null(at); at = ts_node_parent(at)) {
-            const char *ancestor = ts_node_type(at);
-            if (strcmp(ancestor, "program") == 0) break;
-            TSNode ambient = at;
-            if (strcmp(ancestor, "statement_block") == 0) ambient = ts_node_parent(at);
-            if (dts && !ts_node_is_null(ambient) && strcmp(ts_node_type(ambient), "internal_module") == 0) {
-                TSNode name = ts_node_child_by_field_name(ambient, TS_FIELD("name"));
-                if (!ts_node_is_null(name) && text_equals(ctx, name, "global")) {
-                    ambient_global = true;
-                    break;
-                }
-            }
-            if (cbm_js_bodied_kind(ancestor) || strcmp(ancestor, "statement_block") == 0 ||
-                strcmp(ancestor, "class_body") == 0 || strcmp(ancestor, "export_statement") == 0 ||
-                strcmp(ancestor, "internal_module") == 0) {
-                top = false;
-                break;
-            }
-        }
-        if (!global && decl_name && top && (!module || ambient_global)) global = decl_name;
-        if (!global) continue;
-        int n = 0;
-        while (def->extra_props && def->extra_props[n]) n++;
-        const char **props = cbm_arena_alloc(ctx->arena, (size_t)(n + 3) * sizeof(char *));
-        if (!props) continue;
-        for (int j = 0; j < n; j++) props[j] = def->extra_props[j];
-        props[n] = CBM_PROP_JS_GLOBAL_NAME;
-        props[n + 1] = global;
-        props[n + 2] = NULL;
-        def->extra_props = props;
+        if (def->name && def->label &&
+            (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Class") == 0))
+            entries[used++] = (js_global_entry_t){def->node_start_byte, def};
     }
+    qsort(entries, (size_t)used, sizeof(*entries), js_global_entry_cmp);
+    const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    uint64_t steps = 0;
+    for (;;) {
+        if (ctx->walk_budget_nodes && ++steps > ctx->walk_budget_nodes) break;
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        bool class_node = spec->class_node_types && cbm_kind_in_set(node, spec->class_node_types);
+        if (ts_node_is_named(node) &&
+            (cbm_js_bodied_kind(kind) || strcmp(kind, "function_signature") == 0 || class_node)) {
+            js_global_entry_t key = {.start = ts_node_start_byte(node)};
+            js_global_entry_t *hit = bsearch(&key, entries, (size_t)used, sizeof(*entries), js_global_entry_cmp);
+            while (hit && hit > entries && hit[-1].start == key.start) hit--;
+            for (; hit && hit < entries + used && hit->start == key.start; hit++) {
+                if ((strcmp(hit->def->label, "Class") == 0) == class_node)
+                    js_mark_global_definition(ctx, state, hit->def, node, module, dts);
+            }
+        }
+        if (ts_tree_cursor_goto_first_child(&cursor)) continue;
+        bool more = false;
+        for (;;) {
+            if (ts_tree_cursor_goto_next_sibling(&cursor)) { more = true; break; }
+            if (!ts_tree_cursor_goto_parent(&cursor)) break;
+        }
+        if (!more) break;
+    }
+    ts_tree_cursor_delete(&cursor);
 }
 
 /* The JS/TS call classifier, run once every binding of the file is known.

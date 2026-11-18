@@ -360,16 +360,16 @@ bool cbm_def_props_generated(const char *const *extra_props);
  * string property. Pure; unit-tested in test_registry.c. */
 bool cbm_node_props_generated(const char *properties_json);
 
-/* True when a definition's extra_props carry CBM_PROP_FUNCTION_LOCAL: a
- * same-name JS/TS callable declared in a function body, which only that
- * function's code can name. The three graph registration sites register it
- * by qualified name only, as a Python function's locals. Pure. */
 /* Source-proven JavaScript globals; duplicate visible names stay unresolved. */
 const char *cbm_def_js_global_name(const char *const *props);
 void cbm_registry_add_js_global(cbm_registry_t *registry, const char *name, const char *qn);
 void cbm_registry_add_js_global_node(cbm_registry_t *registry, const char *qn, const char *props);
 bool cbm_receiver_suppress_name_guess(bool requires_proof, const char *strategy);
 
+/* True when a definition's extra_props carry CBM_PROP_FUNCTION_LOCAL: a
+ * same-name JS/TS callable declared in a function body, which only that
+ * function's code can name. The three graph registration sites register it
+ * by qualified name only, as a Python function's locals. Pure. */
 bool cbm_def_props_function_local(const char *const *extra_props);
 
 /* The stored-node twin of cbm_def_props_function_local, for the incremental

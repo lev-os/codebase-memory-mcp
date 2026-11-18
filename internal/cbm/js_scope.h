@@ -30,15 +30,6 @@ static inline TSNode cbm_js_scope_node(TSNode node, bool var_scope) {
         return node;
     return (TSNode){0};
 }
-static inline bool cbm_js_program_is_module(TSNode root) {
-    for (uint32_t i = 0; i < ts_node_named_child_count(root); i++) {
-        const char *kind = ts_node_type(ts_node_named_child(root, i));
-        if (strcmp(kind, "import_statement") == 0 || strcmp(kind, "export_statement") == 0)
-            return true;
-    }
-    return false;
-}
-
 /* One pattern model for both same-name declarations and lexical bindings.
  * Keys and default-value expressions are not binding patterns. */
 static inline bool cbm_js_pattern_container(const char *kind) {
