@@ -11352,7 +11352,7 @@ render_trace_output:;
             out_total++;
         }
     }
-    /* in_total was counted per seed: self visits stay in the traversal,
+    /* in_total was counted per seed: the seed itself is never a row,
      * while another same-name function remains a real caller. */
 
     free(json);
@@ -15021,8 +15021,10 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     cbm_store_node_degree(store, node->id, &in_deg, &out_deg);
     yyjson_mut_obj_add_int(doc, root_obj, "callers", in_deg);
     yyjson_mut_obj_add_int(doc, root_obj, "callees", out_deg);
-    trace_recursion_t recursion = trace_recursion_metadata(node, 1);
-    trace_recursion_json(doc, root_obj, &recursion, true);
+    if (trace_label_is_callable(node->label)) {
+        trace_recursion_t recursion = trace_recursion_metadata(node, 1);
+        trace_recursion_json(doc, root_obj, &recursion, true);
+    }
 
     add_snippet_coverage_note(doc, root_obj, store, node);
 

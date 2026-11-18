@@ -316,9 +316,15 @@ char *cbm_atlas_why_json(cbm_store_t *store, const char *project, int64_t node_i
     int64_t id = node_id;
     char sym_name[256] = {0};
     char sym_file[1024] = {0};
+    bool callable = false;
+    int recursion_flags[2] = {-1, -1};
     const char *resolve_sql =
-        id >= 0 ? "SELECT id, name, file_path FROM nodes WHERE project=?1 AND id=?2 LIMIT 1"
-                : "SELECT id, name, file_path FROM nodes WHERE project=?1 AND "
+        id >= 0 ? "SELECT id, name, file_path, label, "
+                  "json_type(properties,'$.self_recursive'), json_type(properties,'$.recursive') "
+                  "FROM nodes WHERE project=?1 AND id=?2 LIMIT 1"
+                : "SELECT id, name, file_path, label, "
+                  "json_type(properties,'$.self_recursive'), json_type(properties,'$.recursive') "
+                  "FROM nodes WHERE project=?1 AND "
                   "qualified_name=?2 ORDER BY id LIMIT 1";
     if (sqlite3_prepare_v2(db, resolve_sql, -1, &st, NULL) != SQLITE_OK)
         return NULL;
@@ -337,6 +343,13 @@ char *cbm_atlas_why_json(cbm_store_t *store, const char *project, int64_t node_i
             snprintf(sym_name, sizeof(sym_name), "%s", n);
         if (f)
             snprintf(sym_file, sizeof(sym_file), "%s", f);
+        const char *label = (const char *)sqlite3_column_text(st, 3);
+        callable = label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0);
+        for (int i = 0; i < 2; i++) {
+            const char *type = (const char *)sqlite3_column_text(st, 4 + i);
+            if (type && (strcmp(type, "true") == 0 || strcmp(type, "false") == 0))
+                recursion_flags[i] = strcmp(type, "true") == 0;
+        }
     }
     sqlite3_finalize(st);
     if (!found)
@@ -353,6 +366,15 @@ char *cbm_atlas_why_json(cbm_store_t *store, const char *project, int64_t node_i
     yyjson_mut_obj_add_strcpy(doc, sym, "name", sym_name);
     if (sym_file[0])
         yyjson_mut_obj_add_strcpy(doc, sym, "file_path", sym_file);
+    if (callable) {
+        const char *keys[] = {"self_recursive", "recursive"};
+        for (int i = 0; i < 2; i++) {
+            if (recursion_flags[i] >= 0)
+                yyjson_mut_obj_add_bool(doc, sym, keys[i], recursion_flags[i] != 0);
+            else
+                yyjson_mut_obj_add_null(doc, sym, keys[i]);
+        }
+    }
     yyjson_mut_obj_add_val(doc, jroot, "symbol", sym);
     yyjson_mut_obj_add_str(doc, jroot, "direction", upward ? "up" : "down");
 
@@ -366,21 +388,23 @@ char *cbm_atlas_why_json(cbm_store_t *store, const char *project, int64_t node_i
     const char *rows_sql =
         upward ? "SELECT n.id, n.name, n.qualified_name, n.file_path, e.properties, "
                  "(SELECT COUNT(*) FROM edges e2 WHERE e2.project=e.project AND "
-                 "e2.target_id=n.id AND e2.type='CALLS') FROM edges e JOIN nodes n ON "
+                 "e2.target_id=n.id AND e2.source_id <> e2.target_id AND e2.type='CALLS') "
+                 "FROM edges e JOIN nodes n ON "
                  "n.project=e.project AND n.id=e.source_id WHERE e.project=?1 AND "
-                 "e.target_id=?2 AND e.type='CALLS' ORDER BY n.id LIMIT ?3"
+                 "e.target_id=?2 AND e.source_id <> e.target_id AND e.type='CALLS' ORDER BY n.id LIMIT ?3"
                : "SELECT n.id, n.name, n.qualified_name, n.file_path, e.properties, "
                  "(SELECT COUNT(*) FROM edges e2 WHERE e2.project=e.project AND "
-                 "e2.source_id=n.id AND e2.type='CALLS') FROM edges e JOIN nodes n ON "
+                 "e2.source_id=n.id AND e2.source_id <> e2.target_id AND e2.type='CALLS') "
+                 "FROM edges e JOIN nodes n ON "
                  "n.project=e.project AND n.id=e.target_id WHERE e.project=?1 AND "
-                 "e.source_id=?2 AND e.type='CALLS' ORDER BY n.id LIMIT ?3";
+                 "e.source_id=?2 AND e.source_id <> e.target_id AND e.type='CALLS' ORDER BY n.id LIMIT ?3";
     long long total = 0;
     {
         const char *count_sql =
             upward ? "SELECT COUNT(*) FROM edges WHERE project=?1 AND target_id=?2 AND "
-                     "type='CALLS'"
+                     "type='CALLS' AND source_id <> target_id"
                    : "SELECT COUNT(*) FROM edges WHERE project=?1 AND source_id=?2 AND "
-                     "type='CALLS'";
+                     "type='CALLS' AND source_id <> target_id";
         if (sqlite3_prepare_v2(db, count_sql, -1, &st, NULL) == SQLITE_OK) {
             sqlite3_bind_text(st, 1, project, -1, SQLITE_STATIC);
             sqlite3_bind_int64(st, 2, id);

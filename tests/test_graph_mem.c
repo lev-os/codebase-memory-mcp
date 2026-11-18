@@ -256,7 +256,7 @@ typedef struct {
     int shapes;
     int diverged;
     uint64_t builds;
-    bool start_back; /* the cycle 0->1->2->0 returns node 0 at hop 3 */
+    bool start_back; /* a cycle must not list its root as a caller or callee */
 } gmt_bfs_run_t;
 
 static void gmt_bfs_all_shapes(const gmt_fixture_t *f, cbm_store_t *sql, cbm_store_t *mem,
@@ -283,7 +283,7 @@ static void gmt_bfs_all_shapes(const gmt_fixture_t *f, cbm_store_t *sql, cbm_sto
     if (cbm_store_bfs(mem, f->ids[0], "outbound", NULL, 0, 3, 100, &tr) == CBM_STORE_OK) {
         for (int i = 0; i < tr.visited_count; i++) {
             if (tr.visited[i].node.id == f->ids[0]) {
-                run->start_back = tr.visited[i].hop == 3;
+                run->start_back = true;
             }
         }
     }
@@ -311,7 +311,7 @@ TEST(graph_mem_bfs_matches_sql_on_every_shape) {
     ASSERT_EQ(run.diverged, 0);
     /* The layer really answered: one build, for the store under test only. */
     ASSERT_EQ(run.builds, 1);
-    ASSERT_TRUE(run.start_back);
+    ASSERT_FALSE(run.start_back);
     PASS();
 }
 
@@ -761,6 +761,27 @@ TEST(graph_mem_recursive_caller_counts_are_exact) {
             }
     }
     cbm_store_search_free(&out);
+    sql = cbm_store_open_path(db);
+    if (!sql)
+        ok = false;
+    for (int mode = 0; sql && mode < 2; mode++) {
+        cbm_store_t *store = mode ? mem : sql;
+        for (int i = 0; i < 4; i++) {
+            for (int inbound = 0; inbound < 2; inbound++) {
+                cbm_traverse_result_t tr = {0};
+                int expected = inbound ? (i == 1 || i == 2) : (i == 3 ? 2 : 0);
+                int rc = cbm_store_bfs(store, ids[i], inbound ? "inbound" : "outbound",
+                                      NULL, 0, 3, 100, &tr);
+                printf("  recursive BFS mode=%d case=%d inbound=%d rows=%d expected=%d\n",
+                       mode, i, inbound, tr.visited_count, expected);
+                ok = rc == CBM_STORE_OK && tr.visited_count == expected && ok;
+                for (int j = 0; j < tr.visited_count; j++)
+                    ok = tr.visited[j].node.id != ids[i] && ok;
+                cbm_store_traverse_free(&tr);
+            }
+        }
+    }
+    cbm_store_close(sql);
     bool built = cbm_graph_mem_build_count() == builds + 1;
     cbm_store_close(mem);
     cbm_mem_set_budget_for_tests(saved);
