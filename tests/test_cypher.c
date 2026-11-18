@@ -6587,7 +6587,22 @@ TEST(cypher_exists_uses_bound_endpoint_and_labels) {
     PASS();
 }
 
+
+
+TEST(cypher_exists_multitype_teaches_or) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (a) WHERE EXISTS { (a)-[:CALLS|ASYNC_CALLS]->() } RETURN a", "p", 0, &r);
+    printf("  multi-type EXISTS rc=%d error=%s\n", rc, r.error ? r.error : "absent");
+    bool ok = rc != 0 && r.error && strstr(r.error, "EXISTS {...} OR EXISTS {...}");
+    cbm_cypher_result_free(&r); cbm_store_close(s);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(cypher) {
+    RUN_TEST(cypher_exists_multitype_teaches_or);
     RUN_TEST(cypher_node_comparisons_use_identity);
     RUN_TEST(cypher_exists_uses_bound_endpoint_and_labels);
     RUN_TEST(cypher_exists_retains_stored_self_relationships);

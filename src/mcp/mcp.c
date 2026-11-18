@@ -11284,6 +11284,9 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                                              .do_inbound = do_inbound};
     trace_call_coverage(store, project, &coverage_scope, trace_includes_calls, &unresolved_out,
                         &unresolved_in);
+    bool callable_roots = node_count > 0;
+    for (int i = 0; i < node_count; i++)
+        callable_roots &= trace_label_is_callable(nodes[i].label);
     trace_recursion_t recursion = trace_recursion_metadata(nodes, node_count);
     const char *out_relation = unresolved_out ? "unknown" : (tr_out.truncated ? "gte" : "eq");
     const char *in_relation = unresolved_in ? "unknown" : (tr_in.truncated ? "gte" : "eq");
@@ -11365,7 +11368,8 @@ render_trace_output:;
         if (mode) {
             cbm_tree_scalar_str(&sb, "mode", mode);
         }
-        trace_recursion_tree(&sb, &recursion, trace_includes_calls);
+        if (callable_roots)
+            trace_recursion_tree(&sb, &recursion, trace_includes_calls);
         /* Grouped tree is THE default; risk_labels/data_flow keep the flat
          * table (extra columns) in the same tree syntax. */
         bool render_risk = risk_labels && emit_optional_fields;
@@ -11461,7 +11465,8 @@ render_trace_output:;
         if (mode) {
             yyjson_mut_obj_add_str(doc, root, "mode", mode);
         }
-        trace_recursion_json(doc, root, &recursion, trace_includes_calls);
+        if (callable_roots)
+            trace_recursion_json(doc, root, &recursion, trace_includes_calls);
         if (do_outbound) {
             yyjson_mut_obj_add_int(doc, root, "callees_total", out_total);
             yyjson_mut_obj_add_str(doc, root, "callees_total_relation", out_relation);
@@ -11547,7 +11552,8 @@ render_trace_output:;
             if (!trace_legacy_json) {
                 cbm_sb_t floor;
                 cbm_sb_init(&floor);
-                trace_recursion_tree(&floor, &recursion, trace_includes_calls);
+                if (callable_roots)
+                    trace_recursion_tree(&floor, &recursion, trace_includes_calls);
                 if (do_outbound) {
                     cbm_tree_scalar_int(&floor, "callees_total", out_total);
                     cbm_tree_scalar_str(&floor, "callees_total_relation", out_relation);
@@ -11579,7 +11585,8 @@ render_trace_output:;
                 yyjson_mut_doc *floor_doc = yyjson_mut_doc_new(NULL);
                 yyjson_mut_val *floor = yyjson_mut_obj(floor_doc);
                 yyjson_mut_doc_set_root(floor_doc, floor);
-                trace_recursion_json(floor_doc, floor, &recursion, trace_includes_calls);
+                if (callable_roots)
+                    trace_recursion_json(floor_doc, floor, &recursion, trace_includes_calls);
                 if (do_outbound) {
                     yyjson_mut_obj_add_int(floor_doc, floor, "callees_total", out_total);
                     yyjson_mut_obj_add_str(floor_doc, floor, "callees_total_relation",

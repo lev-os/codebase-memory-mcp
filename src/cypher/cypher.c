@@ -1117,7 +1117,8 @@ static cbm_expr_t *parse_exists_predicate(parser_t *p, bool negated) {
         free_one_rel_pattern(&rel);
         free_one_node_pattern(&far_node);
         snprintf(p->error, sizeof(p->error),
-                 "EXISTS supports one hop and one edge type, without node properties");
+                 "EXISTS supports one hop and one edge type, without node properties; "
+                 "combine edge types with EXISTS {...} OR EXISTS {...}");
         return NULL;
     }
     bool exclude_self = false;

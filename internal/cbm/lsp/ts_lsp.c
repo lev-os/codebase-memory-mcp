@@ -2573,8 +2573,11 @@ static void ts_flow_enter_loop(TSLSPContext *ctx, TSNode loop) {
         else
             hi = mid;
     }
-    for (int i = lo; i < sites->count && sites->by_start[i]->start < end; i++)
-        ts_flow_write(ctx, sites->by_start[i]->name, NULL, false);
+    for (int i = lo; i < sites->count && sites->by_start[i]->start < end; i++) {
+        const char *name = sites->by_start[i]->name;
+        if (!strchr(name, '.'))
+            ts_flow_write(ctx, name, NULL, false);
+    }
 }
 
 /* Bind each name a `var` of the function being entered declares, in the

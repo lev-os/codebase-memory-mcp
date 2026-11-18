@@ -28943,11 +28943,49 @@ TEST(tool_snippet_neighbor_counts_and_names_agree) {
     PASS();
 }
 
+TEST(tool_trace_noncallable_omits_recursion) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *s = cbm_mcp_server_store(srv);
+    cbm_mcp_server_set_project(srv, "p");
+    ASSERT_EQ(cbm_store_upsert_project(s, "p", "/tmp/p"), CBM_STORE_OK);
+    const char *labels[] = {"Class", "Route", "Resource", "Function", "Method"};
+    bool ok = true;
+    char large[4096]; memset(large, 'q', sizeof(large)-1); large[sizeof(large)-1] = 0;
+    cbm_node_t n = {.project = "p", .label = "Function", .name = large, .qualified_name = large};
+    int64_t child = cbm_store_upsert_node(s, &n);
+    for (int i = 0; i < 5; i++) {
+        n.label = labels[i]; n.name = labels[i]; n.qualified_name = labels[i];
+        n.properties_json = "{\"self_recursive\":true,\"recursive\":true}";
+        int64_t id = cbm_store_upsert_node(s, &n);
+        cbm_edge_t e = {.project = "p", .source_id = id, .target_id = child, .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(s, &e), 0);
+        for (int json = 0; json < 2; json++) {
+            for (int floor = 0; floor < 2; floor++) {
+                char args[256];
+                snprintf(args, sizeof(args), "{\"project\":\"p\",\"function_name\":\"%s\",\"direction\":\"outbound\",\"format\":\"%s\",\"max_output_tokens\":%d}", labels[i], json ? "json" : "tree", floor ? 128 : 8000);
+                char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+                char *inner = extract_text_content(response);
+                ASSERT_NOT_NULL(inner);
+                bool recursion = strstr(inner, "self_recursive") != NULL;
+                printf("  trace %s json=%d floor=%d recursion=%d\n", labels[i], json, floor, recursion);
+                ok = recursion == (i >= 3) && ok;
+                if (i < 3) ok = !strstr(inner, "recursive") && !strstr(inner, "self_call_policy") && ok;
+                if (floor) ok = strstr(inner, "output_budget_floor_exceeded") && ok;
+                free(inner); free(response);
+            }
+        }
+    }
+    cbm_mcp_server_free(srv);
+    ASSERT_TRUE(ok);
+    PASS();
+}
 
 
 
 SUITE(mcp) {
     RUN_TEST(tool_snippet_neighbor_counts_and_names_agree);
+    RUN_TEST(tool_trace_noncallable_omits_recursion);
     RUN_TEST(tool_recursive_neighbors_and_noncallable_snippet);
     RUN_TEST(tool_caller_summary_keeps_other_same_name_roots);
     RUN_TEST(tool_caller_summaries_exclude_recursive_root);
