@@ -38641,13 +38641,19 @@ TEST(pipeline_js_self_edge_requires_unwritten_binding) {
         "class C { walk() { this.walk = replacement; this.walk(); } }\n"
         "class D { step() { this.step(); } }\n"
         "D.prototype.step = replacement;\n"
-        "class Stable { run() { this.other = replacement; this.run(); } }\n",
+        "class Stable { run() { this.other = replacement; this.run(); } }\n"
+        "class Wrapped { turn() { (this).turn = replacement; this.turn(); } }\n"
+        "class Bracket { spin() { this.spin(); } }\n"
+        "Bracket['prototype'].spin = replacement;\n"
+        "class Grouped { next() { this.next(); } }\n"
+        "(Grouped.prototype).next = replacement;\n",
         "script.js",
         "function replacement() {}\n"
         "function walk() { globalThis.walk = replacement; walk(); }\n"
         "function step() { window.step = replacement; step(); }\n"
         "function run() { self.run = replacement; run(); }\n"
-        "function stable() { stable(); }\n",
+        "function stable() { stable(); }\n"
+        "function wrapped() { (globalThis).wrapped = replacement; wrapped(); }\n",
         "self.js",
         "import { walk as again } from './self';\n"
         "function replacement() {}\n"
@@ -38664,10 +38670,14 @@ TEST(pipeline_js_self_edge_requires_unwritten_binding) {
     } cases[] = {{"member.js", 2, ""},
                  {"member.js", 3, ""},
                  {"member.js", 5, "member.Stable.run -> member.Stable.run"},
+                 {"member.js", 6, ""},
+                 {"member.js", 7, ""},
+                 {"member.js", 9, ""},
                  {"script.js", 2, ""},
                  {"script.js", 3, ""},
                  {"script.js", 4, ""},
                  {"script.js", 5, "script.stable -> script.stable"},
+                 {"script.js", 6, ""},
                  {"self.js", 3, ""},
                  {"clean.js", 2, "clean.walk -> clean.walk"}};
     bool ok = true;

@@ -1736,15 +1736,22 @@ static void ts_site_push_pattern(TSLSPContext *ctx, TsSiteVec *v, TSNode pattern
     } else if (strcmp(kind, "member_expression") == 0 ||
                strcmp(kind, "subscript_expression") == 0) {
         TSNode object = ts_node_child_by_field_name(pattern, "object", 6);
+        while (ts_write_wrapper(object))
+            object = ts_write_operand(object);
         TSNode prop = ts_node_child_by_field_name(pattern, "property", 8);
         if (ts_node_is_null(prop))
             prop = ts_node_child_by_field_name(pattern, "index", 5);
         const char *prefix = NULL;
         if (node_kind_is(object, "this")) {
             prefix = "this.";
-        } else if (node_kind_is(object, "member_expression")) {
+        } else if (node_kind_is(object, "member_expression") ||
+                   node_kind_is(object, "subscript_expression")) {
             TSNode part = ts_node_child_by_field_name(object, "property", 8);
-            if (ts_write_name_is(ctx, part, "prototype"))
+            if (ts_node_is_null(part))
+                part = ts_node_child_by_field_name(object, "index", 5);
+            if (ts_write_name_is(ctx, part, "prototype") ||
+                ts_write_name_is(ctx, part, "'prototype'") ||
+                ts_write_name_is(ctx, part, "\"prototype\""))
                 prefix = "this."; /* a prototype write can replace an instance method */
         } else if (node_kind_is(object, "identifier") &&
                    (ts_write_name_is(ctx, object, "globalThis") ||
