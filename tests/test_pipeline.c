@@ -39038,7 +39038,24 @@ TEST(pipeline_x9d_default_export_binding) {
     PASS();
 }
 
+TEST(pipeline_x9d_generator_returns) {
+    const char *sources[] = {
+        "class Port { send() {} } export class Builder { static *make() { return new Port(); } }",
+        "class Port { send() {} } export class Builder { static async *make() { return new Port(); } }",
+        "class Port { send() {} } export const Builder = { *make() { return new Port(); } };",
+        "class Port { send() {} } export const Builder = { async *make() { return new Port(); } };",
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        ok = x9d_calls(sources[i], "(await Builder.make()).send();",
+                        i < 2 ? "main.use -> lib.Builder.make" : "main.use -> lib.make") && ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_x9d_generator_returns);
+
     RUN_TEST(pipeline_x9d_default_export_binding);
 
     RUN_TEST(pipeline_x9c_named_class_static_members_are_values);

@@ -5878,6 +5878,10 @@ static const char *ts_constructor_return(CBMExtractCtx *ctx, TSNode fn) {
         return NULL;
     if (strstr(ts_node_type(fn), "generator"))
         return NULL;
+    /* Generator methods keep the ordinary method_definition node kind. */
+    for (uint32_t i = 0; i < ts_node_child_count(fn); i++)
+        if (strcmp(ts_node_type(ts_node_child(fn, i)), "*") == 0)
+            return NULL;
     for (TSNode p = ts_node_parent(fn); !ts_node_is_null(p); p = ts_node_parent(p)) {
         const char *kind = ts_node_type(p);
         if (strcmp(kind, "statement_block") == 0 || strcmp(kind, "class") == 0 ||
