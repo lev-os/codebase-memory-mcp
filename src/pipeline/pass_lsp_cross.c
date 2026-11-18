@@ -1654,6 +1654,29 @@ static bool pxc_edge_is_reexport(const char *json) {
     return json && strstr(json, "\"reexport\":\"") != NULL;
 }
 
+/* The function or class a file's default export binds (its Module's
+ * CBM_PROP_JS_DEFAULT, extract_defs.c js_mark_default), else NULL. */
+static const cbm_gbuf_node_t *pxc_file_default(const cbm_gbuf_t *gbuf, const char *project_name,
+                                               const cbm_gbuf_node_t *file) {
+    if (!file || !file->file_path) {
+        return NULL;
+    }
+    char *module_qn = cbm_pipeline_fqn_module(project_name, file->file_path);
+    const cbm_gbuf_node_t *mod = module_qn ? cbm_gbuf_find_by_qn(gbuf, module_qn) : NULL;
+    free(module_qn);
+    char qn[CBM_SZ_1K];
+    if (!mod || !mod->label || strcmp(mod->label, "Module") != 0 || !mod->file_path ||
+        strcmp(mod->file_path, file->file_path) != 0 ||
+        !pxc_edge_string_prop(mod->properties_json, CBM_PROP_JS_DEFAULT, qn, sizeof(qn))) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *def = cbm_gbuf_find_by_qn(gbuf, qn);
+    return def && def->label && !pxc_label_is_container(def->label) && def->file_path &&
+                   strcmp(def->file_path, file->file_path) == 0
+               ? def
+               : NULL;
+}
+
 /* "<node id>\x1f<name>" into buf; false when it does not fit. */
 static bool pxc_rx_key(char *buf, size_t cap, int64_t id, const char *name) {
     int n = snprintf(buf, cap, "%lld\x1f%s", (long long)id, name ? name : "");
@@ -1942,6 +1965,9 @@ static int64_t pxc_rx_walk(pxc_rx_ctx_t *c, const cbm_gbuf_node_t *target, const
         }
         const cbm_gbuf_node_t *def =
             pxc_defined_symbol(c->gbuf, c->project, file->file_path, item.name);
+        if (!def && strcmp(item.name, "default") == 0) {
+            def = pxc_file_default(c->gbuf, c->project, file); /* reached by a re-export */
+        }
         if (def) {
             pxc_rx_found(c, def->id);
             continue;
@@ -2001,12 +2027,17 @@ void cbm_pxc_ts_barrels_free(CBMTsBarrels *b) {
     cbm_free(CBM_MEM_CLASS_RESOLVE, b);
 }
 
-/* A named import binds `member`; a default import binds the default export
- * and a namespace import the module object, so neither names a member a
- * barrel could re-export. */
-static bool pxc_import_binds_member(const CBMImport *imp) {
-    return cbm_import_binds_local(imp) && !imp->is_default && imp->member && imp->member[0] &&
-           strcmp(imp->member, "default") != 0;
+/* The export a binding asks a barrel for: a named import's member, or
+ * "default" for a default import (`export { default } from` can forward it).
+ * NULL for a namespace import: it binds the module object. */
+static const char *pxc_import_barrel_member(const CBMImport *imp) {
+    if (!cbm_import_binds_local(imp)) {
+        return NULL;
+    }
+    if (imp->is_default) {
+        return "default";
+    }
+    return imp->member && imp->member[0] ? imp->member : NULL;
 }
 
 /* Record the request under `key` ("target id\x1fmember"), not yet present. */
@@ -2024,12 +2055,13 @@ static void pxc_barrel_req_add(CBMTsBarrels *b, const char *key, int64_t target_
 
 void cbm_pxc_ts_barrels_request(CBMTsBarrels *b, const char *rel_path, const CBMImport *imp,
                                 const cbm_gbuf_node_t *target) {
-    if (!b || !rel_path || !imp || !target || !pxc_label_is_container(target->label) ||
-        !pxc_import_binds_member(imp) || !pxc_is_js_family(cbm_language_for_filename(rel_path))) {
+    const char *member = pxc_import_barrel_member(imp);
+    if (!b || !rel_path || !imp || !target || !pxc_label_is_container(target->label) || !member ||
+        !pxc_is_js_family(cbm_language_for_filename(rel_path))) {
         return;
     }
     char key[CBM_SZ_512];
-    if (!pxc_rx_key(key, sizeof(key), target->id, imp->member) || cbm_ht_has(b->requests, key)) {
+    if (!pxc_rx_key(key, sizeof(key), target->id, member) || cbm_ht_has(b->requests, key)) {
         return;
     }
     pxc_barrel_req_add(b, key, target->id);
@@ -2055,9 +2087,15 @@ void cbm_pxc_ts_barrels_resolve(CBMTsBarrels *b, const cbm_gbuf_t *gbuf, const c
             if (!target || !target->label || !target->file_path) {
                 continue;
             }
-            /* A module that defines the member keeps its own QN. */
+            /* A module that defines the member keeps its own QN, and so does
+             * one whose own default export binds a function or a class. */
             if (strcmp(target->label, "Module") == 0 &&
                 pxc_defined_symbol(gbuf, project_name, target->file_path, r->member)) {
+                continue;
+            }
+            if (strcmp(r->member, "default") == 0 &&
+                pxc_file_default(gbuf, project_name,
+                                 cbm_pxc_ts_barrel_file_of(gbuf, project_name, target))) {
                 continue;
             }
             r->def_id = pxc_rx_walk(&c, target, r->member);
@@ -2105,8 +2143,8 @@ static const cbm_gbuf_node_t *pxc_ts_barrel_def(const cbm_gbuf_t *gbuf, const CB
         imp = it;
     }
     char key[CBM_SZ_512];
-    if (!imp || !pxc_import_binds_member(imp) ||
-        !pxc_rx_key(key, sizeof(key), target->id, imp->member)) {
+    const char *member = imp ? pxc_import_barrel_member(imp) : NULL;
+    if (!member || !pxc_rx_key(key, sizeof(key), target->id, member)) {
         return NULL;
     }
     const pxc_barrel_req_t *r = (const pxc_barrel_req_t *)cbm_ht_get(b->requests, key);

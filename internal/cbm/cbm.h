@@ -376,6 +376,12 @@ typedef struct {
  * "true". */
 #define CBM_PROP_FUNCTION_LOCAL "function_local"
 
+/* extra_props key of a JS/TS Module: the QN of the function or class its
+ * default export binds (the Module's alias_target). The barrel walk reads it
+ * from the graph, so `export { default } from './m'` and `export { default as
+ * x } from './m'` reach that exact definition. */
+#define CBM_PROP_JS_DEFAULT "js_default"
+
 /* Argument captured from a call expression */
 typedef struct {
     const char *expr;      // raw expression text ("payload.info", "MY_URL", "'hello'")

@@ -39537,7 +39537,147 @@ TEST(pipeline_x9e_literal_key_identity) {
     PASS();
 }
 
+/* Write each (path, source) pair, then main.ts, and check the CALLS of
+ * main.use in the sequential and the parallel paths. */
+static bool x9e_repo_calls(const char *const *files, const char *call, const char *want) {
+    bool ok = true;
+    for (int parallel = 0; parallel < 2; parallel++) {
+        char tmp[256] = "/tmp/cbm_x9e_repo_XXXXXX", db[512], main[2048], got[4096];
+        if (!cbm_mkdtemp(tmp)) return false;
+        XlangEnvSave env = xlang_env_select(parallel != 0);
+        if (parallel) x9c_parallel_fixture(tmp);
+        for (int i = 0; files[i]; i += 2) write_temp_file(tmp, files[i], files[i + 1]);
+        snprintf(main, sizeof(main), "%s\nexport async function use() { %s }\n",
+                 "import api, { make } from './lib';", call);
+        write_temp_file(tmp, "main.ts", main);
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        int rc = p ? x9c_parallel_run(p, parallel != 0) : -1;
+        if (rc == 0) {
+            js_twin_calls_at(db, cbm_pipeline_project_name(p), "main.ts", 2, got, sizeof(got));
+            if (!js_twin_expect(parallel ? "parallel exact CALLS" : "sequential exact CALLS",
+                                got, want)) {
+                js_twin_rows(db, cbm_pipeline_project_name(p),
+                             "SELECT t.qualified_name, json_extract(e.properties, '$.strategy') "
+                             "FROM edges e JOIN nodes s ON s.id = e.source_id "
+                             "JOIN nodes t ON t.id = e.target_id WHERE e.project = ?1 "
+                             "AND e.type = 'CALLS' AND json_extract(e.properties, '$.line') = ?2 "
+                             "AND substr(s.file_path, -length(?3)) = ?3 AND ?4 = ?4 ORDER BY 1",
+                             2, "main.ts", NULL, true, got, sizeof(got));
+                fprintf(stderr, "  strategies: %s\n", got);
+                ok = false;
+            }
+        } else ok = false;
+        cbm_pipeline_free(p);
+        xlang_env_restore(&env);
+        th_rmtree(tmp);
+    }
+    if (!ok) fprintf(stderr, "  ^ lib [%s] call [%s]\n", files[1], call);
+    return ok;
+}
+
+TEST(pipeline_x9e_default_export_aliases) {
+    /* Each provider also declares a same-name decoy of the default's target. */
+    const char *provider = "function run() {}\nexport function make() {}\nexport default run;\n";
+    const char *aliased =
+        "function run() {}\nexport function make() {}\nexport { run as default };\n";
+    struct {
+        const char *lib, *provider, *mid, *call, *want;
+    } cases[] = {
+        {"function run() {}\nexport function make() {}\nexport { run as default };", NULL, NULL,
+         "api();", "main.use -> lib.run"},
+        {"function run() {}\nfunction other() {}\nexport { other, run as default };", NULL, NULL,
+         "api();", "main.use -> lib.run"},
+        /* As `export default Runner` gives: `new` on a default import has no
+         * constructor edge in either form yet. */
+        {"class Runner { go() {} }\nexport class Other { go() {} }\nexport { Runner as default };",
+         NULL, NULL, "new api().go();", "main.use -> lib.Runner.go"},
+        {"class Runner { go() {} }\nexport class Other { go() {} }\nexport default Runner;",
+         NULL, NULL, "new api().go();", "main.use -> lib.Runner.go"},
+        {"export function run() {}\nexport { default } from './provider';", provider, NULL,
+         "api();", "main.use -> provider.run"},
+        {"export { default as make } from './provider';", provider, NULL, "make();",
+         "main.use -> provider.run"},
+        {"export { default as make } from './provider';", aliased, NULL, "make();",
+         "main.use -> provider.run"},
+        {"export { default } from './mid';", provider,
+         "export function run() {}\nexport { default as default } from './provider';", "api();",
+         "main.use -> provider.run"},
+        /* No default to reach: a cycle, a module without one. */
+        {"export { default } from './provider';", "export { default } from './lib';", NULL,
+         "api();", ""},
+        {"export { default as make } from './provider';", "export function other() {}", NULL,
+         "make();", ""},
+        {"export function run() {}\nexport { default } from './provider';",
+         "export function run() {}", NULL, "api();", ""},
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *files[] = {"lib.ts",      cases[i].lib, "provider.ts", cases[i].provider,
+                               "mid.ts",      cases[i].mid, NULL};
+        if (!cases[i].provider) files[2] = NULL;
+        else if (!cases[i].mid) files[4] = NULL;
+        ok = x9e_repo_calls(files, cases[i].call, cases[i].want) && ok;
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* A default re-exported through a barrel keeps its exact target across
+ * incremental runs: an importer edit (the barrel and the provider are proxies)
+ * and a provider edit that moves the default. */
+TEST(pipeline_x9e_default_reexport_incremental) {
+    char tmp[256] = "/tmp/cbm_x9e_default_XXXXXX", db[512], got[2048];
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    XlangEnvSave env = xlang_env_select(true);
+    x9c_parallel_fixture(tmp);
+    write_temp_file(tmp, "lib.ts",
+                    "export function run() {}\nexport { default } from './provider';\n");
+    snprintf(db, sizeof(db), "%s/g.db", tmp);
+    const char *mains[] = {"api();", "api(); api();", "api(); api();"};
+    const char *targets[] = {"run", "run", "other"};
+    bool ok = true;
+    for (int phase = 0; phase < 3; phase++) {
+        char body[512], path[512];
+        if (phase != 1) {
+            snprintf(body, sizeof(body),
+                     "function run() {}\nfunction other() {}\nexport default %s;\n",
+                     targets[phase]);
+            write_temp_file(tmp, "provider.ts", body);
+            snprintf(path, sizeof(path), "%s/provider.ts", tmp);
+            ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000 + phase * 100, 0), 0);
+        }
+        if (phase != 2) {
+            snprintf(body, sizeof(body),
+                     "import api from './lib';\nexport function use() { %s }\n", mains[phase]);
+            write_temp_file(tmp, "main.ts", body);
+            snprintf(path, sizeof(path), "%s/main.ts", tmp);
+            ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000 + phase * 100, 0), 0);
+        }
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(p);
+        ASSERT_EQ(x9c_parallel_run(p, phase == 0), 0);
+        if (phase == 1) {
+            ASSERT_EQ(cbm_pipeline_incremental_test_last_route(),
+                      CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+        }
+        const char *project = cbm_pipeline_project_name(p);
+        char want[128];
+        snprintf(want, sizeof(want), "main.use -> provider.%s", targets[phase]);
+        js_twin_calls_at(db, project, "main.ts", 2, got, sizeof(got));
+        ok = js_twin_expect("default re-export edit", got, want) && ok;
+        if (phase) ok = x9c_fresh_calls_equal(tmp, db, project, phase) && ok;
+        cbm_pipeline_free(p);
+    }
+    xlang_env_restore(&env);
+    th_rmtree(tmp);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_x9e_default_reexport_incremental);
+    RUN_TEST(pipeline_x9e_default_export_aliases);
     RUN_TEST(pipeline_x9e_literal_key_identity);
     RUN_TEST(pipeline_x9e_member_decorators);
     RUN_TEST(pipeline_x9e_member_stability);

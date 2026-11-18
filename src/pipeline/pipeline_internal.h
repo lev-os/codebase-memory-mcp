@@ -1843,7 +1843,8 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *     withholds that member only, at every dispatch path.
  *     A decorator withholds the member or the class it decorates.
  *     Literal member keys match by runtime key, and a subscript call joins
- *     a member spelled another way. */
+ *     a member spelled another way.
+ *     A re-exported default binds its exact definition. */
 enum { CBM_SEMANTIC_INDEX_VERSION = 35 };
 
 typedef struct {

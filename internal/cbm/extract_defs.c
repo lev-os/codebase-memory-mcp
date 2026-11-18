@@ -16321,6 +16321,48 @@ static TSNode js_module_binding(CBMExtractCtx *ctx, const char *name) {
     return found;
 }
 
+/* The local binding `export { run as default }` names: the specifier's name
+ * node, else a null node (a clause with a source re-exports another module's
+ * binding; two such specifiers count as two defaults). */
+static TSNode js_default_specifier(CBMExtractCtx *ctx, TSNode stmt, int *defaults) {
+    TSNode found = {0};
+    if (!ts_node_is_null(ts_node_child_by_field_name(stmt, "source", 6)))
+        return found;
+    for (uint32_t i = 0; i < ts_node_named_child_count(stmt); i++) {
+        TSNode clause = ts_node_named_child(stmt, i);
+        if (strcmp(ts_node_type(clause), "export_clause") != 0)
+            continue;
+        for (uint32_t j = 0; j < ts_node_named_child_count(clause); j++) {
+            TSNode spec = ts_node_named_child(clause, j);
+            TSNode alias = ts_node_child_by_field_name(spec, "alias", 5);
+            if (strcmp(ts_node_type(spec), "export_specifier") != 0 ||
+                !cbm_ts_key_is(alias, ctx->source, "default"))
+                continue;
+            (*defaults)++;
+            found = ts_node_child_by_field_name(spec, "name", 4);
+        }
+    }
+    return found;
+}
+
+/* Record a Module's default function or class (alias_target) as the
+ * CBM_PROP_JS_DEFAULT node property, keeping the facts it already carries. */
+static void js_mark_default(CBMArena *a, CBMDefinition *mod) {
+    int n = 0;
+    while (mod->extra_props && mod->extra_props[n])
+        n++;
+    const char **kv =
+        (const char **)cbm_arena_alloc(a, (size_t)(n + PAIR_LEN + SKIP_ONE) * sizeof(char *));
+    if (!kv)
+        return; /* No mark: a re-export of this default reaches nothing. */
+    for (int i = 0; i < n; i++)
+        kv[i] = mod->extra_props[i];
+    kv[n] = CBM_PROP_JS_DEFAULT;
+    kv[n + SKIP_ONE] = mod->alias_target;
+    kv[n + PAIR_LEN] = NULL;
+    mod->extra_props = kv;
+}
+
 static void js_record_object_members(CBMExtractCtx *ctx, int mod_idx) {
     bool needed = false;
     for (int i = 0; i < ctx->result->defs.count; i++)
@@ -16329,9 +16371,13 @@ static void js_record_object_members(CBMExtractCtx *ctx, int mod_idx) {
                    strcmp(ctx->result->defs.items[i].label, "Class") == 0);
     for (uint32_t i = 0; !needed && i < ts_node_named_child_count(ctx->root); i++) {
         TSNode node = ts_node_named_child(ctx->root, i);
-        if (strcmp(ts_node_type(node), "export_statement") == 0)
+        int aliases = 0;
+        if (strcmp(ts_node_type(node), "export_statement") == 0) {
             for (uint32_t j = 0; j < ts_node_child_count(node); j++)
                 needed |= strcmp(ts_node_type(ts_node_child(node, j)), "default") == 0;
+            js_default_specifier(ctx, node, &aliases);
+            needed |= aliases > 0;
+        }
     }
     if (!needed)
         return;
@@ -16399,6 +16445,7 @@ static void js_record_object_members(CBMExtractCtx *ctx, int mod_idx) {
 defaults:
     ts_tree_cursor_delete(&cursor);
     uint32_t n = ts_node_named_child_count(ctx->root);
+    int defaults = 0;
     for (uint32_t i = 0; i < n; i++) {
         TSNode stmt = ts_node_named_child(ctx->root, i);
         if (strcmp(ts_node_type(stmt), "export_statement") != 0)
@@ -16407,7 +16454,12 @@ defaults:
         for (uint32_t j = 0; j < ts_node_child_count(stmt); j++)
             is_default |= strcmp(ts_node_type(ts_node_child(stmt, j)), "default") == 0;
         TSNode value = cbm_ts_unwrap_value(ts_node_child_by_field_name(stmt, "value", 5));
-        if (!is_default)
+        /* `export { run as default }` binds the default as `export default run` does. */
+        if (is_default)
+            defaults++;
+        else
+            value = js_default_specifier(ctx, stmt, &defaults);
+        if (!is_default && ts_node_is_null(value))
             continue;
         TSNode declaration = ts_node_child_by_field_name(stmt, "declaration", 11);
         if (!ts_node_is_null(declaration)) {
@@ -16455,6 +16507,16 @@ defaults:
             }
         }
     }
+    if (defaults > 1) { /* Two default exports bind no one value. */
+        mod->alias_target = NULL;
+        mod->return_type = "unknown";
+        mod->ts_return_scope_safe = false;
+        mod->ts_return_constructor = false;
+        mod->js_object_literal = false;
+        mod->js_object_members = NULL;
+    }
+    if (mod->alias_target)
+        js_mark_default(ctx->arena, mod);
     free(defs);
 }
 
