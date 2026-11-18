@@ -1793,6 +1793,8 @@ static void ts_site_push_key(TSLSPContext *ctx, TsSiteVec *v, TSNode key,
         }
         name = cbm_arena_strndup(ctx->arena, name + 1, len - 2);
     }
+    if (name && strcmp(name, "__proto__") == 0)
+        ts_site_unknown_key(v, global);
     const char *member = name ? cbm_arena_sprintf(ctx->arena, "this.%s", name) : NULL;
     if (!member) {
         v->failed = true;
@@ -1906,6 +1908,18 @@ collected_fresh:
                                     ts_node_eq(ts_node_child_by_field_name(parent, "object", 6), use);
                     if (!receiver && ts_node_start_byte(node) != fresh.items[i].start)
                         escaped[i] = true;
+                    if (receiver) {
+                        TSNode access = parent, call = ts_node_parent(parent);
+                        while (ts_write_wrapper(call)) {
+                            access = call;
+                            call = ts_node_parent(call);
+                        }
+                        /* A method call passes the object as `this`; a
+                         * borrowed method can expose or mutate that receiver. */
+                        if (node_kind_is(call, "call_expression") &&
+                            ts_node_eq(ts_node_child_by_field_name(call, "function", 8), access))
+                            escaped[i] = true;
+                    }
                     if (i + 1 < fresh.count && strcmp(fresh.items[i + 1].name, name) == 0)
                         escaped[i] = true;
                 }
@@ -2055,9 +2069,16 @@ static void ts_site_visit(TSLSPContext *ctx, TsSiteVec *v, TsSiteVec *hoist,
             bool object_helper = ts_write_name_is(ctx, object, "Object") &&
                                  (ts_write_key_is(ctx, prop, "defineProperty") ||
                                   ts_write_key_is(ctx, prop, "defineProperties") ||
-                                  ts_write_key_is(ctx, prop, "assign"));
+                                  ts_write_key_is(ctx, prop, "assign") ||
+                                  ts_write_key_is(ctx, prop, "setPrototypeOf"));
             bool reflect_helper = ts_write_name_is(ctx, object, "Reflect") &&
-                                  ts_write_key_is(ctx, prop, "set");
+                                  (ts_write_key_is(ctx, prop, "set") ||
+                                   ts_write_key_is(ctx, prop, "defineProperty") ||
+                                   ts_write_key_is(ctx, prop, "setPrototypeOf"));
+            if ((object_helper || reflect_helper) &&
+                (ts_write_key_is(ctx, prop, "setPrototypeOf") ||
+                 (reflect_helper && ts_write_key_is(ctx, prop, "defineProperty"))))
+                v->unknown_member_key = true;
             if (object_helper || reflect_helper) {
                 TSNode args = ts_node_child_by_field_name(node, "arguments", 9);
                 bool global = false;
@@ -2080,6 +2101,25 @@ static void ts_site_visit(TSLSPContext *ctx, TsSiteVec *v, TsSiteVec *hoist,
                             ts_site_unknown_key(v, global);
                     }
                 }
+            }
+        }
+    }
+    /* An extracted mutation helper can be invoked through any receiver.
+     * Without alias analysis, even its capture prevents an exact proof. */
+    if (strcmp(kind, "variable_declarator") == 0) {
+        TSNode value = ts_node_child_by_field_name(node, "value", 5);
+        TSNode pattern = ts_node_child_by_field_name(node, "name", 4);
+        if ((ts_write_name_is(ctx, value, "Object") || ts_write_name_is(ctx, value, "Reflect")) &&
+            node_kind_is(pattern, "object_pattern")) {
+            for (uint32_t i = 0; i < ts_node_named_child_count(pattern); i++) {
+                TSNode key = ts_node_named_child(pattern, i);
+                if (node_kind_is(key, "pair_pattern"))
+                    key = ts_node_child_by_field_name(key, "key", 3);
+                if (ts_write_key_is(ctx, key, "assign") || ts_write_key_is(ctx, key, "set") ||
+                    ts_write_key_is(ctx, key, "defineProperty") ||
+                    ts_write_key_is(ctx, key, "defineProperties") ||
+                    ts_write_key_is(ctx, key, "setPrototypeOf"))
+                    ts_site_unknown_key(v, true);
             }
         }
     }

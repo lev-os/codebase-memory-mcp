@@ -38817,6 +38817,7 @@ TEST(pipeline_member_write_scope) {
         {"export const cache = [];", "cache[key] = 1;", false},
         {"const cache = [];", "consume(c\\u0061che); cache[key] = 1;", false},
         {"window.Map = replacement; const cache = new Map();", "cache[key] = 1;", false},
+        {"const cache = {};", "cache[key] = replacement; cache.step = C.prototype.walk; cache.step();", false},
     };
     enum { N = sizeof(cases) / sizeof(cases[0]) };
     const char *files[2 * N + 1] = {0};
@@ -38836,7 +38837,8 @@ TEST(pipeline_member_write_scope) {
         for (int i = 0; i < N; i++) {
             int count = js_twin_count_calls(run.db, run.project, paths[i], "s.id = t.id AND s.name = 'walk'");
             printf("  member scope mode=%d case=%d self=%d expected=%d\n", mode, i, count, cases[i].safe);
-            ok = count == cases[i].safe && ok;
+            int all = js_twin_count_calls(run.db, run.project, paths[i], "s.name = 'walk'");
+            ok = count == cases[i].safe && all == count && ok;
             if (cases[i].safe) {
                 int fib = js_twin_count_calls(run.db, run.project, paths[i], "s.id = t.id AND s.name = 'fib'");
                 printf("  confined receiver mode=%d case=%d fib=%d expected=1\n", mode, i, fib);
@@ -38908,6 +38910,39 @@ TEST(pipeline_script_global_write_scope) {
     PASS();
 }
 
+TEST(pipeline_prototype_helpers_reject_self) {
+    const char *writes[] = {
+        "Reflect.defineProperty(this, 'walk', {value: replacement});",
+        "Object.setPrototypeOf(this, B.prototype);",
+        "Reflect.setPrototypeOf(this, B.prototype);",
+        "this.__proto__ = B.prototype;",
+        "this['__proto__'] = B.prototype;",
+        "const { assign } = Object; assign(this, {walk: replacement});",
+        "const { assign: put } = Object; put(this, {walk: replacement});",
+    };
+    enum { N = sizeof(writes) / sizeof(writes[0]) };
+    const char *files[2 * N + 1] = {0};
+    char sources[N][1024], paths[N][32];
+    for (int i = 0; i < N; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "case%d.js", i);
+        snprintf(sources[i], sizeof(sources[i]),
+                 "class B { walk() {} }\nclass A { walk() { %s this.walk(); } }\n", writes[i]);
+        files[2*i] = paths[i]; files[2*i+1] = sources[i];
+    }
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        js_exact_run_t run;
+        ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+        for (int i = 0; i < N; i++) {
+            int count = js_twin_count_calls(run.db, run.project, paths[i], "s.name = 'walk'");
+            printf("  prototype mode=%d case=%d calls=%d expected=0\n", mode, i, count);
+            ok = count == 0 && ok;
+        }
+        js_exact_done(&run);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
 
 TEST(pipeline_unknown_member_write_preserves_local_types) {
     const char *writes[] = {
@@ -39322,6 +39357,7 @@ TEST(pipeline_x9c_named_class_static_members_are_values) {
 SUITE(pipeline) {
     RUN_TEST(pipeline_member_write_scope);
     RUN_TEST(pipeline_script_global_write_scope);
+    RUN_TEST(pipeline_prototype_helpers_reject_self);
     RUN_TEST(pipeline_unknown_member_write_preserves_local_types);
     RUN_TEST(pipeline_member_self_calls_reject_indirect_writes);
     RUN_TEST(pipeline_js_self_edge_requires_unwritten_binding);
