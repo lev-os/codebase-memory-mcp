@@ -28670,7 +28670,84 @@ TEST(search_code_scan_in_process_limits_and_failures) {
 #undef SCAN_FS
 #undef SCAN_RS
 
+TEST(tool_caller_summaries_exclude_recursive_root) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *s = cbm_mcp_server_store(srv);
+    cbm_mcp_server_set_project(srv, "caller-summary");
+    ASSERT_EQ(cbm_store_upsert_project(s, "caller-summary", "/tmp/caller-summary"), CBM_STORE_OK);
+    const char *names[] = {"alone", "used", "plain", "caller"};
+    int64_t ids[4];
+    for (int i = 0; i < 4; i++) {
+        char qn[128];
+        snprintf(qn, sizeof(qn), "caller-summary.%s", names[i]);
+        cbm_node_t n = {.project = "caller-summary",
+                        .label = "Function",
+                        .name = names[i],
+                        .qualified_name = qn,
+                        .file_path = "src/main.js",
+                        .properties_json = i < 2 ? "{\"self_recursive\":true}" : "{}"};
+        ids[i] = cbm_store_upsert_node(s, &n);
+    }
+    const int pairs[][2] = {{0, 0}, {1, 1}, {3, 1}, {3, 2}};
+    for (int i = 0; i < 4; i++) {
+        cbm_edge_t e = {.project = "caller-summary",
+                        .source_id = ids[pairs[i][0]],
+                        .target_id = ids[pairs[i][1]],
+                        .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(s, &e), 0);
+    }
+    bool ok = true;
+    for (int i = 0; i < 3; i++) {
+        char args[512];
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"caller-summary\",\"function_name\":\"%s\",\"direction\":"
+                 "\"inbound\",\"depth\":1,\"format\":\"json\"}",
+                 names[i]);
+        char *resp = cbm_mcp_handle_tool(srv, "trace_path", args);
+        char *inner = extract_text_content(resp);
+        ASSERT_NOT_NULL(inner);
+        yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *total = yyjson_obj_get(yyjson_doc_get_root(doc), "callers_total");
+        int expected = i == 0 ? 0 : 1;
+        printf("  trace %s callers_total=%lld expected=%d\n", names[i],
+               (long long)yyjson_get_int(total), expected);
+        ok = yyjson_is_int(total) && yyjson_get_int(total) == expected && ok;
+        yyjson_doc_free(doc);
+        free(inner);
+        free(resp);
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"caller-summary\",\"qualified_name\":\"caller-summary.%s\","
+                 "\"format\":\"json\"}",
+                 names[i]);
+        resp = cbm_mcp_handle_tool(srv, "get_code_snippet", args);
+        inner = extract_text_content(resp);
+        ASSERT_NOT_NULL(inner);
+        doc = yyjson_read(inner, strlen(inner), 0);
+        ASSERT_NOT_NULL(doc);
+        total = yyjson_obj_get(yyjson_doc_get_root(doc), "callers");
+        printf("  snippet %s callers=%lld expected=%d\n", names[i],
+               (long long)yyjson_get_int(total), expected);
+        ok = yyjson_is_int(total) && yyjson_get_int(total) == expected && ok;
+        if (i < 2) {
+            yyjson_val *recursive = yyjson_obj_get(yyjson_doc_get_root(doc), "self_recursive");
+            printf("  snippet %s self_recursive=%s\n", names[i],
+                   yyjson_is_bool(recursive) ? "present" : "missing");
+            ok = yyjson_is_bool(recursive) && yyjson_get_bool(recursive) && ok;
+        }
+        yyjson_doc_free(doc);
+        free(inner);
+        free(resp);
+    }
+    cbm_mcp_server_free(srv);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(mcp) {
+    RUN_TEST(tool_caller_summaries_exclude_recursive_root);
+
     RUN_TEST(tool_check_index_coverage_parse_gap_precedes_unresolved_calls);
     RUN_TEST(index_repository_async_and_status_refused_without_daemon_issue2144);
     RUN_TEST(index_repository_schema_documents_async_polling_issue2144);

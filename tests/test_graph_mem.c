@@ -725,7 +725,55 @@ TEST(graph_mem_next_request_evicts_expired_layers) {
     PASS();
 }
 
+TEST(graph_mem_recursive_caller_counts_are_exact) {
+    char *tmp = th_mktempdir("cbm_recursive_degrees");
+    ASSERT_NOT_NULL(tmp);
+    char db[512];
+    snprintf(db, sizeof(db), "%s/g.db", tmp);
+    cbm_store_t *sql = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(sql);
+    ASSERT_EQ(cbm_store_upsert_project(sql, "p", "/p"), CBM_STORE_OK);
+    int64_t ids[4];
+    for (int i = 0; i < 4; i++)
+        ids[i] = gmt_node(sql, "p", i, "fn");
+    gmt_edge(sql, ids[0], ids[0], "CALLS", NULL);
+    gmt_edge(sql, ids[1], ids[1], "CALLS", NULL);
+    gmt_edge(sql, ids[3], ids[1], "CALLS", NULL);
+    gmt_edge(sql, ids[3], ids[2], "CALLS", NULL);
+    ASSERT_EQ(cbm_store_generation_advance(sql), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_prepare_for_publish(sql), CBM_STORE_OK);
+    cbm_store_close(sql);
+    size_t saved = gmt_budget_pin(gmt_budget_roomy());
+    uint64_t builds = cbm_graph_mem_build_count();
+    cbm_store_t *mem = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(mem);
+    cbm_search_params_t p = {.project = "p", .min_degree = 0, .max_degree = -1};
+    cbm_search_output_t out = {0};
+    int rc = cbm_store_search(mem, &p, &out);
+    bool ok = rc == CBM_STORE_OK && out.count == 4;
+    for (int i = 0; i < out.count; i++) {
+        for (int j = 0; j < 3; j++)
+            if (out.results[i].node.id == ids[j]) {
+                int expected = j == 0 ? 0 : 1;
+                printf("  graph_mem case=%d callers=%d expected=%d\n", j, out.results[i].in_degree,
+                       expected);
+                ok = out.results[i].in_degree == expected && ok;
+            }
+    }
+    cbm_store_search_free(&out);
+    bool built = cbm_graph_mem_build_count() == builds + 1;
+    cbm_store_close(mem);
+    cbm_mem_set_budget_for_tests(saved);
+    cbm_graph_mem_drop_idle();
+    th_rmtree(tmp);
+    ASSERT_TRUE(built);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(graph_mem) {
+    RUN_TEST(graph_mem_recursive_caller_counts_are_exact);
+
     RUN_TEST(graph_mem_bfs_matches_sql_on_every_shape);
     RUN_TEST(graph_mem_degree_search_matches_sql);
     RUN_TEST(graph_mem_generation_change_invalidates);

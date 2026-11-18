@@ -9390,6 +9390,7 @@ static int arch_hotspots(cbm_store_t *s, const char *project, const char *path,
     char sqlbuf[ST_SQL_BUF];
     const char *base = "SELECT n.name, n.qualified_name, COUNT(*) as fan_in "
                        "FROM nodes n JOIN edges e ON e.target_id = n.id AND e.type = 'CALLS' "
+                       "AND e.source_id <> e.target_id "
                        "WHERE n.project=?1 AND n.label IN ('Function', 'Method') "
                        "AND (json_extract(n.properties, '$.is_test') IS NULL OR "
                        "json_extract(n.properties, '$.is_test') != 1) "

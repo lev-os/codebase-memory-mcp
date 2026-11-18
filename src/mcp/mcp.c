@@ -11330,7 +11330,10 @@ render_trace_output:;
     }
     int in_total = 0;
     for (int i = 0; i < tr_in.visited_count; i++) {
-        if (include_tests || !is_test_file(tr_in.visited[i].node.file_path)) {
+        /* A recursive root stays in the traversal/edge list, but it is not
+         * another caller of itself. Keep this summary consistent with search. */
+        if (!trace_root_contains(&in_edge_ctx, tr_in.visited[i].node.id) &&
+            (include_tests || !is_test_file(tr_in.visited[i].node.file_path))) {
             in_total++;
         }
     }
@@ -15001,6 +15004,8 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     cbm_store_node_degree(store, node->id, &in_deg, &out_deg);
     yyjson_mut_obj_add_int(doc, root_obj, "callers", in_deg);
     yyjson_mut_obj_add_int(doc, root_obj, "callees", out_deg);
+    trace_recursion_t recursion = trace_recursion_metadata(node, 1);
+    trace_recursion_json(doc, root_obj, &recursion, true);
 
     add_snippet_coverage_note(doc, root_obj, store, node);
 
