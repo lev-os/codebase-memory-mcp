@@ -7156,7 +7156,9 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     }
 
     char *name = cbm_func_name_node_text(a, name_node, ctx->source, ctx->language);
-    if (!name || !name[0] || strcmp(name, "function") == 0) {
+    /* A literal key is never the unnamed-function sentinel: `'function'() {}`. */
+    bool literal_key = cbm_js_literal_key_node(name_node, ctx->language);
+    if (!name || !name[0] || (!literal_key && strcmp(name, "function") == 0)) {
         return;
     }
 
@@ -7210,12 +7212,8 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
 
-    def.name = name;
-    def.literal_member_name =
-        (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
-         ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) &&
-        (strcmp(ts_node_type(name_node), "string") == 0 ||
-         strcmp(ts_node_type(name_node), "number") == 0);
+    def.name = literal_key ? cbm_js_literal_key_name(a, name_node, ctx->source) : name;
+    def.literal_member_name = literal_key;
     def.test_role = configured ? configured_rule.role : CBM_TEST_ROLE_NONE;
     if (configured) {
         TSNode candidate_name, body;
@@ -9580,12 +9578,8 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
 
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
-    def.name = name;
-    def.literal_member_name =
-        (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
-         ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) &&
-        (strcmp(ts_node_type(name_node), "string") == 0 ||
-         strcmp(ts_node_type(name_node), "number") == 0);
+    def.literal_member_name = cbm_js_literal_key_node(name_node, ctx->language);
+    def.name = def.literal_member_name ? cbm_js_literal_key_name(a, name_node, ctx->source) : name;
     def.qualified_name = method_qn;
     if (ctx->language == CBM_LANG_SWIFT) {
         if (!method_qn) {

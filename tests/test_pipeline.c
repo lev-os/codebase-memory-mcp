@@ -37260,6 +37260,85 @@ TEST(pipeline_js_quoted_key_keeps_global_fetch_http_call) {
     PASS();
 }
 
+/* Every literal key keeps its own node, findable by its plain name: the
+ * empty key, a key spelled like the unnamed-function marker, a dotted key
+ * beside a nested object path, a quoted key beside an identifier key, a
+ * string beside a number and a key with a slash. */
+TEST(pipeline_js_literal_keys_keep_distinct_nodes) {
+    static const char *const files[] = {"main.js",
+                                        "function work() {} function halt() {} function step() {}\n"
+                                        "const handlers = {\n"
+                                        "  '': () => work(),\n"
+                                        "  'function': () => halt(),\n"
+                                        "  'a.b'() { step(); },\n"
+                                        "  inner: { b() { work(); } },\n"
+                                        "  'k/v'() { halt(); },\n"
+                                        "  'a%2Eb'() { work(); },\n"
+                                        "};\n"
+                                        "const quoted = { 'x'() { step(); } };\n"
+                                        "const plain = { x() { work(); } };\n"
+                                        "const text = { \"1\"() { halt(); } };\n"
+                                        "const num = { 1() { step(); } };\n"
+                                        "const a = { b() { work(); } };\n",
+                                        NULL};
+    /* The QN segment escapes '.', '%' and '"', so a dotted key is not the
+     * object path a.b, and the real path keeps its own name. */
+    static const struct {
+        int line;
+        const char *name;
+        const char *qn;
+        const char *callee;
+    } cases[] = {{3, "\"\"", "main.\"\"", "main.work"},
+                 {4, "function", "main.function", "main.halt"},
+                 {5, "a.b", "main.a%2Eb", "main.step"},
+                 {6, "b", "main.handlers.inner.b", "main.work"},
+                 {7, "k/v", "main.k/v", "main.halt"},
+                 {8, "a%2Eb", "main.a%252Eb", "main.work"},
+                 {10, "x", "main.quoted.x", "main.step"},
+                 {11, "x", "main.plain.x", "main.work"},
+                 {12, "1", "main.text.1", "main.halt"},
+                 {13, "1", "main.num.1", "main.step"},
+                 {14, "b", "main.a.b", "main.work"}};
+    enum { CASES = sizeof(cases) / sizeof(cases[0]) };
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        js_exact_run_t run;
+        ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+        char qns[CASES][256];
+        for (int i = 0; i < CASES; i++) {
+            char got[1024];
+            char want[512];
+            char what[64];
+            snprintf(what, sizeof(what), "key mode=%d line=%d", mode, cases[i].line);
+            js_twin_qn_at(run.db, run.project, "main.js", cases[i].name, cases[i].line, got,
+                          sizeof(got));
+            printf("  literal key mode=%d line=%d name=%s qn=[%s]\n", mode, cases[i].line,
+                   cases[i].name, got);
+            snprintf(qns[i], sizeof(qns[i]), "%s", got);
+            ok = js_twin_expect(what, got, cases[i].qn) && ok;
+            if (!got[0] || strchr(got, ';')) {
+                fprintf(stderr, "  %s: want one node named %s, got [%s]\n", what, cases[i].name,
+                        got);
+                ok = false;
+                continue;
+            }
+            for (int j = 0; j < i; j++) {
+                if (strcmp(qns[j], got) == 0) {
+                    fprintf(stderr, "  %s: shares node %s with line %d\n", what, got,
+                            cases[j].line);
+                    ok = false;
+                }
+            }
+            snprintf(want, sizeof(want), "%s -> %s", got, cases[i].callee);
+            js_twin_calls_at(run.db, run.project, "main.js", cases[i].line, got, sizeof(got));
+            ok = js_twin_expect(what, got, want) && ok;
+        }
+        js_exact_done(&run);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 TEST(pipeline_js_generator_expressions) {
     static const char *const exts[] = {"js", "ts", "tsx"};
     bool ok = true;
@@ -38528,6 +38607,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_reassigned_callable_has_no_self_edge);
     RUN_TEST(pipeline_py_import_alias_self_call_has_no_self_edge);
     RUN_TEST(pipeline_js_quoted_key_keeps_global_fetch_http_call);
+    RUN_TEST(pipeline_js_literal_keys_keep_distinct_nodes);
     RUN_TEST(pipeline_js_generator_expressions);
     RUN_TEST(pipeline_js_constructor_does_not_guess_type_alias);
     RUN_TEST(pipeline_js_keyword_named_local_call);
