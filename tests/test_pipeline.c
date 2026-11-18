@@ -39675,7 +39675,52 @@ TEST(pipeline_x9e_default_reexport_incremental) {
     PASS();
 }
 
+/* Shorthand member proof work for `export const api2 = { f0, ..., fN }`. */
+static uint64_t x9e_shorthand_work(int count, bool *complete) {
+    size_t cap = (size_t)count * 40 + 64;
+    char *source = malloc(cap);
+    if (!source) {
+        *complete = false;
+        return 0;
+    }
+    int off = 0;
+    for (int i = 0; i < count; i++)
+        off += snprintf(source + off, cap - (size_t)off, "function f%d() {}\n", i);
+    off += snprintf(source + off, cap - (size_t)off, "export const api2 = {");
+    for (int i = 0; i < count; i++)
+        off += snprintf(source + off, cap - (size_t)off, "%s f%d", i ? "," : "", i);
+    off += snprintf(source + off, cap - (size_t)off, " };\n");
+    (void)cbm_lsp_work_take();
+    CBMFileResult *fr =
+        cbm_extract_file(source, off, CBM_LANG_TYPESCRIPT, "probe", "lib.ts", 0, NULL, NULL);
+    uint64_t work = cbm_lsp_work_take();
+    int members = -1;
+    for (int i = 0; fr && i < fr->defs.count; i++) {
+        const CBMDefinition *d = &fr->defs.items[i];
+        if (d->name && strcmp(d->name, "api2") == 0 && d->js_object_members)
+            for (members = 0; d->js_object_members[members * 2]; members++) {
+            }
+    }
+    *complete = members == count;
+    cbm_free_result(fr);
+    free(source);
+    return work;
+}
+
+TEST(pipeline_x9e_shorthand_work_is_linear) {
+    bool small_ok, large_ok;
+    uint64_t small = x9e_shorthand_work(128, &small_ok);
+    uint64_t large = x9e_shorthand_work(512, &large_ok);
+    fprintf(stderr, "shorthand work: 128=%llu 512=%llu\n", (unsigned long long)small,
+            (unsigned long long)large);
+    ASSERT_TRUE(small_ok && large_ok);
+    ASSERT_GT(small, 0);
+    ASSERT_LTE(large, small * 6);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_x9e_shorthand_work_is_linear);
     RUN_TEST(pipeline_x9e_default_reexport_incremental);
     RUN_TEST(pipeline_x9e_default_export_aliases);
     RUN_TEST(pipeline_x9e_literal_key_identity);

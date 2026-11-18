@@ -16155,9 +16155,115 @@ static int js_def_start_cmp(const void *pa, const void *pb) {
 
 /* Callable QNs are final only after twin splitting. Match a literal's own
  * function syntax by byte position, never by its method's leaf name. */
+/* Binding and write evidence for shorthand members, collected in one walk of
+ * the file on first use: the declarations of each name and every written name. */
+typedef struct JsDeclNode {
+    TSNode node;
+    struct JsDeclNode *next;
+} JsDeclNode;
+
+typedef struct {
+    CBMHashTable *decls;  /* name -> JsDeclNode list */
+    CBMHashTable *writes; /* written names; a same-spelled write in any scope */
+    int decl_count;
+    bool ready, stable;
+} JsShorthandIndex;
+
+/* Each name a binding pattern declares (the leaves cbm_ts_pattern_name reads). */
+static bool js_index_pattern(CBMExtractCtx *ctx, JsShorthandIndex *idx, TSNode pattern,
+                             TSNode decl, int depth) {
+    if (ts_node_is_null(pattern))
+        return true;
+    if (depth > 64)
+        return false;
+    CBM_LSP_WORK(1);
+    const char *kind = ts_node_type(pattern);
+    if (strcmp(kind, "identifier") == 0 || strcmp(kind, "type_identifier") == 0 ||
+        strcmp(kind, "shorthand_property_identifier_pattern") == 0) {
+        const char *name = cbm_node_text(ctx->arena, pattern, ctx->source);
+        JsDeclNode *item = (JsDeclNode *)cbm_arena_alloc(ctx->arena, sizeof(*item));
+        if (!name || !item)
+            return false;
+        item->node = decl;
+        item->next = (JsDeclNode *)cbm_ht_get(idx->decls, name);
+        cbm_ht_set(idx->decls, name, item);
+        idx->decl_count++;
+        return cbm_ht_get(idx->decls, name) == item;
+    }
+    if (strcmp(kind, "pair_pattern") == 0)
+        return js_index_pattern(ctx, idx, ts_node_child_by_field_name(pattern, "value", 5), decl,
+                                depth + 1);
+    if (strcmp(kind, "assignment_pattern") == 0 || strcmp(kind, "object_assignment_pattern") == 0)
+        return js_index_pattern(ctx, idx, ts_node_child_by_field_name(pattern, "left", 4), decl,
+                                depth + 1);
+    if (strcmp(kind, "required_parameter") == 0 || strcmp(kind, "optional_parameter") == 0)
+        return js_index_pattern(ctx, idx, ts_node_child_by_field_name(pattern, "pattern", 7), decl,
+                                depth + 1);
+    if (strcmp(kind, "formal_parameters") != 0 && strcmp(kind, "object_pattern") != 0 &&
+        strcmp(kind, "array_pattern") != 0 && strcmp(kind, "rest_pattern") != 0)
+        return true;
+    for (uint32_t i = 0; i < ts_node_named_child_count(pattern); i++)
+        if (!js_index_pattern(ctx, idx, ts_node_named_child(pattern, i), decl, depth + 1))
+            return false;
+    return true;
+}
+
+static void js_shorthand_index(CBMExtractCtx *ctx, JsShorthandIndex *idx) {
+    idx->ready = true;
+    idx->decls = cbm_ht_create(64);
+    idx->writes = cbm_ht_create(32);
+    idx->stable = idx->decls && idx->writes;
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    while (idx->stable) {
+        CBM_LSP_WORK(1);
+        TSNode node = ts_tree_cursor_current_node(&cursor), target = {0};
+        const char *nk = ts_node_type(node);
+        if (strcmp(nk, "with_statement") == 0 || cbm_ts_direct_eval(node, ctx->source)) {
+            idx->stable = false;
+            break;
+        }
+        if (strcmp(nk, "assignment_expression") == 0 ||
+            strcmp(nk, "augmented_assignment_expression") == 0 ||
+            (strcmp(nk, "for_in_statement") == 0 &&
+             ts_node_is_null(ts_node_child_by_field_name(node, "kind", 4))))
+            target = ts_node_child_by_field_name(node, "left", 4);
+        else if (strcmp(nk, "update_expression") == 0)
+            target = ts_node_named_child(node, 0);
+        bool var = false, own = false;
+        TSNode binding = cbm_ts_binding_of(node, &var, &own);
+        if (!js_return_write_pattern(ctx, idx->writes, target, 0) ||
+            !js_index_pattern(ctx, idx, binding, node, 0)) {
+            idx->stable = false;
+            break;
+        }
+        if (ts_tree_cursor_goto_first_child(&cursor)) continue;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) goto done;
+        }
+    }
+done:
+    ts_tree_cursor_delete(&cursor);
+}
+
 /* A shorthand member reads a stable lexical function/const binding. */
-static TSNode js_shorthand_callable(CBMExtractCtx *ctx, TSNode member, const char *name) {
-    TSNode binding = cbm_ts_lexical_binding_at(member, ctx->source, name, NULL);
+static TSNode js_shorthand_callable(CBMExtractCtx *ctx, JsShorthandIndex *idx, TSNode member,
+                                    const char *name) {
+    if (!idx->ready)
+        js_shorthand_index(ctx, idx);
+    /* A same-spelled write in another scope can only withhold the fact. */
+    if (!idx->stable || cbm_ht_has(idx->writes, name))
+        return (TSNode){0};
+    int count = 0;
+    for (const JsDeclNode *d = cbm_ht_get(idx->decls, name); d; d = d->next)
+        count++;
+    TSNode *decls = count ? (TSNode *)cbm_arena_alloc(ctx->arena, (size_t)count * sizeof(*decls))
+                          : NULL;
+    if (count && !decls)
+        return (TSNode){0};
+    count = 0;
+    for (const JsDeclNode *d = cbm_ht_get(idx->decls, name); d; d = d->next)
+        decls[count++] = d->node;
+    TSNode binding = cbm_ts_lexical_binding_among(member, decls, count);
     if (ts_node_is_null(binding))
         return (TSNode){0};
     TSNode fn = binding;
@@ -16174,41 +16280,11 @@ static TSNode js_shorthand_callable(CBMExtractCtx *ctx, TSNode member, const cha
     }
     if (ts_node_is_null(fn) || !js_twin_bodied_kind(ts_node_type(fn)))
         return (TSNode){0};
-    /* A same-spelled write in another scope can only withhold the fact. */
-    CBMHashTable *writes = cbm_ht_create(4);
-    bool stable = writes != NULL;
-    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
-    while (stable) {
-        TSNode node = ts_tree_cursor_current_node(&cursor), target = {0};
-        const char *nk = ts_node_type(node);
-        if (strcmp(nk, "with_statement") == 0 || cbm_ts_direct_eval(node, ctx->source)) {
-            stable = false;
-            break;
-        }
-        if (strcmp(nk, "assignment_expression") == 0 ||
-            strcmp(nk, "augmented_assignment_expression") == 0 ||
-            (strcmp(nk, "for_in_statement") == 0 &&
-             ts_node_is_null(ts_node_child_by_field_name(node, "kind", 4))))
-            target = ts_node_child_by_field_name(node, "left", 4);
-        else if (strcmp(nk, "update_expression") == 0)
-            target = ts_node_named_child(node, 0);
-        if (!js_return_write_pattern(ctx, writes, target, 0) || cbm_ht_has(writes, name)) {
-            stable = false;
-            break;
-        }
-        if (ts_tree_cursor_goto_first_child(&cursor)) continue;
-        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
-            if (!ts_tree_cursor_goto_parent(&cursor)) goto done;
-        }
-    }
-done:
-    ts_tree_cursor_delete(&cursor);
-    cbm_ht_free(writes);
-    return stable ? fn : (TSNode){0};
+    return fn;
 }
 
-static const char **js_object_members(CBMExtractCtx *ctx, TSNode object, CBMDefinition **defs,
-                                      int count) {
+static const char **js_object_members(CBMExtractCtx *ctx, JsShorthandIndex *idx, TSNode object,
+                                      CBMDefinition **defs, int count) {
     uint32_t n = ts_node_named_child_count(object);
     const char **members = cbm_arena_calloc(ctx->arena, ((size_t)n * 2 + 1) * sizeof(*members));
     CBMHashTable *seen = cbm_ht_create(n);
@@ -16259,7 +16335,7 @@ static const char **js_object_members(CBMExtractCtx *ctx, TSNode object, CBMDefi
             break;
         }
         if (strcmp(kind, "shorthand_property_identifier") == 0)
-            fn = js_shorthand_callable(ctx, member, key);
+            fn = js_shorthand_callable(ctx, idx, member, key);
         if (ts_node_is_null(fn))
             continue;
         uint32_t start = ts_node_start_byte(fn);
@@ -16389,6 +16465,7 @@ static void js_record_object_members(CBMExtractCtx *ctx, int mod_idx) {
         defs[i] = &ctx->result->defs.items[i];
     qsort(defs, (size_t)count, sizeof(*defs), js_def_start_cmp);
     CBMDefinition *mod = &ctx->result->defs.items[mod_idx];
+    JsShorthandIndex idx = {0};
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     for (;;) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
@@ -16432,7 +16509,8 @@ static void js_record_object_members(CBMExtractCtx *ctx, int mod_idx) {
                 }
                 for (int i = lo; i < count && defs[i]->node_start_byte == start; i++)
                     if (defs[i]->js_object_literal)
-                        defs[i]->js_object_members = js_object_members(ctx, object, defs, count);
+                        defs[i]->js_object_members =
+                            js_object_members(ctx, &idx, object, defs, count);
             }
         }
         if (ts_tree_cursor_goto_first_child(&cursor))
@@ -16479,7 +16557,7 @@ defaults:
         mod->return_type = "unknown";
         if (cbm_ts_plain_object(value)) {
             mod->js_object_literal = true;
-            mod->js_object_members = js_object_members(ctx, value, defs, count);
+            mod->js_object_members = js_object_members(ctx, &idx, value, defs, count);
         } else if (strcmp(ts_node_type(value), "identifier") == 0) {
             const char *name = cbm_node_text(ctx->arena, value, ctx->source);
             TSNode binding = js_module_binding(ctx, name);
@@ -16517,6 +16595,8 @@ defaults:
     }
     if (mod->alias_target)
         js_mark_default(ctx->arena, mod);
+    cbm_ht_free(idx.decls);
+    cbm_ht_free(idx.writes);
     free(defs);
 }
 

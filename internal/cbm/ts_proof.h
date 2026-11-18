@@ -3,6 +3,9 @@
 #define CBM_TS_PROOF_H
 
 #include "tree_sitter/api.h"
+#include "lsp/lsp_work.h"
+#include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 
 /* A binding or write target that can hide a constructor. The caller walks
@@ -137,6 +140,84 @@ static inline bool cbm_ts_eval_function(TSNode node) {
            strstr(kind, "generator");
 }
 
+/* The binding pattern a declaration-like node introduces, else null. `var`
+ * marks a function-scoped declarator; `own` a node that is its own scope. */
+static inline TSNode cbm_ts_binding_of(TSNode node, bool *var, bool *own) {
+    const char *kind = ts_node_type(node);
+    TSNode binding = {0};
+    *var = false;
+    *own = false;
+    if (strcmp(kind, "variable_declarator") == 0) {
+        binding = ts_node_child_by_field_name(node, "name", 4);
+        *var = strcmp(ts_node_type(ts_node_parent(node)), "variable_declaration") == 0;
+    } else if (strcmp(kind, "function_declaration") == 0 ||
+               strcmp(kind, "generator_function_declaration") == 0 ||
+               strcmp(kind, "class_declaration") == 0 || strcmp(kind, "enum_declaration") == 0 ||
+               strcmp(kind, "internal_module") == 0 || strcmp(kind, "import_alias") == 0 ||
+               strcmp(kind, "import_require_clause") == 0) {
+        binding = ts_node_child_by_field_name(node, "name", 4);
+        if (ts_node_is_null(binding) && (strcmp(kind, "import_alias") == 0 ||
+                                        strcmp(kind, "import_require_clause") == 0))
+            binding = ts_node_named_child(node, 0);
+    } else if (strcmp(kind, "function_expression") == 0 || strcmp(kind, "function") == 0 ||
+               strcmp(kind, "generator_function") == 0 || strcmp(kind, "class") == 0) {
+        binding = ts_node_child_by_field_name(node, "name", 4);
+        *own = true;
+    } else if (strcmp(kind, "formal_parameters") == 0) {
+        binding = node;
+    } else if (strcmp(kind, "arrow_function") == 0) {
+        binding = ts_node_child_by_field_name(node, "parameter", 9);
+        *own = true;
+    } else if (strcmp(kind, "catch_clause") == 0) {
+        binding = ts_node_child_by_field_name(node, "parameter", 9);
+        *own = true;
+    } else if (strcmp(kind, "import_specifier") == 0) {
+        binding = ts_node_child_by_field_name(node, "alias", 5);
+        if (ts_node_is_null(binding)) binding = ts_node_child_by_field_name(node, "name", 4);
+    } else if (strcmp(kind, "namespace_import") == 0 || strcmp(kind, "import_clause") == 0) {
+        for (uint32_t i = 0; i < ts_node_named_child_count(node); i++) {
+            TSNode child = ts_node_named_child(node, i);
+            if (strcmp(ts_node_type(child), "identifier") == 0) binding = child;
+        }
+    }
+    return binding;
+}
+
+/* Weigh one declaration of the name: the innermost scope that holds the site
+ * wins, and two declarations of that one scope leave it ambiguous. */
+static inline void cbm_ts_binding_weigh(TSNode node, TSNode site, bool var, bool own, TSNode *found,
+                                        uint32_t *width, bool *ambiguous) {
+    TSNode scope = own ? node : ts_node_parent(node);
+    for (; !ts_node_is_null(scope); scope = ts_node_parent(scope)) {
+        const char *sk = ts_node_type(scope);
+        if (cbm_ts_eval_function(scope) || strcmp(sk, "program") == 0 ||
+            (!var && (strcmp(sk, "statement_block") == 0 ||
+                      strcmp(sk, "for_statement") == 0 || strcmp(sk, "for_in_statement") == 0 ||
+                      strcmp(sk, "catch_clause") == 0 || strcmp(sk, "switch_body") == 0)) ||
+            own)
+            break;
+    }
+    /* Body vars are not visible in a non-simple parameter list.
+     * A static block or namespace also owns its var declarations. */
+    TSNode body = var && !ts_node_is_null(scope) && cbm_ts_eval_function(scope)
+                      ? ts_node_child_by_field_name(scope, "body", 4) : (TSNode){0};
+    bool body_visible = ts_node_is_null(body) ||
+                        (ts_node_start_byte(body) <= ts_node_start_byte(site) &&
+                         ts_node_end_byte(site) <= ts_node_end_byte(body));
+    if (!ts_node_is_null(scope) && body_visible &&
+        ts_node_start_byte(scope) <= ts_node_start_byte(site) &&
+        ts_node_end_byte(site) <= ts_node_end_byte(scope)) {
+        uint32_t size = ts_node_end_byte(scope) - ts_node_start_byte(scope);
+        if (size < *width) {
+            *width = size;
+            *found = node;
+            *ambiguous = false;
+        } else if (size == *width && !ts_node_eq(*found, node)) {
+            *ambiguous = true;
+        }
+    }
+}
+
 /* Return one visible syntax declaration. Ambiguity leaves identity unproved. */
 static inline TSNode cbm_ts_lexical_binding_at(TSNode site, const char *source, const char *name, bool *bound) {
     TSNode root = site;
@@ -147,73 +228,12 @@ static inline TSNode cbm_ts_lexical_binding_at(TSNode site, const char *source, 
     bool ambiguous = false;
     TSTreeCursor cursor = ts_tree_cursor_new(root);
     for (;;) {
-        TSNode node = ts_tree_cursor_current_node(&cursor), binding = {0};
-        const char *kind = ts_node_type(node);
+        TSNode node = ts_tree_cursor_current_node(&cursor);
         bool var = false, own = false;
-        if (strcmp(kind, "variable_declarator") == 0) {
-            binding = ts_node_child_by_field_name(node, "name", 4);
-            var = strcmp(ts_node_type(ts_node_parent(node)), "variable_declaration") == 0;
-        } else if (strcmp(kind, "function_declaration") == 0 ||
-                   strcmp(kind, "generator_function_declaration") == 0 ||
-                   strcmp(kind, "class_declaration") == 0 || strcmp(kind, "enum_declaration") == 0 ||
-                   strcmp(kind, "internal_module") == 0 || strcmp(kind, "import_alias") == 0 ||
-                   strcmp(kind, "import_require_clause") == 0) {
-            binding = ts_node_child_by_field_name(node, "name", 4);
-            if (ts_node_is_null(binding) && (strcmp(kind, "import_alias") == 0 ||
-                                            strcmp(kind, "import_require_clause") == 0))
-                binding = ts_node_named_child(node, 0);
-        } else if (strcmp(kind, "function_expression") == 0 || strcmp(kind, "function") == 0 ||
-                   strcmp(kind, "generator_function") == 0 || strcmp(kind, "class") == 0) {
-            binding = ts_node_child_by_field_name(node, "name", 4);
-            own = true;
-        } else if (strcmp(kind, "formal_parameters") == 0) {
-            binding = node;
-        } else if (strcmp(kind, "arrow_function") == 0) {
-            binding = ts_node_child_by_field_name(node, "parameter", 9);
-            own = true;
-        } else if (strcmp(kind, "catch_clause") == 0) {
-            binding = ts_node_child_by_field_name(node, "parameter", 9);
-            own = true;
-        } else if (strcmp(kind, "import_specifier") == 0) {
-            binding = ts_node_child_by_field_name(node, "alias", 5);
-            if (ts_node_is_null(binding)) binding = ts_node_child_by_field_name(node, "name", 4);
-        } else if (strcmp(kind, "namespace_import") == 0 || strcmp(kind, "import_clause") == 0) {
-            for (uint32_t i = 0; i < ts_node_named_child_count(node); i++) {
-                TSNode child = ts_node_named_child(node, i);
-                if (strcmp(ts_node_type(child), "identifier") == 0) binding = child;
-            }
-        }
-        if (cbm_ts_pattern_name(binding, source, name)) {
-            TSNode scope = own ? node : ts_node_parent(node);
-            for (; !ts_node_is_null(scope); scope = ts_node_parent(scope)) {
-                const char *sk = ts_node_type(scope);
-                if (cbm_ts_eval_function(scope) || strcmp(sk, "program") == 0 ||
-                    (!var && (strcmp(sk, "statement_block") == 0 ||
-                              strcmp(sk, "for_statement") == 0 || strcmp(sk, "for_in_statement") == 0 ||
-                              strcmp(sk, "catch_clause") == 0 || strcmp(sk, "switch_body") == 0)) ||
-                    own)
-                    break;
-            }
-            /* Body vars are not visible in a non-simple parameter list.
-             * A static block or namespace also owns its var declarations. */
-            TSNode body = var && !ts_node_is_null(scope) && cbm_ts_eval_function(scope)
-                              ? ts_node_child_by_field_name(scope, "body", 4) : (TSNode){0};
-            bool body_visible = ts_node_is_null(body) ||
-                                (ts_node_start_byte(body) <= ts_node_start_byte(site) &&
-                                 ts_node_end_byte(site) <= ts_node_end_byte(body));
-            if (!ts_node_is_null(scope) && body_visible &&
-                ts_node_start_byte(scope) <= ts_node_start_byte(site) &&
-                ts_node_end_byte(site) <= ts_node_end_byte(scope)) {
-                uint32_t size = ts_node_end_byte(scope) - ts_node_start_byte(scope);
-                if (size < width) {
-                    width = size;
-                    found = node;
-                    ambiguous = false;
-                } else if (size == width && !ts_node_eq(found, node)) {
-                    ambiguous = true;
-                }
-            }
-        }
+        CBM_LSP_WORK(1);
+        TSNode binding = cbm_ts_binding_of(node, &var, &own);
+        if (cbm_ts_pattern_name(binding, source, name))
+            cbm_ts_binding_weigh(node, site, var, own, &found, &width, &ambiguous);
         if (ts_tree_cursor_goto_first_child(&cursor)) continue;
         while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
             if (!ts_tree_cursor_goto_parent(&cursor)) goto done;
@@ -223,6 +243,20 @@ done:
     ts_tree_cursor_delete(&cursor);
     if (bound)
         *bound = !ts_node_is_null(found);
+    return ambiguous ? (TSNode){0} : found;
+}
+
+/* The same choice among declarations already known to bind the name. */
+static inline TSNode cbm_ts_lexical_binding_among(TSNode site, const TSNode *decls, int count) {
+    TSNode found = {0};
+    uint32_t width = UINT32_MAX;
+    bool ambiguous = false;
+    for (int i = 0; i < count; i++) {
+        bool var = false, own = false;
+        CBM_LSP_WORK(1);
+        (void)cbm_ts_binding_of(decls[i], &var, &own);
+        cbm_ts_binding_weigh(decls[i], site, var, own, &found, &width, &ambiguous);
+    }
     return ambiguous ? (TSNode){0} : found;
 }
 
