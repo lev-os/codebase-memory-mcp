@@ -6548,8 +6548,48 @@ TEST(cypher_node_comparisons_use_identity) {
     PASS();
 }
 
+TEST(cypher_exists_uses_bound_endpoint_and_labels) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "p", "/tmp/p"), CBM_STORE_OK);
+    cbm_node_t n = {.project = "p", .label = "Function", .name = "walk",
+                    .qualified_name = "p.walk"};
+    int64_t f = cbm_store_upsert_node(s, &n);
+    n.label = "Method";
+    n.name = "caller";
+    n.qualified_name = "p.caller";
+    int64_t caller = cbm_store_upsert_node(s, &n);
+    cbm_edge_t e = {.project = "p", .source_id = caller, .target_id = f, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(s, &e), 0);
+    const struct { const char *predicate; int rows; bool error; } cases[] = {
+        {"NOT EXISTS { (caller)-[:CALLS]->(f) WHERE caller <> f }", 0, false},
+        {"EXISTS { (caller:Method)-[:CALLS]->(f) WHERE caller <> f }", 1, false},
+        {"EXISTS { (caller:Function)-[:CALLS]->(f) WHERE caller <> f }", 0, false},
+        {"EXISTS { (f)<-[:CALLS]-(caller:Method) WHERE caller <> f }", 1, false},
+        {"EXISTS { (f)<-[:CALLS]-(caller:Function) WHERE caller <> f }", 0, false},
+        {"EXISTS { (caller)-[:CALLS]-(f) WHERE caller <> f }", 1, false},
+        {"NOT EXISTS { (a)-[:CALLS]->(b) WHERE a <> b }", 0, true},
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char query[512];
+        snprintf(query, sizeof(query), "MATCH (f:Function) WHERE %s RETURN f.name", cases[i].predicate);
+        cbm_cypher_result_t r = {0};
+        int rc = cbm_cypher_execute(s, query, "p", 0, &r);
+        printf("  EXISTS case=%zu rc=%d rows=%d error=%s\n", i, rc, r.row_count,
+               r.error ? r.error : "absent");
+        ok = (cases[i].error ? rc != 0 && r.error && strstr(r.error, "bound")
+                             : rc == 0 && r.row_count == cases[i].rows) && ok;
+        cbm_cypher_result_free(&r);
+    }
+    cbm_store_close(s);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(cypher) {
     RUN_TEST(cypher_node_comparisons_use_identity);
+    RUN_TEST(cypher_exists_uses_bound_endpoint_and_labels);
     RUN_TEST(cypher_exists_retains_stored_self_relationships);
     RUN_TEST(cypher_dead_code_excludes_only_self_callers);
 
