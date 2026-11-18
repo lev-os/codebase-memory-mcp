@@ -7970,14 +7970,19 @@ static void ts_mark_unwritten_callees(TSLSPContext *ctx, CBMFileResult *result) 
         qsort(vars, (size_t)s->hoisted_count, sizeof(*vars), ts_name_ptr_cmp);
     }
     bool script = true;
-    uint32_t statements = ts_node_named_child_count(s->root);
-    for (uint32_t i = 0; i < statements; i++) {
-        TSNode stmt = ts_node_named_child(s->root, i);
-        if (node_kind_is(stmt, "import_statement") || node_kind_is(stmt, "export_statement")) {
-            script = false;
-            break;
-        }
+    /* A cursor steps to the next sibling in constant time; an indexed child
+     * read restarts from the first child and made a wide script quadratic. */
+    TSTreeCursor top = ts_tree_cursor_new(s->root);
+    if (ts_tree_cursor_goto_first_child(&top)) {
+        do {
+            TSNode stmt = ts_tree_cursor_current_node(&top);
+            if (node_kind_is(stmt, "import_statement") || node_kind_is(stmt, "export_statement")) {
+                script = false;
+                break;
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&top));
     }
+    ts_tree_cursor_delete(&top);
     for (int i = 0; i < result->calls.count; i++) {
         CBMCall *call = &result->calls.items[i];
         const char *name = call->callee_name;
