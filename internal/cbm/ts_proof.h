@@ -12,8 +12,14 @@ static inline TSNode cbm_ts_return_binding(TSNode node) {
     if (strcmp(kind, "variable_declarator") == 0 ||
         strcmp(kind, "class_declaration") == 0 || strcmp(kind, "class") == 0 ||
         strcmp(kind, "function_declaration") == 0 || strcmp(kind, "function_expression") == 0 ||
-        strcmp(kind, "function") == 0 || strstr(kind, "generator"))
+        strcmp(kind, "function") == 0 || strstr(kind, "generator") ||
+        strcmp(kind, "enum_declaration") == 0 || strcmp(kind, "internal_module") == 0 ||
+        strcmp(kind, "module") == 0)
         return ts_node_child_by_field_name(node, "name", 4);
+    if (strcmp(kind, "import_alias") == 0 || strcmp(kind, "import_require_clause") == 0) {
+        TSNode name = ts_node_child_by_field_name(node, "name", 4);
+        return ts_node_is_null(name) ? ts_node_named_child(node, 0) : name;
+    }
     if (strcmp(kind, "required_parameter") == 0 || strcmp(kind, "optional_parameter") == 0)
         return ts_node_child_by_field_name(node, "pattern", 7);
     if (strcmp(kind, "arrow_function") == 0)

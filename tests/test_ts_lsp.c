@@ -6136,7 +6136,28 @@ TEST(tslsp_x9d_repeated_declaration_work) {
     PASS();
 }
 
+TEST(tslsp_x9d_constructor_shadow_forms) {
+    const char *forms[] = {
+        "enum Port { A }",
+        "namespace Port { export const value = 1; }",
+        "import Port = Other.Port;",
+        "import Port = require('elsewhere');",
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); i++) {
+        char source[1024];
+        snprintf(source, sizeof(source), "export class Port { send() {} } export function make() { %s return new Port(); }", forms[i]);
+        bool pass = x9c_factory_fact(source, false);
+        if (!pass) fprintf(stderr, "constructor shadow form %zu failed\n", i);
+        ok = pass && ok;
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(ts_lsp) {
+    RUN_TEST(tslsp_x9d_constructor_shadow_forms);
+
     RUN_TEST(tslsp_x9d_repeated_declaration_work);
 
     RUN_TEST(tslsp_x9c_uniform_write_work_is_linear);
