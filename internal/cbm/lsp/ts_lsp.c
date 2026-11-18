@@ -1896,8 +1896,8 @@ static void ts_collect_assign_sites(TSLSPContext *ctx, TSNode root) {
         sites->hoisted = hoist.items;
         sites->hoisted_count = hoist.count;
     }
-    if (v.failed)
-        return; /* complete stays false: every writable binding is fixed */
+    if (v.failed || hoist.failed)
+        return; /* complete stays false: either collection may have missed a binding */
 
     TsAssignSite **by_start = NULL;
     if (v.count) {
