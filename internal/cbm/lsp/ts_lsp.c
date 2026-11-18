@@ -1664,6 +1664,11 @@ typedef struct {
     const CBMVarBinding *binding; /* NULL: empty slot */
     const CBMType *declared;      /* annotation or uniform-write proof, or NULL */
     bool fixed;                   /* a closure writes it: the walk never updates it */
+    uint32_t write_fn_start, write_fn_end;
+    int writes;                   /* cached classification for this binding and function */
+    const CBMType *uniform_initial, *uniform_type;
+    uint32_t uniform_fn_start, uniform_fn_end;
+    bool uniform_checked;
 } TsFlowBinding;
 
 struct TsFlowBindings {
@@ -2004,7 +2009,9 @@ static bool ts_flow_put(TSLSPContext *ctx, const CBMVarBinding *b, const CBMType
     TsFlowBinding *slot = &set->slots[ts_flow_slot(set, b)];
     if (!slot->binding)
         set->count++;
-    *slot = (TsFlowBinding){.binding = b, .declared = declared, .fixed = fixed};
+    slot->binding = b;
+    slot->declared = declared;
+    slot->fixed = fixed;
     return true;
 }
 
@@ -2027,12 +2034,24 @@ static void ts_bind_local(TSLSPContext *ctx, CBMScope *frame, const char *name,
         type = cbm_type_unknown();
     if (declared && cbm_type_is_unknown(declared))
         declared = NULL;
-    int writes = writable ? ts_assign_writes(ctx, name) : 0;
+    const CBMVarBinding *binding = cbm_scope_lookup_local(frame, name);
+    const TsFlowBinding *cached = ts_flow_find(ctx, binding);
+    int writes = !writable ? 0
+                 : cached && cached->writes && cached->write_fn_start == ctx->fn_start &&
+                       cached->write_fn_end == ctx->fn_end
+                     ? cached->writes
+                     : ts_assign_writes(ctx, name);
     if (writes == 0) {
         cbm_scope_bind(frame, name, type);
         return;
     }
     ts_bind_flow(ctx, frame, name, type, declared, writes == 2);
+    TsFlowBinding *flow = (TsFlowBinding *)ts_flow_find(ctx, cbm_scope_lookup_local(frame, name));
+    if (flow) {
+        flow->writes = writes;
+        flow->write_fn_start = ctx->fn_start;
+        flow->write_fn_end = ctx->fn_end;
+    }
 }
 
 /* True when owner is a frame of the function being walked. */
@@ -4175,10 +4194,30 @@ static void bind_variable_declarator(TSLSPContext *ctx, TSNode decl, bool writab
 
     if (node_kind_is(name, "identifier")) {
         char *nm = node_text(ctx, name);
-        if (writable && !declared)
-            declared = ts_uniform_write_type(ctx, nm, bound,
-                                             ts_node_child_by_field_name(decl, "value", 5));
+        const TsFlowBinding *cached =
+            ts_flow_find(ctx, cbm_scope_lookup_local(ctx->current_scope, nm));
+        bool reuse = cached && cached->uniform_checked &&
+                     cached->uniform_fn_start == ctx->fn_start &&
+                     cached->uniform_fn_end == ctx->fn_end;
+        bool infer = writable && !declared;
+        if (infer) {
+            /* All redeclaration initializers are already in the write index.
+             * Reuse only this lexical binding's proof in the same function. */
+            declared = reuse ? (cbm_type_equal(bound, cached->uniform_initial)
+                                    ? cached->uniform_type : NULL)
+                             : ts_uniform_write_type(ctx, nm, bound,
+                                   ts_node_child_by_field_name(decl, "value", 5));
+        }
         ts_bind_local(ctx, ctx->current_scope, nm, bound, declared, writable);
+        TsFlowBinding *flow = (TsFlowBinding *)ts_flow_find(
+            ctx, cbm_scope_lookup_local(ctx->current_scope, nm));
+        if (infer && !reuse && flow) {
+            flow->uniform_initial = bound;
+            flow->uniform_type = declared;
+            flow->uniform_fn_start = ctx->fn_start;
+            flow->uniform_fn_end = ctx->fn_end;
+            flow->uniform_checked = true;
+        }
     } else {
         ts_bind_pattern(ctx, name, bound, writable, 0);
     }

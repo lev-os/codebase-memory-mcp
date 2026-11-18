@@ -6103,7 +6103,42 @@ TEST(tslsp_x9c_uniform_write_work_is_linear) {
     PASS();
 }
 
+static uint64_t x9d_repeated_work(int count, bool *resolved) {
+    size_t cap = (size_t)count * 120 + 1024;
+    char *source = malloc(cap);
+    if (!source) { *resolved = false; return 0; }
+    int off = snprintf(source, cap, "class Port { send() {} } function outer() {\n");
+    for (int i = 0; i < count; i++)
+        off += snprintf(source + off, cap - (size_t)off, "var item = new Port();\n");
+    off += snprintf(source + off, cap - (size_t)off,
+                    "function reset() { item = new Port(); } const read = () => item.send(); "
+                    "} function boundary() { let item = new Port(); { let item = new Port(); item = outside; const read = () => item.send(); } }\n");
+    (void)cbm_lsp_work_take();
+    CBMFileResult *r = extract_ts(source);
+    uint64_t work = cbm_lsp_work_take();
+    int hits = 0;
+    for (int i = 0; r && i < r->resolved_calls.count; i++)
+        if (r->resolved_calls.items[i].callee_qn && strcmp(r->resolved_calls.items[i].callee_qn, "test.main.Port.send") == 0) hits++;
+    *resolved = hits == 1;
+    cbm_free_result(r);
+    free(source);
+    return work;
+}
+
+TEST(tslsp_x9d_repeated_declaration_work) {
+    bool small_ok, large_ok;
+    uint64_t small = x9d_repeated_work(128, &small_ok);
+    uint64_t large = x9d_repeated_work(512, &large_ok);
+    fprintf(stderr, "repeated declaration work: 128=%llu 512=%llu\n", (unsigned long long)small, (unsigned long long)large);
+    ASSERT_TRUE(small_ok && large_ok);
+    ASSERT_GT(small, 0);
+    ASSERT_LTE(large, small * 6);
+    PASS();
+}
+
 SUITE(ts_lsp) {
+    RUN_TEST(tslsp_x9d_repeated_declaration_work);
+
     RUN_TEST(tslsp_x9c_uniform_write_work_is_linear);
 
     RUN_TEST(tslsp_x9c_repeated_var_initializers_are_writes);
