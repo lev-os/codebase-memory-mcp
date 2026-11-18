@@ -5877,7 +5877,8 @@ TEST(tslsp_incomplete_var_collection_cannot_prove_unwritten) {
     n += (size_t)snprintf(source + n, sizeof(source) - n, "hidden");
     for (int i = 0; i < 70; i++)
         source[n++] = ']';
-    snprintf(source + n, sizeof(source) - n, " = [];\nfunction walk() { walk(); }\n");
+    /* No initializer: only the hoist collection visits this deep pattern. */
+    snprintf(source + n, sizeof(source) - n, ";\nfunction walk() { walk(); }\n");
     CBMFileResult *r = extract_js(source);
     ASSERT_NOT_NULL(r);
     int calls = 0;
