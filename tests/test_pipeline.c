@@ -38849,6 +38849,64 @@ TEST(pipeline_member_write_scope) {
     PASS();
 }
 
+TEST(pipeline_script_global_write_scope) {
+    const struct { const char *prefix; const char *binding; const char *write; bool safe; bool self; } cases[] = {
+        {"", "function make() { return new Foo(); }", "window[key] = replacement;", false, false},
+        {"", "function make() { return new Foo(); }", "globalThis[key] = replacement;", false, false},
+        {"", "function make() { return new Foo(); }", "self[key] = replacement;", false, false},
+        {"", "function make() { return new Foo(); }", "this[key] = replacement;", false, false},
+        {"", "function make() { return new Foo(); }", "window.make = replacement;", false, true},
+        {"", "var value = new Foo();", "window[key] = replacement;", false, false},
+        {"", "var value = new Foo();", "window.value = replacement;", false, true},
+        {"export {};", "function make() { return new Foo(); }", "window[key] = replacement;", true, true},
+        {"", "const value = new Foo();", "window[key] = replacement;", true, false},
+        {"", "let value = new Foo();", "window[key] = replacement;", true, false},
+        {"", "function make() { return new Foo(); }", "cache[key] = replacement;", true, false},
+        {"", "function make() { return new Foo(); }", "window.other = replacement;", true, true},
+        {"export {};", "var value = new Foo();", "window.value = replacement;", true, true},
+        {"", "let value = new Foo();", "window.value = replacement;", true, true},
+        {"", "const value = new Foo();", "window.value = replacement;", true, true},
+        {"", "function make() { return new Foo(); }", "class Setter { run() { this[key] = replacement; } }", true, false},
+    };
+    enum { N = sizeof(cases) / sizeof(cases[0]) };
+    const char *files[2 * N + 1] = {0};
+    char sources[N][1024], paths[N][32];
+    for (int i = 0; i < N; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "case%d.js", i);
+        snprintf(sources[i], sizeof(sources[i]),
+                 "%s\nclass Foo { bar() {} }\n%s\n"
+                 "function install(key, replacement) { %s }\n"
+                 "function use() { %s.bar(); }\n"
+                 "function recur() { recur(); }\n"
+                 "function copyUse() { const local = %s; %s.bar(); }\n",
+                 cases[i].prefix, cases[i].binding, cases[i].write,
+                 strstr(cases[i].binding, "make") ? "make()" : "value",
+                 strstr(cases[i].binding, "make") ? "make" : "value",
+                 strstr(cases[i].binding, "make") ? "local()" : "local");
+        files[2*i] = paths[i]; files[2*i+1] = sources[i];
+    }
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        js_exact_run_t run;
+        ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+        for (int i = 0; i < N; i++) {
+            int count = js_twin_count_calls(run.db, run.project, paths[i], "s.name = 'use' AND t.name = 'bar'");
+            printf("  global scope mode=%d case=%d bar=%d expected=%d\n", mode, i, count, cases[i].safe);
+            int exact = js_twin_count_calls(run.db, run.project, paths[i], "s.name = 'use' AND t.name = 'bar' AND s.file_path = t.file_path");
+            ok = count == cases[i].safe && exact == count && ok;
+            int copied = js_twin_count_calls(run.db, run.project, paths[i], "s.name = 'copyUse' AND t.name = 'bar'");
+            printf("  global copy mode=%d case=%d bar=%d expected=%d\n", mode, i, copied, cases[i].safe);
+            int copied_exact = js_twin_count_calls(run.db, run.project, paths[i], "s.name = 'copyUse' AND t.name = 'bar' AND s.file_path = t.file_path");
+            ok = copied == cases[i].safe && copied_exact == copied && ok;
+            int recur = js_twin_count_calls(run.db, run.project, paths[i], "s.id = t.id AND s.name = 'recur'");
+            printf("  global scope mode=%d case=%d self=%d expected=%d\n", mode, i, recur, cases[i].self);
+            ok = recur == cases[i].self && ok;
+        }
+        js_exact_done(&run);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
 
 
 TEST(pipeline_unknown_member_write_preserves_local_types) {
@@ -38888,6 +38946,8 @@ TEST(pipeline_unknown_member_write_preserves_local_types) {
                     snprintf(want, sizeof(want),
                              "case%d.useFactory -> case%d.Foo.bar; case%d.useFactory -> case%d.make",
                              i, i, i, i);
+                if (j == 2 && i != 2)
+                    snprintf(want, sizeof(want), "case%d.useFactory -> case%d.make", i, i);
                 js_twin_calls_at(run.db, run.project, paths[i], lines[j], got, sizeof(got));
                 ok = js_twin_expect(what, got, want) && ok;
             }
@@ -39261,6 +39321,7 @@ TEST(pipeline_x9c_named_class_static_members_are_values) {
 
 SUITE(pipeline) {
     RUN_TEST(pipeline_member_write_scope);
+    RUN_TEST(pipeline_script_global_write_scope);
     RUN_TEST(pipeline_unknown_member_write_preserves_local_types);
     RUN_TEST(pipeline_member_self_calls_reject_indirect_writes);
     RUN_TEST(pipeline_js_self_edge_requires_unwritten_binding);

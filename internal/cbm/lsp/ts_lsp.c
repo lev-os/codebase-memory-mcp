@@ -1632,6 +1632,10 @@ struct TsAssignSites {
     TsAssignSite *fresh; /* const receivers whose values never escape */
     int fresh_count;
     bool fresh_ready;
+    bool script;
+    bool unknown_global_key;
+    TsAssignSite *globals; /* script top-level function and var bindings */
+    int global_count;
     /* Every name a `var` declares, by the function it hoists to, sorted by
      * (fn_start, fn_end, start). */
     TsAssignSite *hoisted;
@@ -1667,6 +1671,7 @@ typedef struct {
     int cap;
     bool failed;
     bool unknown_member_key;
+    bool unknown_global_key;
 } TsSiteVec;
 
 static bool ts_write_wrapper(TSNode node) {
@@ -1738,19 +1743,40 @@ static bool ts_write_key_is(TSLSPContext *ctx, TSNode node, const char *name) {
            memcmp(ctx->source + lo + 1, name, hi - lo - 2) == 0;
 }
 
+/* Script `this` may be the global object unless a class owns it. */
+static bool ts_write_global_object(TSLSPContext *ctx, TSNode object) {
+    while (ts_write_wrapper(object))
+        object = ts_write_operand(object);
+    if (node_kind_is(object, "identifier"))
+        return ts_write_name_is(ctx, object, "globalThis") ||
+               ts_write_name_is(ctx, object, "window") || ts_write_name_is(ctx, object, "self");
+    if (!node_kind_is(object, "this"))
+        return false;
+    for (TSNode p = ts_node_parent(object); !ts_node_is_null(p); p = ts_node_parent(p)) {
+        if (node_kind_is(p, "class_body"))
+            return false;
+    }
+    return true;
+}
+
+static void ts_site_unknown_key(TsSiteVec *v, bool global) {
+    v->unknown_member_key = true;
+    v->unknown_global_key |= global;
+}
+
 /* Keep the write-name vocabulary independent of the receiver: aliases and
  * call/apply/bind can move an arbitrary receiver into a method. */
 static void ts_site_push_key(TSLSPContext *ctx, TsSiteVec *v, TSNode key,
                              uint32_t fs, uint32_t fe, bool global) {
     if (ts_node_is_null(key)) {
-        v->unknown_member_key = true;
+        ts_site_unknown_key(v, global);
         return;
     }
     const char *kind = ts_node_type(key);
     if (strcmp(kind, "property_identifier") != 0 && strcmp(kind, "identifier") != 0 &&
         strcmp(kind, "shorthand_property_identifier") != 0 &&
         strcmp(kind, "string") != 0 && strcmp(kind, "number") != 0) {
-        v->unknown_member_key = true;
+        ts_site_unknown_key(v, global);
         return;
     }
     int before = v->count;
@@ -1762,7 +1788,7 @@ static void ts_site_push_key(TSLSPContext *ctx, TsSiteVec *v, TSNode key,
         size_t len = strlen(name);
         if (len < 2 || strchr(name, '\\')) {
             v->count = before;
-            v->unknown_member_key = true;
+            ts_site_unknown_key(v, global);
             return;
         }
         name = cbm_arena_strndup(ctx->arena, name + 1, len - 2);
@@ -1926,7 +1952,7 @@ static void ts_site_helper_object(TSLSPContext *ctx, TsSiteVec *v, TSNode source
     while (ts_write_wrapper(source))
         source = ts_write_operand(source);
     if (!node_kind_is(source, "object")) {
-        v->unknown_member_key = true;
+        ts_site_unknown_key(v, global);
         return;
     }
     for (uint32_t i = 0; i < ts_node_named_child_count(source); i++) {
@@ -1939,7 +1965,7 @@ static void ts_site_helper_object(TSLSPContext *ctx, TsSiteVec *v, TSNode source
         if (node_kind_is(entry, "shorthand_property_identifier"))
             key = entry;
         if (ts_node_is_null(key))
-            v->unknown_member_key = true;
+            ts_site_unknown_key(v, global);
         else
             ts_site_push_key(ctx, v, key, fs, fe, global);
     }
@@ -1969,14 +1995,11 @@ static void ts_site_push_pattern(TSLSPContext *ctx, TsSiteVec *v, TSNode pattern
             prop = ts_node_child_by_field_name(pattern, "index", 5);
         /* Any receiver can alias this, a class, or a namespace object. A
          * same-name write may conservatively withhold another class's self edge. */
-        bool global = node_kind_is(object, "identifier") &&
-                      (ts_write_name_is(ctx, object, "globalThis") ||
-                       ts_write_name_is(ctx, object, "window") ||
-                       ts_write_name_is(ctx, object, "self"));
+        bool global = ts_write_global_object(ctx, object);
         if (node_kind_is(pattern, "subscript_expression") &&
             !node_kind_is(prop, "string") && !node_kind_is(prop, "number")) {
             if (!ts_receiver_confined(ctx, object))
-                v->unknown_member_key = true;
+                ts_site_unknown_key(v, global);
             return;
         }
         ts_site_push_key(ctx, v, prop, fs, fe, global);
@@ -2046,9 +2069,7 @@ static void ts_site_visit(TSLSPContext *ctx, TsSiteVec *v, TsSiteVec *hoist,
                     while (ts_write_wrapper(arg))
                         arg = ts_write_operand(arg);
                     if (position++ == 0) {
-                        global = ts_write_name_is(ctx, arg, "globalThis") ||
-                                 ts_write_name_is(ctx, arg, "window") ||
-                                 ts_write_name_is(ctx, arg, "self");
+                        global = ts_write_global_object(ctx, arg);
                     } else if (ts_write_key_is(ctx, prop, "assign") ||
                                (position == 2 && ts_write_key_is(ctx, prop, "defineProperties"))) {
                         ts_site_helper_object(ctx, v, arg, fs, fe, global);
@@ -2056,7 +2077,7 @@ static void ts_site_visit(TSLSPContext *ctx, TsSiteVec *v, TsSiteVec *hoist,
                         if (node_kind_is(arg, "string") || node_kind_is(arg, "number"))
                             ts_site_push_key(ctx, v, arg, fs, fe, global);
                         else
-                            v->unknown_member_key = true;
+                            ts_site_unknown_key(v, global);
                     }
                 }
             }
@@ -2114,6 +2135,30 @@ static int ts_site_start_cmp(const void *pa, const void *pb) {
     return (a->start > b->start) - (a->start < b->start);
 }
 
+static bool ts_script_global(const struct TsAssignSites *s, const char *name) {
+    if (!s || !s->script || !name)
+        return false;
+    int i = ts_proof_first_name(s->globals, s->global_count, name);
+    return i < s->global_count && strcmp(s->globals[i].name, name) == 0;
+}
+
+/* Registry signatures can predate the write scan. Test the global
+ * property writes when reading a script binding, including a copied value. */
+static bool ts_script_global_written(TSLSPContext *ctx, const char *name) {
+    const struct TsAssignSites *s = ctx->assign_sites;
+    if (!ts_script_global(s, name))
+        return false;
+    if (!s->complete || s->unknown_global_key)
+        return true;
+    if (!s->count)
+        return false;
+    const char *key = cbm_arena_sprintf(ctx->arena, "globalThis.%s", name);
+    if (!key)
+        return true;
+    int i = ts_proof_first_name(s->by_name, s->count, key);
+    return i < s->count && strcmp(s->by_name[i].name, key) == 0;
+}
+
 /* One cursor walk of the file; no recursion over the tree. */
 static void ts_collect_assign_sites(TSLSPContext *ctx, TSNode root) {
     if (ctx->assign_sites || !ctx->arena || ts_node_is_null(root))
@@ -2125,7 +2170,16 @@ static void ts_collect_assign_sites(TSLSPContext *ctx, TSNode root) {
     memset(sites, 0, sizeof(*sites));
     ctx->assign_sites = sites;
     sites->root = root;
+    sites->script = true;
+    for (uint32_t i = 0; i < ts_node_named_child_count(root); i++) {
+        TSNode stmt = ts_node_named_child(root, i);
+        if (node_kind_is(stmt, "import_statement") || node_kind_is(stmt, "export_statement")) {
+            sites->script = false;
+            break;
+        }
+    }
 
+    TsSiteVec globals = {0};
     TsSiteVec v = {0};
     TsSiteVec hoist = {0};
     uint32_t inline_fns[2 * 32];
@@ -2147,6 +2201,11 @@ static void ts_collect_assign_sites(TSLSPContext *ctx, TSNode root) {
              memcmp(ctx->source + ts_node_start_byte(called), "eval", 4) == 0)) {
             v.failed = true;
             break;
+        }
+        if (sites->script && ts_is_function_declaration(node) && fn_top == 1) {
+            TSNode name = ts_node_child_by_field_name(node, "name", 4);
+            if (!ts_node_is_null(name))
+                ts_site_push(ctx, &globals, name, 0, UINT32_MAX);
         }
         ts_site_visit(ctx, &v, &hoist, &cursor, node, fns[2 * fn_top - 2], fns[2 * fn_top - 1]);
         bool fn = ts_is_flow_function(node);
@@ -2187,9 +2246,40 @@ static void ts_collect_assign_sites(TSLSPContext *ctx, TSNode root) {
         sites->hoisted = hoist.items;
         sites->hoisted_count = hoist.count;
     }
-    if (v.failed || hoist.failed)
-        return; /* complete stays false: either collection may have missed a binding */
+    if (v.failed || hoist.failed || globals.failed)
+        return; /* complete stays false: a collection may have missed a binding */
 
+    if (sites->script && (globals.count || hoist.count)) {
+        sites->globals = cbm_arena_alloc(ctx->arena,
+            (size_t)(globals.count + hoist.count) * sizeof(*sites->globals));
+        if (!sites->globals)
+            return;
+        for (int i = 0; i < globals.count; i++)
+            sites->globals[sites->global_count++] = globals.items[i];
+        for (int i = 0; i < hoist.count; i++) {
+            if (hoist.items[i].fn_start == 0 && hoist.items[i].fn_end == UINT32_MAX)
+                sites->globals[sites->global_count++] = hoist.items[i];
+        }
+        qsort(sites->globals, (size_t)sites->global_count, sizeof(*sites->globals), ts_site_name_cmp);
+        /* A known global property write also replaces its script binding.
+         * Lexical class/let/const names never enter this table. */
+        if (v.count && sites->global_count) {
+            TsAssignSite *items = cbm_arena_alloc(ctx->arena, (size_t)v.count * 2 * sizeof(*items));
+            if (!items)
+                return;
+            memcpy(items, v.items, (size_t)v.count * sizeof(*items));
+            int original = v.count;
+            for (int i = 0; i < original; i++) {
+                if (strncmp(items[i].name, "globalThis.", 11) == 0 &&
+                    ts_script_global(sites, items[i].name + 11)) {
+                    items[v.count] = items[i];
+                    items[v.count++].name += 11;
+                }
+            }
+            v.items = items;
+        }
+    }
+    sites->unknown_global_key = v.unknown_global_key;
     TsAssignSite **by_start = NULL;
     if (v.count) {
         qsort(v.items, (size_t)v.count, sizeof(*v.items), ts_site_name_cmp);
@@ -2214,7 +2304,9 @@ static int ts_assign_writes(const TSLSPContext *ctx, const char *name) {
     const struct TsAssignSites *sites = ctx->assign_sites;
     if (!sites || !name)
         return 0;
-    if (!sites->complete)
+    if (!sites->complete || (ctx->fn_start == 0 && ctx->fn_end == UINT32_MAX &&
+                             sites->unknown_global_key &&
+                             ts_script_global(sites, name)))
         return 2;
     int lo = 0;
     int hi = sites->count;
@@ -2307,6 +2399,12 @@ static void ts_bind_local(TSLSPContext *ctx, CBMScope *frame, const char *name,
     if (!type)
         type = cbm_type_unknown();
     if (declared && cbm_type_is_unknown(declared))
+        declared = NULL;
+    /* Unknown global writes invalidate even a previously inferred floor
+     * for a script var. A nested lexical binding keeps its own type. */
+    if (ctx->fn_start == 0 && ctx->fn_end == UINT32_MAX && frame == ctx->fn_scope &&
+        ctx->assign_sites && ctx->assign_sites->unknown_global_key &&
+        ts_script_global(ctx->assign_sites, name))
         declared = NULL;
     int writes = writable ? ts_assign_writes(ctx, name) : 0;
     if (writes == 0) {
@@ -2724,6 +2822,8 @@ static const CBMType *type_of_identifier(TSLSPContext *ctx, const char *name) {
     const CBMType *bound = ts_lookup_binding_type(ctx, name);
     if (bound)
         return bound;
+    if (ts_script_global_written(ctx, name))
+        return cbm_type_unknown();
 
     // Imports: bare identifier matching an import binding. Compute the full symbol QN
     // and look it up in the registry. If it's a registered func, return its signature;
@@ -3548,6 +3648,10 @@ static const CBMType *ts_signature_for_call(TSLSPContext *ctx, TSNode function, 
         if (name && ts_scope_has_binding(ctx->current_scope, name))
             return type_of_identifier(ctx, name);
         if (name) {
+            /* The registry may already contain a shallow return signature.
+             * A replaced script function cannot certify that return type. */
+            if (ts_script_global_written(ctx, name))
+                return NULL;
             /* An explicit import binding wins over a flattened same-file
              * member name, in return typing just as in call resolution. */
             bool imported = false;
@@ -4320,7 +4424,8 @@ static int ts_proof_first_name(const TsAssignSite *sites, int count, const char 
 
 static bool ts_proof_name(TSLSPContext *ctx, TSNode node, const char *name) {
     const struct TsAssignSites *s = ctx->assign_sites;
-    if (!name || !s || !s->complete)
+    if (!name || !s || !s->complete ||
+        (s->unknown_global_key && ts_script_global(s, name)))
         return false;
     int i = ts_proof_first_name(s->by_name, s->count, name);
     if (i < s->count && strcmp(s->by_name[i].name, name) == 0)
@@ -8102,15 +8207,6 @@ static void ts_mark_unwritten_callees(TSLSPContext *ctx, CBMFileResult *result) 
             vars[i] = s->hoisted[i].name;
         qsort(vars, (size_t)s->hoisted_count, sizeof(*vars), ts_name_ptr_cmp);
     }
-    bool script = true;
-    uint32_t statements = ts_node_named_child_count(s->root);
-    for (uint32_t i = 0; i < statements; i++) {
-        TSNode stmt = ts_node_named_child(s->root, i);
-        if (node_kind_is(stmt, "import_statement") || node_kind_is(stmt, "export_statement")) {
-            script = false;
-            break;
-        }
-    }
     for (int i = 0; i < result->calls.count; i++) {
         CBMCall *call = &result->calls.items[i];
         const char *name = call->callee_name;
@@ -8139,9 +8235,10 @@ static void ts_mark_unwritten_callees(TSLSPContext *ctx, CBMFileResult *result) 
             target = cbm_arena_strndup(ctx->arena, target, (size_t)(suffix - target));
         if (!target || !ts_name_unwritten(s, vars, target))
             continue;
-        if (script) {
+        if (ts_script_global(s, target)) {
             const char *global = cbm_arena_sprintf(ctx->arena, "globalThis.%s", target);
-            if (s->unknown_member_key || !global || !ts_name_unwritten(s, vars, global))
+            if (s->unknown_member_key || s->unknown_global_key || !global ||
+                !ts_name_unwritten(s, vars, global))
                 continue;
         }
         call->callee_never_written = true;
