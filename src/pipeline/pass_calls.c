@@ -910,7 +910,7 @@ static bool emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     /* A proven recursive invocation is plain CALLS. Service classifiers
      * cannot manufacture a self edge or reinterpret this exact binding. */
     if (target && source->id == target->id) {
-        return !suppress_plain_calls && cbm_pipeline_exact_self_call(res) &&
+        return !suppress_plain_calls && cbm_pipeline_exact_self_call(lang, call, res) &&
                calls_emit_plain(ctx, call, source, target, res);
     }
     cbm_svc_kind_t svc = cbm_service_pattern_match_in_project(
@@ -974,7 +974,7 @@ static const cbm_gbuf_node_t *calls_overload_target(cbm_pipeline_ctx_t *ctx, con
     if (novl > 0) {
         target = ovl[0];
     }
-    return target->id == source->id && !cbm_pipeline_exact_self_call(res) ? NULL : target;
+    return target->id == source->id && !cbm_pipeline_exact_self_call(lang, call, res) ? NULL : target;
 }
 
 /* Find source node for a call: enclosing function or file node. */
@@ -1366,7 +1366,7 @@ static bool calls_emit_lsp_target(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     res.confidence = lsp->confidence;
     res.strategy = lsp->strategy;
     res.candidate_count = PC_SINGLE_CANDIDATE_COUNT;
-    if (source_node->id == target_node->id && !cbm_pipeline_exact_self_call(&res)) {
+    if (source_node->id == target_node->id && !cbm_pipeline_exact_self_call(lang, call, &res)) {
         return false;
     }
     target_node =
@@ -1762,7 +1762,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
         res.qualified_name = target_node->qualified_name;
     }
     if (!target_node || (source_node->id == target_node->id &&
-                         !cbm_pipeline_exact_self_call(&res))) {
+                         !cbm_pipeline_exact_self_call(lang, call, &res))) {
         return 0;
     }
     if (cbm_pipeline_js_type_only_target(lang, target_node)) {

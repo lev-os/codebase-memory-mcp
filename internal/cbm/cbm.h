@@ -478,6 +478,10 @@ typedef struct {
     const char *js_this_class_qn;
     const char *js_this_base;
     uint8_t js_this;
+    /* JS/TS bare call whose name no assignment in the file writes (closures
+     * and `var` included). Set by the TS resolver; a bare self CALLS edge
+     * needs it, since a write can rebind the callable before the call. */
+    bool callee_never_written;
     /* Java/Kotlin: the arguments written at the site, one entry each,
      * comma-separated: the Kotlin argument name or "_", and "*" for a
      * trailing lambda ("" = no arguments). NULL = not recorded. Read

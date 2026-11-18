@@ -44,8 +44,18 @@
 
 /* A self CALLS edge requires an exact JS/TS binding, never a name guess.
  * Keep this allow-list shared by both writers and overload handling. New
- * resolver strategies must prove their binding before joining this list. */
-static inline bool cbm_pipeline_exact_self_call(const cbm_resolution_t *res) {
+ * resolver strategies must prove their binding before joining this list.
+ * Only the TS resolver proves a binding has no write, so other languages
+ * get no self edge; a bare name must have no write in its file (cbm.h). */
+static inline bool cbm_pipeline_exact_self_call(CBMLanguage lang, const CBMCall *call,
+                                                const cbm_resolution_t *res) {
+    if (lang != CBM_LANG_JAVASCRIPT && lang != CBM_LANG_TYPESCRIPT && lang != CBM_LANG_TSX) {
+        return false;
+    }
+    if (!call || !call->callee_name ||
+        (!strchr(call->callee_name, '.') && !call->callee_never_written)) {
+        return false;
+    }
     if (!res || !res->strategy || res->candidate_count != 1) {
         return false;
     }

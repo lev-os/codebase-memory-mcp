@@ -37061,6 +37061,159 @@ TEST(pipeline_js_quoted_key_keeps_lexical_binding) {
     PASS();
 }
 
+/* One index of `files` ({path, text} pairs, NULL ends) by the sequential
+ * writer, or by the parallel one: that run adds pad files past
+ * MIN_FILES_FOR_PARALLEL. */
+typedef struct {
+    char tmp[256];
+    char db[512];
+    char project[256];
+    XlangEnvSave env;
+    cbm_pipeline_t *p;
+} js_exact_run_t;
+
+static bool js_exact_index(js_exact_run_t *run, const char *const *files, bool parallel) {
+    memset(run, 0, sizeof(*run));
+    run->env = xlang_env_select(parallel);
+    snprintf(run->tmp, sizeof(run->tmp), "%s", "/tmp/cbm_js_exact_XXXXXX");
+    if (!cbm_mkdtemp(run->tmp)) {
+        return false;
+    }
+    for (int i = 0; files[i]; i += 2) {
+        write_temp_file(run->tmp, files[i], files[i + 1]);
+    }
+    for (int i = 0; parallel && i < 51; i++) {
+        char pad[32];
+        snprintf(pad, sizeof(pad), "pad%d.js", i);
+        write_temp_file(run->tmp, pad, "export const pad = 0;\n");
+    }
+    snprintf(run->db, sizeof(run->db), "%s/g.db", run->tmp);
+    run->p = js_twin_index(run->tmp, run->db);
+    if (run->p) {
+        snprintf(run->project, sizeof(run->project), "%s", cbm_pipeline_project_name(run->p));
+    }
+    return run->p != NULL;
+}
+
+static void js_exact_done(js_exact_run_t *run) {
+    if (run->p) {
+        cbm_pipeline_free(run->p);
+    }
+    xlang_env_restore(&run->env);
+    th_rmtree(run->tmp);
+}
+
+/* A write to a callable's binding (closures included) can make its own name
+ * call another function, so that call proves no recursion: no self edge. A
+ * binding nothing writes keeps its exact self edge. */
+TEST(pipeline_js_reassigned_callable_has_no_self_edge) {
+    static const char *const files[] = {"main.js",
+                                        "function replacement() {}\n"
+                                        "function other() {}\n"
+                                        "export function walk() { walk = replacement; walk(); }\n"
+                                        "export function get() { get = other; get(); }\n"
+                                        "export function stable(n) { if (n) stable(n - 1); }\n"
+                                        "export function late(n) {\n"
+                                        "  if (n) late(n - 1);\n"
+                                        "  function swap() { late = other; }\n"
+                                        "}\n",
+                                        NULL};
+    static const struct {
+        int line;
+        const char *want;
+    } cases[] = {{3, ""}, {4, ""}, {5, "main.stable -> main.stable"}, {7, ""}};
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        js_exact_run_t run;
+        ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            char got[1024];
+            char what[64];
+            snprintf(what, sizeof(what), "reassigned mode=%d line=%d", mode, cases[i].line);
+            js_twin_calls_at(run.db, run.project, "main.js", cases[i].line, got, sizeof(got));
+            ok = js_twin_expect(what, got, cases[i].want) && ok;
+        }
+        js_exact_done(&run);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* A self edge needs proof that no write rebinds the callable, and only the
+ * TS resolver gives it. A Python call through an alias of the function it is
+ * in (module, lazy, re-exported, rebound) gets no self edge in either writer;
+ * a rebound alias keeps its edge to the new target. */
+TEST(pipeline_py_import_alias_self_call_has_no_self_edge) {
+    static const char *const files[] = {"pkg/__init__.py",
+                                        "from pkg.lazy import walk as again\n",
+                                        "pkg/lazy.py",
+                                        "def walk(n):\n"
+                                        "    from pkg import again\n"
+                                        "    if n:\n"
+                                        "        again(n - 1)\n",
+                                        "pkg/selfimp.py",
+                                        "def walk(n):\n"
+                                        "    from pkg.selfimp import walk as again\n"
+                                        "    if n:\n"
+                                        "        again(n - 1)\n",
+                                        "pkg/rebind.py",
+                                        "def other(n):\n"
+                                        "    return n\n"
+                                        "\n"
+                                        "\n"
+                                        "def walk(n):\n"
+                                        "    from pkg.rebind import walk as again\n"
+                                        "    again = other\n"
+                                        "    if n:\n"
+                                        "        again(n - 1)\n",
+                                        "pkg/walk.py",
+                                        "def walk(n):\n"
+                                        "    if n:\n"
+                                        "        again(n - 1)\n"
+                                        "\n"
+                                        "\n"
+                                        "from pkg.walk import walk as again\n",
+                                        "pkg/rebound.py",
+                                        "def other(n):\n"
+                                        "    return n\n"
+                                        "\n"
+                                        "\n"
+                                        "def walk(n):\n"
+                                        "    if n:\n"
+                                        "        again(n - 1)\n"
+                                        "\n"
+                                        "\n"
+                                        "from pkg.rebound import walk as again\n"
+                                        "again = other\n",
+                                        NULL};
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        js_exact_run_t run;
+        ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+        static const struct {
+            const char *file;
+            int line;
+            const char *self;
+        } sites[] = {{"pkg/walk.py", 3, "pkg.walk.walk -> pkg.walk.walk"},
+                     {"pkg/rebound.py", 7, "pkg.rebound.walk -> pkg.rebound.walk"},
+                     {"pkg/lazy.py", 4, "pkg.lazy.walk -> pkg.lazy.walk"},
+                     {"pkg/selfimp.py", 4, "pkg.selfimp.walk -> pkg.selfimp.walk"},
+                     {"pkg/rebind.py", 9, "pkg.rebind.walk -> pkg.rebind.walk"}};
+        for (size_t i = 0; i < sizeof(sites) / sizeof(sites[0]); i++) {
+            char got[1024];
+            js_twin_calls_at(run.db, run.project, sites[i].file, sites[i].line, got, sizeof(got));
+            printf("  python alias mode=%d %s:%d [%s]\n", mode, sites[i].file, sites[i].line, got);
+            if (strstr(got, sites[i].self)) {
+                fprintf(stderr, "  python alias kept a self edge: [%s]\n", got);
+                ok = false;
+            }
+        }
+        js_exact_done(&run);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 TEST(pipeline_js_generator_expressions) {
     static const char *const exts[] = {"js", "ts", "tsx"};
     bool ok = true;
@@ -38326,6 +38479,8 @@ TEST(pipeline_js_twin_callables_scale) {
 SUITE(pipeline) {
     RUN_TEST(pipeline_js_quoted_callable_names);
     RUN_TEST(pipeline_js_quoted_key_keeps_lexical_binding);
+    RUN_TEST(pipeline_js_reassigned_callable_has_no_self_edge);
+    RUN_TEST(pipeline_py_import_alias_self_call_has_no_self_edge);
     RUN_TEST(pipeline_js_generator_expressions);
     RUN_TEST(pipeline_js_constructor_does_not_guess_type_alias);
     RUN_TEST(pipeline_js_keyword_named_local_call);

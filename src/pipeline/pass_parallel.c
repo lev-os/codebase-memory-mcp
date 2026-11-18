@@ -2914,7 +2914,7 @@ static bool emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                               const char *route_mount, CBMLanguage lang) {
     /* Match emit_classified_edge: exact recursion bypasses classifiers. */
     if (target && source->id == target->id) {
-        if (cbm_pipeline_exact_self_call(res)) {
+        if (cbm_pipeline_exact_self_call(lang, call, res)) {
             return !suppress_plain_calls &&
                    emit_normal_calls_edge(gbuf, source, target, call, res);
         }
@@ -3865,7 +3865,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             continue;
         }
         if (!target_node || (source_node->id == target_node->id &&
-                             !cbm_pipeline_exact_self_call(&res))) {
+                             !cbm_pipeline_exact_self_call(lang, call, &res))) {
             /* HTTP/ASYNC calls to an EXTERNAL client library (`requests.get(url)`)
              * resolve to an unindexed QN (target_node == NULL), but their edge
              * target is a synthesized route node, not the library — emit them
@@ -3912,7 +3912,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
         if (novl > 0) {
             target_node = ovl[0];
-            if (target_node->id == source_node->id && !cbm_pipeline_exact_self_call(&res)) {
+            if (target_node->id == source_node->id && !cbm_pipeline_exact_self_call(lang, call, &res)) {
                 continue;
             }
         }
