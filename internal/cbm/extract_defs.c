@@ -16092,8 +16092,18 @@ static const char **js_object_members(CBMExtractCtx *ctx, TSNode object, CBMDefi
 /* A default export reads a module binding, never a nested namesake. */
 static TSNode js_module_binding(CBMExtractCtx *ctx, const char *name) {
     TSNode found = {0};
-    for (uint32_t i = 0; name && i < ts_node_named_child_count(ctx->root); i++) {
-        TSNode node = ts_node_named_child(ctx->root, i);
+    if (!name)
+        return found;
+    /* A cursor keeps this walk linear on a file with many top-level statements. */
+    TSTreeCursor top = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&top)) {
+        ts_tree_cursor_delete(&top);
+        return found;
+    }
+    do {
+        TSNode node = ts_tree_cursor_current_node(&top);
+        if (!ts_node_is_named(node))
+            continue;
         if (strcmp(ts_node_type(node), "export_statement") == 0)
             node = ts_node_child_by_field_name(node, "declaration", 11);
         if (ts_node_is_null(node))
@@ -16112,11 +16122,14 @@ static TSNode js_module_binding(CBMExtractCtx *ctx, const char *name) {
             TSNode binding = ts_node_child_by_field_name(decl, "name", 4);
             if (ts_node_is_null(binding) || !js_node_text_is(binding, ctx->source, name))
                 continue;
-            if (!ts_node_is_null(found))
+            if (!ts_node_is_null(found)) {
+                ts_tree_cursor_delete(&top);
                 return (TSNode){0}; /* Ambiguous declarations have no exact value. */
+            }
             found = decl;
         }
-    }
+    } while (ts_tree_cursor_goto_next_sibling(&top));
+    ts_tree_cursor_delete(&top);
     return found;
 }
 
