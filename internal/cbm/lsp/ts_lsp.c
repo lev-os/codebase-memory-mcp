@@ -2238,13 +2238,19 @@ static void ts_collect_assign_sites(TSLSPContext *ctx, TSNode root) {
     ctx->assign_sites = sites;
     sites->root = root;
     sites->script = true;
-    for (uint32_t i = 0; i < ts_node_named_child_count(root); i++) {
-        TSNode stmt = ts_node_named_child(root, i);
-        if (node_kind_is(stmt, "import_statement") || node_kind_is(stmt, "export_statement")) {
-            sites->script = false;
-            break;
-        }
+    /* A cursor steps to the next sibling in constant time; an indexed child
+     * read restarts from the first child and made a wide script quadratic. */
+    TSTreeCursor top = ts_tree_cursor_new(root);
+    if (ts_tree_cursor_goto_first_child(&top)) {
+        do {
+            TSNode stmt = ts_tree_cursor_current_node(&top);
+            if (node_kind_is(stmt, "import_statement") || node_kind_is(stmt, "export_statement")) {
+                sites->script = false;
+                break;
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&top));
     }
+    ts_tree_cursor_delete(&top);
 
     TsSiteVec globals = {0};
     TsSiteVec v = {0};
