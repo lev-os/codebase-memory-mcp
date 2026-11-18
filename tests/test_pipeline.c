@@ -39537,6 +39537,40 @@ TEST(pipeline_x9e_literal_key_identity) {
     PASS();
 }
 
+/* An indirect eval in a script runs in the global scope that holds the file's
+ * top-level bindings; in a module it cannot reach them. */
+TEST(pipeline_x9e_script_global_eval) {
+    const char *evals[] = {"globalThis.eval('Port = Other');", "window.eval('Port = Other');",
+                           "globalThis['eval']('make = replacement');"};
+    bool ok = true;
+    for (int module = 0; module < 2; module++) {
+        for (size_t i = 0; i < sizeof(evals) / sizeof(evals[0]); i++) {
+            char source[1024], want[256];
+            snprintf(source, sizeof(source),
+                     "%sclass Port { send() {} }\nclass Other { send() {} }\n"
+                     "function replacement() {}\nfunction make() { return new Port(); }\n"
+                     "function use() { make().send(); }\n%s\n",
+                     module ? "export {};\n" : "", evals[i]);
+            snprintf(want, sizeof(want), "%s",
+                     module ? "app.use -> app.Port.send; app.use -> app.make"
+                            : "app.use -> app.make");
+            const char *files[] = {"app.js", source, NULL};
+            for (int mode = 0; mode < 2; mode++) {
+                js_exact_run_t run;
+                char got[1024], what[96];
+                ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+                js_twin_calls_at(run.db, run.project, "app.js", module ? 6 : 5, got, sizeof(got));
+                snprintf(what, sizeof(what), "global eval module=%d case=%zu mode=%d", module, i,
+                         mode);
+                ok = js_twin_expect(what, got, want) && ok;
+                js_exact_done(&run);
+            }
+        }
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 /* Write each (path, source) pair, then main.ts, and check the CALLS of
  * main.use in the sequential and the parallel paths. */
 static bool x9e_repo_calls(const char *const *files, const char *call, const char *want) {
@@ -39723,6 +39757,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_x9e_shorthand_work_is_linear);
     RUN_TEST(pipeline_x9e_default_reexport_incremental);
     RUN_TEST(pipeline_x9e_default_export_aliases);
+    RUN_TEST(pipeline_x9e_script_global_eval);
     RUN_TEST(pipeline_x9e_literal_key_identity);
     RUN_TEST(pipeline_x9e_member_decorators);
     RUN_TEST(pipeline_x9e_member_stability);

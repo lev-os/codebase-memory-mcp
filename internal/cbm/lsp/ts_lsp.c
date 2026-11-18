@@ -1979,10 +1979,13 @@ static void ts_collect_assign_sites(TSLSPContext *ctx, TSNode root) {
     fns[0] = 0;
     fns[1] = UINT32_MAX;
     fn_top = 1;
+    /* An indirect eval in a script can rebind any top-level binding. */
+    bool script = cbm_ts_script(root);
     TSTreeCursor cursor = ts_tree_cursor_new(root);
     for (bool done = false; !done && !v.failed;) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
-        if (node_kind_is(node, "with_statement") || cbm_ts_direct_eval(node, ctx->source)) {
+        if (node_kind_is(node, "with_statement") || cbm_ts_direct_eval(node, ctx->source) ||
+            (script && cbm_ts_global_eval(node, ctx->source))) {
             v.failed = true;
             break;
         }

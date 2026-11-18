@@ -16080,11 +16080,13 @@ static void js_invalidate_written_returns(CBMExtractCtx *ctx) {
             complete = cbm_ht_has(writes, d->name) && js_member_fact(ctx, &facts, d->name, "*");
         }
     }
+    bool script = cbm_ts_script(ctx->root);
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     while (complete) {
         TSNode node = ts_tree_cursor_current_node(&cursor), target = {0};
         const char *kind = ts_node_type(node);
-        if (strcmp(kind, "with_statement") == 0 || cbm_ts_direct_eval(node, ctx->source)) {
+        if (strcmp(kind, "with_statement") == 0 || cbm_ts_direct_eval(node, ctx->source) ||
+            (script && cbm_ts_global_eval(node, ctx->source))) {
             complete = false;
             break; /* Dynamic scope cannot prove that module bindings stay unchanged. */
         }
@@ -16213,12 +16215,14 @@ static void js_shorthand_index(CBMExtractCtx *ctx, JsShorthandIndex *idx) {
     idx->decls = cbm_ht_create(64);
     idx->writes = cbm_ht_create(32);
     idx->stable = idx->decls && idx->writes;
+    bool script = cbm_ts_script(ctx->root);
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     while (idx->stable) {
         CBM_LSP_WORK(1);
         TSNode node = ts_tree_cursor_current_node(&cursor), target = {0};
         const char *nk = ts_node_type(node);
-        if (strcmp(nk, "with_statement") == 0 || cbm_ts_direct_eval(node, ctx->source)) {
+        if (strcmp(nk, "with_statement") == 0 || cbm_ts_direct_eval(node, ctx->source) ||
+            (script && cbm_ts_global_eval(node, ctx->source))) {
             idx->stable = false;
             break;
         }

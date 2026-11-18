@@ -333,4 +333,46 @@ static inline bool cbm_ts_plain_object(TSNode node) {
     return true;
 }
 
+/* A script (no import or export statement) keeps its top-level bindings in
+ * the global scope, where an indirect eval runs. */
+static inline bool cbm_ts_script(TSNode root) {
+    for (uint32_t i = 0; i < ts_node_named_child_count(root); i++) {
+        const char *kind = ts_node_type(ts_node_named_child(root, i));
+        if (strcmp(kind, "import_statement") == 0 || strcmp(kind, "export_statement") == 0)
+            return false;
+    }
+    return true;
+}
+
+/* An indirect eval: `globalThis.eval(...)`, `window.eval(...)`, `self.eval`,
+ * `global.eval`, a quoted member of one, or `(0, eval)(...)`. */
+static inline bool cbm_ts_global_eval(TSNode call, const char *source) {
+    if (strcmp(ts_node_type(call), "call_expression") != 0)
+        return false;
+    TSNode callee = ts_node_child_by_field_name(call, "function", 8);
+    while (!ts_node_is_null(callee) &&
+           strcmp(ts_node_type(callee), "parenthesized_expression") == 0)
+        callee = ts_node_named_child(callee, 0);
+    if (ts_node_is_null(callee))
+        return false;
+    const char *kind = ts_node_type(callee);
+    if (strcmp(kind, "sequence_expression") == 0) {
+        uint32_t n = ts_node_named_child_count(callee);
+        TSNode last = n ? ts_node_named_child(callee, n - 1) : (TSNode){0};
+        return !ts_node_is_null(last) && strcmp(ts_node_type(last), "identifier") == 0 &&
+               cbm_ts_key_is(last, source, "eval");
+    }
+    if (strcmp(kind, "member_expression") != 0 && strcmp(kind, "subscript_expression") != 0)
+        return false;
+    TSNode object = cbm_ts_unwrap_value(ts_node_child_by_field_name(callee, "object", 6));
+    TSNode key = ts_node_child_by_field_name(callee, "property", 8);
+    if (ts_node_is_null(key))
+        key = cbm_ts_unwrap_value(ts_node_child_by_field_name(callee, "index", 5));
+    return !ts_node_is_null(object) && strcmp(ts_node_type(object), "identifier") == 0 &&
+           (cbm_ts_key_is(object, source, "globalThis") ||
+            cbm_ts_key_is(object, source, "window") || cbm_ts_key_is(object, source, "self") ||
+            cbm_ts_key_is(object, source, "global")) &&
+           cbm_ts_key_is(key, source, "eval");
+}
+
 #endif

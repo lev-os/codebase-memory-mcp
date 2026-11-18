@@ -1844,7 +1844,8 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *     A decorator withholds the member or the class it decorates.
  *     Literal member keys match by runtime key, and a subscript call joins
  *     a member spelled another way.
- *     A re-exported default binds its exact definition. */
+ *     A re-exported default binds its exact definition.
+ *     A global indirect eval in a script withholds its top-level proofs. */
 enum { CBM_SEMANTIC_INDEX_VERSION = 35 };
 
 typedef struct {
