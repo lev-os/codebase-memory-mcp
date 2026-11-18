@@ -15833,7 +15833,8 @@ TEST(pipeline_x11b_default_scope_parallel) { return check_x11b_default_scope(tru
 static int check_x11b_import_values(bool parallel) {
     static const ng_file_t files[] = {
         {"src/value_lib.js", "export function run() { return 1; }\n"},
-        {"src/values.js", "import * as ops from './value_lib';\n"
+        {"src/values.js", "const hooks = { 'run': () => 0 };\n"
+         "import * as ops from './value_lib';\n"
          "import { run as imported } from './value_lib';\n"
          "export function unpack() { const { run } = ops; return run(); }\n"
          "export function alias() { const run = imported; return run(); }\n"
@@ -15841,7 +15842,8 @@ static int check_x11b_import_values(bool parallel) {
          "export function renamed() { const { run: local } = ops; return local(); }\n"
          "export function unknown(ops) { const { run } = ops; return run(); }\n"
          "export function parameter(run) { return run(); }\n"},
-        {"src/required.js", "export function unpack() { const { run } = require('./value_lib'); return run(); }\n"
+        {"src/required.js", "const hooks = { 'run': () => 0 };\n"
+         "export function unpack() { const { run } = require('./value_lib'); return run(); }\n"
          "export function alias() { const ops = require('./value_lib'); const run = ops.run; return run(); }\n"},
     };
     static const ng_pair_t pairs[] = {
