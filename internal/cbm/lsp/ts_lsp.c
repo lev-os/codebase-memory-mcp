@@ -1571,7 +1571,21 @@ static const CBMType *simplify_type_at(TSLSPContext *ctx, const CBMType *t, int 
 
 /* Await and async return adoption share the same bounded recursive unwrap. */
 static const CBMType *ts_awaited_type_at(TSLSPContext *ctx, const CBMType *value, int depth) {
+    if (depth >= 32)
+        return cbm_type_unknown();
     value = simplify_type_at(ctx, value, depth + 1);
+    if (value && value->kind == CBM_TYPE_UNION) {
+        const CBMType *agreed = NULL;
+        if (!value->data.union_type.members || value->data.union_type.count <= 0)
+            return cbm_type_unknown();
+        for (int i = 0; i < value->data.union_type.count; i++) {
+            const CBMType *arm = ts_awaited_type_at(ctx, value->data.union_type.members[i], depth + 1);
+            if (!arm || cbm_type_is_unknown(arm) || (agreed && !cbm_type_equal(agreed, arm)))
+                return cbm_type_unknown();
+            agreed = arm;
+        }
+        return agreed;
+    }
     while (value && value->kind == CBM_TYPE_TEMPLATE && value->data.template_type.template_name &&
            strcmp(value->data.template_type.template_name, "Promise") == 0 &&
            value->data.template_type.arg_count == 1 && value->data.template_type.template_args) {
@@ -1579,6 +1593,13 @@ static const CBMType *ts_awaited_type_at(TSLSPContext *ctx, const CBMType *value
             return cbm_type_unknown();
         value = simplify_type_at(ctx, value->data.template_type.template_args[0], depth);
     }
+    if (value && value->kind == CBM_TYPE_UNION)
+        return ts_awaited_type_at(ctx, value, depth + 1);
+    /* Await adopts callable then members. Their fulfillment value is not
+     * proved by the nominal class, so its own methods are not the result. */
+    if (value && (lookup_method(ctx, value, "then") ||
+                  !cbm_type_is_unknown(lookup_member_type(ctx, value, "then"))))
+        return cbm_type_unknown();
     return value;
 }
 
@@ -8027,7 +8048,17 @@ static void ts_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
             if (d->is_static)
                 rf.flags |= CBM_FUNC_FLAG_STATICMETHOD;
             const CBMType **rets = NULL;
-            if (d->return_types && d->return_types[0]) {
+            if (d->return_types && d->return_types[0] &&
+                (d->lang == CBM_LANG_TYPESCRIPT || d->lang == CBM_LANG_TSX ||
+                 d->lang == CBM_LANG_JAVASCRIPT)) {
+                /* A TS return annotation is one type, including its unions.
+                 * Splitting on pipes would turn awaited unions into tuples. */
+                rets = cbm_arena_alloc(arena, 2 * sizeof(*rets));
+                if (rets) {
+                    rets[0] = parse_ts_type_text(arena, d->return_types, d->def_module_qn);
+                    rets[1] = NULL;
+                }
+            } else if (d->return_types && d->return_types[0]) {
                 int n = 1;
                 for (const char *s = d->return_types; *s; s++)
                     if (*s == '|')
@@ -8358,7 +8389,17 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
                 rf.flags |= CBM_FUNC_FLAG_STATICMETHOD;
             // Return types from pipe-separated return_types text.
             const CBMType **rets = NULL;
-            if (d->return_types && d->return_types[0]) {
+            if (d->return_types && d->return_types[0] &&
+                (d->lang == CBM_LANG_TYPESCRIPT || d->lang == CBM_LANG_TSX ||
+                 d->lang == CBM_LANG_JAVASCRIPT)) {
+                /* A TS return annotation is one type, including its unions.
+                 * Splitting on pipes would turn awaited unions into tuples. */
+                rets = cbm_arena_alloc(arena, 2 * sizeof(*rets));
+                if (rets) {
+                    rets[0] = parse_ts_type_text(arena, d->return_types, d->def_module_qn);
+                    rets[1] = NULL;
+                }
+            } else if (d->return_types && d->return_types[0]) {
                 int n = 1;
                 for (const char *s = d->return_types; *s; s++)
                     if (*s == '|')

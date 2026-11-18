@@ -39053,7 +39053,20 @@ TEST(pipeline_x9d_generator_returns) {
     PASS();
 }
 
+TEST(pipeline_x9d_await_adoption) {
+    bool ok = x9d_calls("export class Port { then() {} send() {} } export function make() { return new Port(); }",
+                         "(await make()).send();", "main.use -> lib.make");
+    ok = x9d_calls("export class Port { send() {} } export function make(): Promise<Port> | Port { return null; }",
+                    "(await make()).send();", "main.use -> lib.Port.send; main.use -> lib.make") && ok;
+    ok = x9d_calls("export class Port { send() {} } class Other { send() {} } export function make(): Promise<Port> | Other { return null; }",
+                    "(await make()).send();", "main.use -> lib.make") && ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_x9d_await_adoption);
+
     RUN_TEST(pipeline_x9d_generator_returns);
 
     RUN_TEST(pipeline_x9d_default_export_binding);
