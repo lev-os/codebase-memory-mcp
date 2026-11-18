@@ -8279,9 +8279,12 @@ static void ts_mark_unwritten_callees(TSLSPContext *ctx, CBMFileResult *result) 
         if (!target || !ts_name_unwritten(s, vars, target))
             continue;
         if (ts_script_global(s, target)) {
+            /* Any receiver can alias the global object. A literal member
+             * write can therefore replace this script binding too. */
             const char *global = cbm_arena_sprintf(ctx->arena, "globalThis.%s", target);
-            if (s->unknown_member_key || s->unknown_global_key || !global ||
-                !ts_name_unwritten(s, vars, global))
+            const char *member = cbm_arena_sprintf(ctx->arena, "this.%s", target);
+            if (s->unknown_member_key || s->unknown_global_key || !global || !member ||
+                !ts_name_unwritten(s, vars, global) || !ts_name_unwritten(s, vars, member))
                 continue;
         }
         call->callee_never_written = true;

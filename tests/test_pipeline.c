@@ -38944,6 +38944,44 @@ TEST(pipeline_prototype_helpers_reject_self) {
     PASS();
 }
 
+
+TEST(pipeline_script_self_rejects_aliased_literal_writes) {
+    const struct { const char *write; bool module; bool self; } cases[] = {
+        {"Object.defineProperty(alias, 'recur', {value: replacement});", false, false},
+        {"Reflect.set(alias, 'recur', replacement);", false, false},
+        {"Object.defineProperties(alias, {recur: {value: replacement}});", false, false},
+        {"Object.assign(alias, {recur: replacement});", false, false},
+        {"alias.recur = replacement;", false, false},
+        {"Object.assign(alias, {other: replacement});", false, true},
+        {"Object.assign(alias, {recur: replacement});", true, true},
+    };
+    enum { N = sizeof(cases) / sizeof(cases[0]) };
+    const char *files[2 * N + 1] = {0};
+    char sources[N][512], paths[N][32];
+    for (int i = 0; i < N; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "case%d.js", i);
+        snprintf(sources[i], sizeof(sources[i]),
+                 "%s\nconst alias = globalThis;\nfunction replacement() {}\n"
+                 "function recur() { %s recur(); }\n",
+                 cases[i].module ? "export {};" : "", cases[i].write);
+        files[2*i] = paths[i]; files[2*i+1] = sources[i];
+    }
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        js_exact_run_t run;
+        ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+        for (int i = 0; i < N; i++) {
+            int self = js_twin_count_calls(run.db, run.project, paths[i], "s.id = t.id AND s.name = 'recur'");
+            int all = js_twin_count_calls(run.db, run.project, paths[i], "s.name = 'recur'");
+            printf("  literal global alias mode=%d case=%d self=%d expected=%d\n", mode, i, self, cases[i].self);
+            ok = self == cases[i].self && all == self && ok;
+        }
+        js_exact_done(&run);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 TEST(pipeline_unknown_member_write_preserves_local_types) {
     const char *writes[] = {
         "for (const k in o) this[k] = o[k];",
@@ -39355,6 +39393,7 @@ TEST(pipeline_x9c_named_class_static_members_are_values) {
 }
 
 SUITE(pipeline) {
+    RUN_TEST(pipeline_script_self_rejects_aliased_literal_writes);
     RUN_TEST(pipeline_member_write_scope);
     RUN_TEST(pipeline_script_global_write_scope);
     RUN_TEST(pipeline_prototype_helpers_reject_self);
