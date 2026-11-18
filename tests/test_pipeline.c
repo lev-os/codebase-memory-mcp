@@ -38982,6 +38982,38 @@ TEST(pipeline_script_self_rejects_aliased_literal_writes) {
     PASS();
 }
 
+
+TEST(pipeline_private_member_writes_keep_unrelated_self) {
+    const struct { const char *write; int calls; } cases[] = {
+        {"this.#cache = 1;", 1},
+        {"this.#cache++;", 1},
+        {"this.#cache = 1; this.walk = replacement;", 0},
+        {"this.#cache = 1; this[key] = replacement;", 0},
+    };
+    const char *files[9] = {0};
+    char sources[4][256], paths[4][32];
+    for (int i = 0; i < 4; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "case%d.js", i);
+        snprintf(sources[i], sizeof(sources[i]),
+                 "class C { #cache = 0; walk() { %s this.walk(); } }\n", cases[i].write);
+        files[2*i] = paths[i]; files[2*i+1] = sources[i];
+    }
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        js_exact_run_t run;
+        ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+        for (int i = 0; i < 4; i++) {
+            int self = js_twin_count_calls(run.db, run.project, paths[i], "s.id=t.id AND s.name='walk'");
+            int all = js_twin_count_calls(run.db, run.project, paths[i], "s.name='walk'");
+            printf("  private member mode=%d case=%d calls=%d expected=%d\n", mode, i, all, cases[i].calls);
+            ok = self == cases[i].calls && all == self && ok;
+        }
+        js_exact_done(&run);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 TEST(pipeline_unknown_member_write_preserves_local_types) {
     const char *writes[] = {
         "for (const k in o) this[k] = o[k];",
@@ -39393,6 +39425,7 @@ TEST(pipeline_x9c_named_class_static_members_are_values) {
 }
 
 SUITE(pipeline) {
+    RUN_TEST(pipeline_private_member_writes_keep_unrelated_self);
     RUN_TEST(pipeline_script_self_rejects_aliased_literal_writes);
     RUN_TEST(pipeline_member_write_scope);
     RUN_TEST(pipeline_script_global_write_scope);

@@ -1773,7 +1773,8 @@ static void ts_site_push_key(TSLSPContext *ctx, TsSiteVec *v, TSNode key,
         return;
     }
     const char *kind = ts_node_type(key);
-    if (strcmp(kind, "property_identifier") != 0 && strcmp(kind, "identifier") != 0 &&
+    if (strcmp(kind, "property_identifier") != 0 &&
+        strcmp(kind, "private_property_identifier") != 0 && strcmp(kind, "identifier") != 0 &&
         strcmp(kind, "shorthand_property_identifier") != 0 &&
         strcmp(kind, "string") != 0 && strcmp(kind, "number") != 0) {
         ts_site_unknown_key(v, global);
