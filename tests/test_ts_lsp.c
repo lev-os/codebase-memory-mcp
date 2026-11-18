@@ -6155,7 +6155,14 @@ TEST(tslsp_x9d_constructor_shadow_forms) {
     PASS();
 }
 
+TEST(tslsp_x9d_try_finally_fact) {
+    ASSERT_TRUE(x9c_factory_fact("class Port {} export function make() { try { return new Port(); } finally { cleanup(); } }", true));
+    PASS();
+}
+
 SUITE(ts_lsp) {
+    RUN_TEST(tslsp_x9d_try_finally_fact);
+
     RUN_TEST(tslsp_x9d_constructor_shadow_forms);
 
     RUN_TEST(tslsp_x9d_repeated_declaration_work);

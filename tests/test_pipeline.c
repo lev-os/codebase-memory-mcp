@@ -39155,7 +39155,24 @@ TEST(pipeline_x9d_literal_members) {
     PASS();
 }
 
+TEST(pipeline_x9d_side_effect_import) {
+    ASSERT_TRUE(x9d_calls("import './x'; import { Other } from './other'; export class Port { send() {} } export function make() { return new Port(); }",
+                           "make().send();", "main.use -> lib.Port.send; main.use -> lib.make"));
+    PASS();
+}
+
+TEST(pipeline_x9d_finally_returns) {
+    ASSERT_TRUE(x9d_calls("export class Port { send() {} } export function make() { try { return new Port(); } finally { cleanup(); } }",
+                           "make().send();", "main.use -> lib.Port.send; main.use -> lib.make"));
+    ASSERT_TRUE(x9d_calls("export class Port { send() {} } export function make() { try { return new Port(); } finally { return outside; } }",
+                           "make().send();", "main.use -> lib.make"));
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_x9d_side_effect_import);
+    RUN_TEST(pipeline_x9d_finally_returns);
+
     RUN_TEST(pipeline_x9d_literal_members);
 
     RUN_TEST(pipeline_x9d_mutated_members);

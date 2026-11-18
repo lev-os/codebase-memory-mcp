@@ -57,6 +57,27 @@ static inline bool cbm_ts_returns_on_normal_exit(TSNode node, int depth) {
                                              depth + 1);
     if (strcmp(kind, "else_clause") == 0)
         return cbm_ts_returns_on_normal_exit(ts_node_named_child(node, 0), depth + 1);
+    if (strcmp(kind, "try_statement") == 0) {
+        TSNode handler = ts_node_child_by_field_name(node, "handler", 7);
+        TSNode finalizer = ts_node_child_by_field_name(node, "finalizer", 9);
+        if (!ts_node_is_null(finalizer)) {
+            TSNode body = ts_node_child_by_field_name(finalizer, "body", 4);
+            if (ts_node_is_null(body))
+                return false;
+            /* Straight-line cleanup may throw, but cannot cancel a return
+             * and then complete normally without a returned value. */
+            for (uint32_t i = 0; i < ts_node_named_child_count(body); i++) {
+                const char *k = ts_node_type(ts_node_named_child(body, i));
+                if (strcmp(k, "expression_statement") != 0 && strcmp(k, "comment") != 0 &&
+                    strcmp(k, "empty_statement") != 0 && strcmp(k, "lexical_declaration") != 0 &&
+                    strcmp(k, "variable_declaration") != 0)
+                    return false;
+            }
+        }
+        return cbm_ts_returns_on_normal_exit(ts_node_child_by_field_name(node, "body", 4), depth + 1) &&
+               (ts_node_is_null(handler) || cbm_ts_returns_on_normal_exit(
+                   ts_node_child_by_field_name(handler, "body", 4), depth + 1));
+    }
     if (strcmp(kind, "statement_block") == 0) {
         uint32_t count = ts_node_named_child_count(node);
         for (uint32_t i = 0; i < count; i++)
