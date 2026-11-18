@@ -6516,7 +6516,40 @@ TEST(cypher_dead_code_excludes_only_self_callers) {
     PASS();
 }
 
+TEST(cypher_node_comparisons_use_identity) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "p", "/tmp/p"), CBM_STORE_OK);
+    cbm_node_t n = {.project = "p", .label = "Method", .name = "walk",
+                    .qualified_name = "p.A.walk"};
+    int64_t a = cbm_store_upsert_node(s, &n);
+    n.qualified_name = "p.B.walk";
+    int64_t b = cbm_store_upsert_node(s, &n);
+    cbm_edge_t e = {.project = "p", .source_id = a, .target_id = a, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(s, &e), 0);
+    e.source_id = b;
+    ASSERT_GT(cbm_store_insert_edge(s, &e), 0);
+    const char *ops[] = {"<>", "="};
+    bool ok = true;
+    for (int i = 0; i < 2; i++) {
+        char query[256];
+        snprintf(query, sizeof(query),
+                 "MATCH (f)<-[:CALLS]-(caller) WHERE caller %s f RETURN caller.qualified_name",
+                 ops[i]);
+        cbm_cypher_result_t r = {0};
+        int rc = cbm_cypher_execute(s, query, "p", 0, &r);
+        printf("  node identity %s rc=%d rows=%d expected=1\n", ops[i], rc, r.row_count);
+        ok = rc == 0 && r.row_count == 1 &&
+             strcmp(r.rows[0][0], i == 0 ? "p.B.walk" : "p.A.walk") == 0 && ok;
+        cbm_cypher_result_free(&r);
+    }
+    cbm_store_close(s);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(cypher) {
+    RUN_TEST(cypher_node_comparisons_use_identity);
     RUN_TEST(cypher_exists_retains_stored_self_relationships);
     RUN_TEST(cypher_dead_code_excludes_only_self_callers);
 

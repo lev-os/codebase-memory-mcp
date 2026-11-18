@@ -2841,6 +2841,19 @@ static bool eval_exists_condition(const cbm_condition_t *c, binding_t *b) {
  * on either side is NULL and the comparison is false, so two nodes that both
  * lack a property do not compare equal. */
 static bool eval_property_comparison(const cbm_condition_t *c, const char *actual, binding_t *b) {
+    /* Real node aliases compare identity. WITH scalars are virtual nodes
+     * with id 0 and retain value comparison. A property/function also stays scalar. */
+    if (!c->property && !c->rhs_property && !c->func && !c->coalesce_default &&
+        (strcmp(c->op, "=") == 0 || strcmp(c->op, "<>") == 0)) {
+        const cbm_node_t *lhs_node = binding_get(b, c->variable);
+        const cbm_node_t *rhs_node = binding_get(b, c->rhs_variable);
+        if (lhs_node && rhs_node && lhs_node->id > 0 && rhs_node->id > 0) {
+            bool result = lhs_node->id == rhs_node->id;
+            if (strcmp(c->op, "<>") == 0)
+                result = !result;
+            return c->negated ? !result : result;
+        }
+    }
     cbm_condition_t rhs = {0};
     rhs.variable = c->rhs_variable;
     rhs.property = c->rhs_property;
