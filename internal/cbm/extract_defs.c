@@ -15780,12 +15780,79 @@ static bool js_return_write_pattern(CBMExtractCtx *ctx, CBMHashTable *writes, TS
     return true;
 }
 
+/* Only a unique, declared static data field proves that a direct write
+ * preserves the constructor and its callable members. Unknown/bulk writes
+ * retain the conservative guard, including imported and inherited members. */
+static bool js_return_static_data(CBMExtractCtx *ctx, TSNode object, const char *name,
+                                   const char *key) {
+    TSNode binding = cbm_ts_lexical_binding_at(object, ctx->source, name, NULL);
+    if (!ts_node_is_null(binding) && strcmp(ts_node_type(binding), "variable_declarator") == 0)
+        binding = cbm_ts_unwrap_value(ts_node_child_by_field_name(binding, "value", 5));
+    if (ts_node_is_null(binding))
+        return false;
+    const char *kind = ts_node_type(binding);
+    if (strcmp(kind, "class_declaration") != 0 && strcmp(kind, "class") != 0 &&
+        strcmp(kind, "abstract_class_declaration") != 0)
+        return false;
+    TSNode body = ts_node_child_by_field_name(binding, "body", 4);
+    bool found = false;
+    for (uint32_t i = 0; i < ts_node_named_child_count(body); i++) {
+        TSNode member = ts_node_named_child(body, i);
+        bool is_static = false, decorated = false;
+        if (strcmp(ts_node_type(member), "class_static_block") == 0)
+            return false;
+        for (uint32_t j = 0; j < ts_node_child_count(member); j++) {
+            const char *k = ts_node_type(ts_node_child(member, j));
+            is_static |= strcmp(k, "static") == 0;
+            decorated |= strcmp(k, "decorator") == 0;
+        }
+        if (!is_static)
+            continue;
+        TSNode mn = ts_node_child_by_field_name(member, "name", 4);
+        if (ts_node_is_null(mn) || strcmp(ts_node_type(mn), "computed_property_name") == 0)
+            return false;
+        const char *member_name = cbm_js_literal_key_node(mn, ctx->language)
+                                      ? cbm_js_literal_key_name(ctx->arena, mn, ctx->source)
+                                      : cbm_node_text(ctx->arena, mn, ctx->source);
+        if (!member_name)
+            return false;
+        if (strcmp(member_name, key) != 0)
+            continue;
+        kind = ts_node_type(member);
+        TSNode value = cbm_ts_unwrap_value(ts_node_child_by_field_name(member, "value", 5));
+        if (found || decorated ||
+            (strcmp(kind, "public_field_definition") != 0 && strcmp(kind, "field_definition") != 0) ||
+            (!ts_node_is_null(value) && js_twin_bodied_kind(ts_node_type(value))))
+            return false;
+        found = true;
+    }
+    return found;
+}
+
 /* Mutating a constructor or its prototype also invalidates instance proof.
  * The existing persisted class flag carries this uncertainty to importers. */
 static bool js_return_member_write(CBMExtractCtx *ctx, CBMHashTable *writes, TSNode target, bool value) {
     target = cbm_ts_unwrap_value(target);
     if (ts_node_is_null(target))
         return true;
+    const char *static_key = NULL;
+    if (!value) {
+        TSNode object = cbm_ts_unwrap_value(ts_node_child_by_field_name(target, "object", 6));
+        TSNode key = ts_node_child_by_field_name(target, "property", 8);
+        bool known_key = !ts_node_is_null(key);
+        if (ts_node_is_null(key)) {
+            key = ts_node_child_by_field_name(target, "index", 5);
+            known_key = !ts_node_is_null(key) && cbm_js_literal_key_node(key, ctx->language);
+        }
+        if (known_key && !ts_node_is_null(object) &&
+            strcmp(ts_node_type(object), "identifier") == 0) {
+            const char *raw = cbm_node_text(ctx->arena, key, ctx->source);
+            static_key = raw && !strchr(raw, '\\')
+                             ? (cbm_js_literal_key_node(key, ctx->language)
+                                    ? cbm_js_literal_key_name(ctx->arena, key, ctx->source) : raw)
+                             : NULL;
+        }
+    }
     bool member = false;
     while (strcmp(ts_node_type(target), "member_expression") == 0 ||
            strcmp(ts_node_type(target), "subscript_expression") == 0) {
@@ -15801,8 +15868,11 @@ static bool js_return_member_write(CBMExtractCtx *ctx, CBMHashTable *writes, TSN
         return false;
     for (int i = 0; i < ctx->result->defs.count; i++) {
         const CBMDefinition *d = &ctx->result->defs.items[i];
-        if (strcmp(d->label, "Class") == 0 && d->name && strcmp(d->name, name) == 0)
+        if (strcmp(d->label, "Class") == 0 && d->name && strcmp(d->name, name) == 0) {
+            if (static_key && js_return_static_data(ctx, target, name, static_key))
+                return true;
             return js_return_write_pattern(ctx, writes, target, 0);
+        }
         const char *ctor = d->ts_return_constructor ? d->return_type : NULL;
         if (ctor && strncmp(ctor, "Promise<", 8) == 0)
             ctor += 8;

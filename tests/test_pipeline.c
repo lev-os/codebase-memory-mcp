@@ -39089,6 +39089,8 @@ TEST(pipeline_x9d_mutated_members) {
         "export class Port { send() {} } Port.prototype.send = replacement; export function make() { return new Port(); }",
         "@decorate export class Port { send() {} } export function make() { return new Port(); }",
         "export class Port { send() {} } (Object . assign)(Port.prototype, { send: replacement }); export function make() { return new Port(); }",
+        "export class Port { send() {} } Port['prototype'].send = replacement; export function make() { return new Port(); }",
+        "export class Port { send() {} } Port[key].send = replacement; export function make() { return new Port(); }",
     };
     bool ok = true;
     for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
@@ -39171,7 +39173,26 @@ TEST(pipeline_x9d_finally_returns) {
     PASS();
 }
 
+TEST(pipeline_x9d_static_writes_keep_constructor_binding) {
+    const char *provider = "export class Port { static count = 0; static build() {} send() {} } "
+                           "Port.count++; export function make() { return new Port(); }";
+    bool ok = x9d_calls(provider, "make().send();", "main.use -> lib.Port.send; main.use -> lib.make");
+    ok = x9d_calls(provider, "new Port().send();", "main.use -> lib.Port; main.use -> lib.Port.send") && ok;
+    ok = x9d_calls(provider, "Port.build();", "main.use -> lib.Port.build") && ok;
+    ok = x9d_calls("export class Port { static slot; send() {} } Port.slot = new Port(); export function make() { return new Port(); }",
+                    "make().send();", "main.use -> lib.Port.send; main.use -> lib.make") && ok;
+    ok = x9d_calls("export class Port { static build() {} } Port.build = replacement;",
+                    "Port.build();", "") && ok;
+    ok = x9d_calls("export class Port { static build() {} } Object.assign(Port, { build: replacement });",
+                    "Port.build();", "") && ok;
+    ok = x9d_calls("export class Port { static key = 0; static build() {} } Port[key] = replacement;",
+                    "Port.build();", "") && ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_x9d_static_writes_keep_constructor_binding);
     RUN_TEST(pipeline_x9d_side_effect_import);
     RUN_TEST(pipeline_x9d_finally_returns);
 
