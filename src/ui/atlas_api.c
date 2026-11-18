@@ -326,9 +326,11 @@ static void aa_add_connections(yyjson_mut_doc *doc, yyjson_mut_val *root, struct
     yyjson_mut_val *section = yyjson_mut_obj(doc);
     const char *count_sql =
         inbound ? "SELECT e.type, COUNT(*) FROM edges e WHERE e.project=?1 AND e.target_id=?2 "
-                  "AND e.type IN (" AA_CALLISH_TYPES ") GROUP BY e.type"
+                  "AND e.source_id <> e.target_id AND e.type IN (" AA_CALLISH_TYPES ") "
+                  "GROUP BY e.type"
                 : "SELECT e.type, COUNT(*) FROM edges e WHERE e.project=?1 AND e.source_id=?2 "
-                  "AND e.type IN (" AA_CALLISH_TYPES ") GROUP BY e.type";
+                  "AND e.source_id <> e.target_id AND e.type IN (" AA_CALLISH_TYPES ") "
+                  "GROUP BY e.type";
     sqlite3_stmt *st = NULL;
     long long total = 0;
     yyjson_mut_val *by_type = yyjson_mut_obj(doc);
@@ -355,12 +357,14 @@ static void aa_add_connections(yyjson_mut_doc *doc, yyjson_mut_val *root, struct
     const char *rows_sql =
         inbound ? "SELECT e.type, n.id, n.label, n.name, n.file_path, n.start_line, "
                   "n.qualified_name FROM edges e JOIN nodes n ON n.project=e.project AND "
-                  "n.id=e.source_id WHERE e.project=?1 AND e.target_id=?2 AND e.type IN "
+                  "n.id=e.source_id WHERE e.project=?1 AND e.target_id=?2 AND e.source_id <> e.target_id "
+                  "AND e.type IN "
                   "(" AA_CALLISH_TYPES ") ORDER BY CASE e.type WHEN 'CALLS' THEN 0 WHEN "
                   "'CALL_REFERENCE' THEN 1 ELSE 2 END, n.id LIMIT ?3 OFFSET ?4"
                 : "SELECT e.type, n.id, n.label, n.name, n.file_path, n.start_line, "
                   "n.qualified_name FROM edges e JOIN nodes n ON n.project=e.project AND "
-                  "n.id=e.target_id WHERE e.project=?1 AND e.source_id=?2 AND e.type IN "
+                  "n.id=e.target_id WHERE e.project=?1 AND e.source_id=?2 AND e.source_id <> e.target_id "
+                  "AND e.type IN "
                   "(" AA_CALLISH_TYPES ") ORDER BY CASE e.type WHEN 'CALLS' THEN 0 WHEN "
                   "'CALL_REFERENCE' THEN 1 ELSE 2 END, n.id LIMIT ?3 OFFSET ?4";
     if (sqlite3_prepare_v2(db, rows_sql, -1, &st, NULL) == SQLITE_OK) {
@@ -379,13 +383,15 @@ static void aa_add_connections(yyjson_mut_doc *doc, yyjson_mut_val *root, struct
         const char *tail_sql =
             inbound ? "SELECT file_path, COUNT(*) FROM (SELECT n.file_path AS file_path FROM edges "
                       "e JOIN nodes n ON n.project=e.project AND n.id=e.source_id WHERE "
-                      "e.project=?1 AND e.target_id=?2 AND e.type IN (" AA_CALLISH_TYPES ") ORDER "
+                      "e.project=?1 AND e.target_id=?2 AND e.source_id <> e.target_id "
+                      "AND e.type IN (" AA_CALLISH_TYPES ") ORDER "
                       "BY CASE e.type WHEN 'CALLS' THEN 0 WHEN 'CALL_REFERENCE' THEN 1 ELSE 2 END, "
                       "n.id LIMIT -1 OFFSET ?3) WHERE file_path IS NOT NULL GROUP BY file_path "
                       "ORDER BY COUNT(*) DESC, file_path LIMIT 10"
                     : "SELECT file_path, COUNT(*) FROM (SELECT n.file_path AS file_path FROM edges "
                       "e JOIN nodes n ON n.project=e.project AND n.id=e.target_id WHERE "
-                      "e.project=?1 AND e.source_id=?2 AND e.type IN (" AA_CALLISH_TYPES ") ORDER "
+                      "e.project=?1 AND e.source_id=?2 AND e.source_id <> e.target_id "
+                      "AND e.type IN (" AA_CALLISH_TYPES ") ORDER "
                       "BY CASE e.type WHEN 'CALLS' THEN 0 WHEN 'CALL_REFERENCE' THEN 1 ELSE 2 END, "
                       "n.id LIMIT -1 OFFSET ?3) WHERE file_path IS NOT NULL GROUP BY file_path "
                       "ORDER BY COUNT(*) DESC, file_path LIMIT 10";
@@ -428,13 +434,15 @@ char *cbm_atlas_symbol_json(cbm_store_t *store, const char *project, int64_t nod
                        "json_extract(properties,'$.docstring'), "
                        "json_extract(properties,'$.is_entry_point'), "
                        "json_extract(properties,'$.is_test'), "
-                       "json_extract(properties,'$.is_exported') "
+                       "json_extract(properties,'$.is_exported'), "
+                       "json_type(properties,'$.self_recursive'), json_type(properties,'$.recursive') "
                        "FROM nodes WHERE project=?1 AND id=?2"
                      : "SELECT id, label, name, qualified_name, file_path, start_line, end_line, "
                        "json_extract(properties,'$.docstring'), "
                        "json_extract(properties,'$.is_entry_point'), "
                        "json_extract(properties,'$.is_test'), "
-                       "json_extract(properties,'$.is_exported') "
+                       "json_extract(properties,'$.is_exported'), "
+                       "json_type(properties,'$.self_recursive'), json_type(properties,'$.recursive') "
                        "FROM nodes WHERE project=?1 AND qualified_name=?2 ORDER BY id LIMIT 1";
     if (sqlite3_prepare_v2(db, node_sql, -1, &st, NULL) != SQLITE_OK)
         return NULL;
@@ -477,6 +485,17 @@ char *cbm_atlas_symbol_json(cbm_store_t *store, const char *project, int64_t nod
         yyjson_mut_obj_add_bool(doc, node, "is_test", true);
     if (sqlite3_column_int(st, 10))
         yyjson_mut_obj_add_bool(doc, node, "is_exported", true);
+    const char *label = (const char *)sqlite3_column_text(st, 1);
+    if (label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0)) {
+        const char *keys[] = {"self_recursive", "recursive"};
+        for (int i = 0; i < 2; i++) {
+            const char *type = (const char *)sqlite3_column_text(st, 11 + i);
+            if (type && (strcmp(type, "true") == 0 || strcmp(type, "false") == 0))
+                yyjson_mut_obj_add_bool(doc, node, keys[i], strcmp(type, "true") == 0);
+            else
+                yyjson_mut_obj_add_null(doc, node, keys[i]);
+        }
+    }
     char *file_copy = aa_strdup(file);
     sqlite3_finalize(st);
     yyjson_mut_obj_add_val(doc, root, "node", node);

@@ -37697,6 +37697,14 @@ TEST(pipeline_py_import_alias_self_call_has_no_self_edge) {
             char got[1024];
             js_twin_calls_at(run.db, run.project, sites[i].file, sites[i].line, got, sizeof(got));
             printf("  python alias mode=%d %s:%d [%s]\n", mode, sites[i].file, sites[i].line, got);
+            if (strcmp(sites[i].file, "pkg/rebind.py") == 0)
+                ok = js_twin_expect("local rebound alias target", got,
+                                    "pkg.rebind.walk -> pkg.rebind.other") &&
+                     ok;
+            if (strcmp(sites[i].file, "pkg/rebound.py") == 0)
+                ok = js_twin_expect("module rebound alias target", got,
+                                    "pkg.rebound.walk -> pkg.rebound.other") &&
+                     ok;
             if (strstr(got, sites[i].self)) {
                 fprintf(stderr, "  python alias kept a self edge: [%s]\n", got);
                 ok = false;
@@ -39266,6 +39274,167 @@ TEST(pipeline_js_twin_callables_scale) {
     PASS();
 }
 
+TEST(pipeline_unknown_member_write_preserves_local_types) {
+    const char *writes[] = {
+        "for (const k in o) this[k] = o[k];",
+        "window[name] = replacement;",
+        "Foo.prototype[Symbol.iterator] = replacement;",
+        "this['w\\\\alk'] = replacement;",
+    };
+    const char *files[9] = {0};
+    char sources[4][1024], paths[4][32];
+    for (int i = 0; i < 4; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "case%d.js", i);
+        snprintf(sources[i], sizeof(sources[i]),
+                 "class Foo { bar() {} walk() { this.walk(); } }\n"
+                 "function mutate(o, name, replacement) { %s }\n"
+                 "function useConst() { const x = new Foo(); x.bar(); }\n"
+                 "function useLet() { let y = new Foo(); y.bar(); }\n"
+                 "function make() { return new Foo(); }\n"
+                 "function useFactory() { make().bar(); }\n", writes[i]);
+        files[2 * i] = paths[i];
+        files[2 * i + 1] = sources[i];
+    }
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        js_exact_run_t run;
+        ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+        for (int i = 0; i < 4; i++) {
+            const char *users[] = {"useConst", "useLet", "useFactory"};
+            const int lines[] = {3, 4, 6};
+            for (int j = 0; j < 3; j++) {
+                char got[1024], want[256], what[128];
+                snprintf(what, sizeof(what), "unknown key mode=%d case=%d %s", mode, i, users[j]);
+                snprintf(want, sizeof(want), "case%d.%s -> case%d.Foo; case%d.%s -> case%d.Foo.bar",
+                         i, users[j], i, i, users[j], i);
+                if (j == 2)
+                    snprintf(want, sizeof(want),
+                             "case%d.useFactory -> case%d.Foo.bar; case%d.useFactory -> case%d.make",
+                             i, i, i, i);
+                if (i == 2) {
+                    /* This computed key has no proven runtime identity. A write
+                     * to Foo.prototype can replace bar, so both writers retain
+                     * the constructor/factory call but withhold Foo.bar. The
+                     * unrelated writes in cases 0, 1 and 3 keep lexical types. */
+                    snprintf(want, sizeof(want), "case%d.%s -> case%d.%s", i, users[j], i,
+                             j == 2 ? "make" : "Foo");
+                }
+                js_twin_calls_at(run.db, run.project, paths[i], lines[j], got, sizeof(got));
+                ok = js_twin_expect(what, got, want) && ok;
+            }
+            char got[1024];
+            js_twin_calls_at(run.db, run.project, paths[i], 1, got, sizeof(got));
+            ok = js_twin_expect("unknown key cannot certify member self call", got, "") && ok;
+        }
+        js_exact_done(&run);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_member_self_calls_reject_indirect_writes) {
+    const char *sources[] = {
+        "class C { walk() { Object.defineProperty(this, 'walk', {value: replacement}); this.walk(); } }\n",
+        "class C { walk() { Object.defineProperties(this, {walk: {value: replacement}}); this.walk(); } }\n",
+        "class C { walk() { Object.assign(this, {walk: replacement}); this.walk(); } }\n",
+        "class C { walk() { Object.assign(C.prototype, {walk: replacement}); this.walk(); } }\n",
+        "class C { walk() { Reflect.set(this, 'walk', replacement); this.walk(); } }\n",
+        "class C { walk() { const that = this; that.walk = replacement; this.walk(); } }\n",
+        "class C { walk() { const self = this; self.walk = replacement; this.walk(); } }\n",
+        "class C { static walk() { C.walk = replacement; C.walk(); } }\n",
+        "class C { static walk() { C.walk = replacement; this.walk(); } }\n",
+        "const api = { walk() { api.walk = replacement; api.walk(); } };\n",
+        "class C { walk() { other.walk = replacement; this.walk(); } }\n",
+        "class C { walk() { other.step = replacement; this.walk(); } }\n",
+    };
+    const char *files[25] = {0};
+    char paths[12][32];
+    for (int i = 0; i < 12; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "case%d.js", i);
+        files[2 * i] = paths[i];
+        files[2 * i + 1] = sources[i];
+    }
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        js_exact_run_t run;
+        ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+        for (int i = 0; i < 12; i++) {
+            char got[1024], what[128];
+            snprintf(what, sizeof(what), "indirect write mode=%d case=%d", mode, i);
+            js_twin_calls_at(run.db, run.project, paths[i], 1, got, sizeof(got));
+            ok = js_twin_expect(what, got,
+                                i == 11 ? "case11.C.walk -> case11.C.walk" : "") && ok;
+        }
+        js_exact_done(&run);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_js_self_edge_requires_unwritten_binding) {
+    static const char *const files[] = {
+        "member.js",
+        "function replacement() {}\n"
+        "class C { walk() { this.walk = replacement; this.walk(); } }\n"
+        "class D { step() { this.step(); } }\n"
+        "D.prototype.step = replacement;\n"
+        "class Stable { run() { this.other = replacement; this.run(); } }\n"
+        "class Wrapped { turn() { (this).turn = replacement; this.turn(); } }\n"
+        "class Bracket { spin() { this.spin(); } }\n"
+        "Bracket['prototype'].spin = replacement;\n"
+        "class Grouped { next() { this.next(); } }\n"
+        "(Grouped.prototype).next = replacement;\n",
+        "script.js",
+        "function replacement() {}\n"
+        "function walk() { globalThis.walk = replacement; walk(); }\n"
+        "function step() { window.step = replacement; step(); }\n"
+        "function run() { self.run = replacement; run(); }\n"
+        "function stable() { stable(); }\n"
+        "function wrapped() { (globalThis).wrapped = replacement; wrapped(); }\n",
+        "self.js",
+        "import { walk as again } from './self';\n"
+        "function replacement() {}\n"
+        "export function walk() { again(); }\n"
+        "walk = replacement;\n",
+        "clean.js",
+        "import { walk as again } from './clean';\n"
+        "export function walk() { again(); }\n",
+        NULL};
+    static const struct {
+        const char *file;
+        int line;
+        const char *want;
+    } cases[] = {{"member.js", 2, ""},
+                 {"member.js", 3, ""},
+                 {"member.js", 5, "member.Stable.run -> member.Stable.run"},
+                 {"member.js", 6, ""},
+                 {"member.js", 7, ""},
+                 {"member.js", 9, ""},
+                 {"script.js", 2, ""},
+                 {"script.js", 3, ""},
+                 {"script.js", 4, ""},
+                 {"script.js", 5, "script.stable -> script.stable"},
+                 {"script.js", 6, ""},
+                 {"self.js", 3, ""},
+                 {"clean.js", 2, "clean.walk -> clean.walk"}};
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        js_exact_run_t run;
+        ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            char got[1024], what[128];
+            snprintf(what, sizeof(what), "binding mode=%d %s:%d", mode, cases[i].file,
+                     cases[i].line);
+            js_twin_calls_at(run.db, run.project, cases[i].file, cases[i].line, got, sizeof(got));
+            printf("  %s [%s]\n", what, got);
+            ok = js_twin_expect(what, got, cases[i].want) && ok;
+        }
+        js_exact_done(&run);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 TEST(pipeline_x9c_imported_class_write_withholds_factory) {
     char tmp[256] = "/tmp/cbm_x9c_class_write_XXXXXX", db[512], lib[512], got[1024];
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
@@ -39347,6 +39516,47 @@ TEST(pipeline_x9c_transparent_object_literals) {
         ok = js_twin_expect("literal cannot borrow free member", got, "") && ok;
         cbm_pipeline_free(p);
         th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_js_empty_and_quote_keys_are_distinct) {
+    static const char *const files[] = {"main.js",
+                                        "function work() {} function halt() {}\n"
+                                        "const ops = {\n"
+                                        "  ''() { work(); },\n"
+                                        "  '\"\"'() { halt(); },\n"
+                                        "  'a.b'() { work(); }\n"
+                                        "};\n"
+                                        "const alt = {\n"
+                                        "  ''() { halt(); },\n"
+                                        "  '\"\"'() { work(); },\n"
+                                        "  'a.b'() { halt(); }\n"
+                                        "};\n",
+                                        NULL};
+    static const struct {
+        int line;
+        const char *name, *qn, *target;
+    } cases[] = {{3, "\"\"", "main.ops.\"\"", "main.ops.\"\" -> main.work"},
+                 {4, "\"\"", "main.ops.%22%22", "main.ops.%22%22 -> main.halt"},
+                 {5, "a.b", "main.ops.a%2Eb", "main.ops.a%2Eb -> main.work"},
+                 {8, "\"\"", "main.alt.\"\"", "main.alt.\"\" -> main.halt"},
+                 {9, "\"\"", "main.alt.%22%22", "main.alt.%22%22 -> main.work"},
+                 {10, "a.b", "main.alt.a%2Eb", "main.alt.a%2Eb -> main.halt"}};
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        js_exact_run_t run;
+        ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            char got[1024];
+            js_twin_qn_at(run.db, run.project, "main.js", cases[i].name, cases[i].line, got,
+                          sizeof(got));
+            ok = js_twin_expect("quoted key QN", got, cases[i].qn) && ok;
+            js_twin_calls_at(run.db, run.project, "main.js", cases[i].line, got, sizeof(got));
+            ok = js_twin_expect("quoted key caller", got, cases[i].target) && ok;
+        }
+        js_exact_done(&run);
     }
     ASSERT_TRUE(ok);
     PASS();
@@ -39480,7 +39690,228 @@ TEST(pipeline_x9c_named_class_static_members_are_values) {
     PASS();
 }
 
+/* Each fixture checks the complete caller edge set through both writers. */
+static bool x9d_calls(const char *provider, const char *call, const char *want) {
+    bool ok = true;
+    for (int parallel = 0; parallel < 2; parallel++) {
+        char tmp[256] = "/tmp/cbm_x9d_calls_XXXXXX", db[512], main[2048], got[4096];
+        if (!cbm_mkdtemp(tmp)) return false;
+        XlangEnvSave env = xlang_env_select(parallel != 0);
+        if (parallel) x9c_parallel_fixture(tmp);
+        write_temp_file(tmp, "lib.ts", provider);
+        write_temp_file(tmp, "x.ts", "export const loaded = true;\n");
+        write_temp_file(tmp, "other.ts", "export class Other {}\n");
+        snprintf(main, sizeof(main), "%s\nexport async function use() { %s }\n",
+                 "import api, { make, Builder, api2, Port } from './lib';", call);
+        write_temp_file(tmp, "main.ts", main);
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        int rc = p ? x9c_parallel_run(p, parallel != 0) : -1;
+        if (rc == 0) {
+            js_twin_calls_at(db, cbm_pipeline_project_name(p), "main.ts", 2, got, sizeof(got));
+            ok = js_twin_expect(parallel ? "parallel exact CALLS" : "sequential exact CALLS",
+                                got, want) && ok;
+        } else ok = false;
+        cbm_pipeline_free(p);
+        xlang_env_restore(&env);
+        th_rmtree(tmp);
+    }
+    return ok;
+}
+
+TEST(pipeline_x9d_default_export_binding) {
+    const char *sources[] = {
+        "function run() {}\nfunction outer() { function run() {} }\nexport default run;\n",
+        "function run() {} function outer() { function run() {} } export default run;\n",
+        "export default function run() {} function outer() { function run() {} }\n",
+        "const run = () => {}; function outer() { const run = () => {}; } export default run;\n",
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        ok = x9d_calls(sources[i], "api();", "main.use -> lib.run") && ok;
+    ok = x9d_calls("export default class Port { static run() {} } function outer() { class Port {} }",
+                    "api.run();", "main.use -> lib.Port.run") && ok;
+    ok = x9d_calls("class Port { send() {} } const value = new Port(); export default value;",
+                    "api.send();", "main.use -> lib.Port.send") && ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_x9d_generator_returns) {
+    const char *sources[] = {
+        "class Port { send() {} } export class Builder { static *make() { return new Port(); } }",
+        "class Port { send() {} } export class Builder { static async *make() { return new Port(); } }",
+        "class Port { send() {} } export const Builder = { *make() { return new Port(); } };",
+        "class Port { send() {} } export const Builder = { async *make() { return new Port(); } };",
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        ok = x9d_calls(sources[i], "(await Builder.make()).send();",
+                        i < 2 ? "main.use -> lib.Builder.make" : "main.use -> lib.make") && ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_x9d_await_adoption) {
+    bool ok = x9d_calls("export class Port { then() {} send() {} } export function make() { return new Port(); }",
+                         "(await make()).send();", "main.use -> lib.make");
+    ok = x9d_calls("export class Port { send() {} } export function make(): Promise<Port> | Port { return null; }",
+                    "(await make()).send();", "main.use -> lib.Port.send; main.use -> lib.make") && ok;
+    ok = x9d_calls("export class Port { send() {} } class Other { send() {} } export function make(): Promise<Port> | Other { return null; }",
+                    "(await make()).send();", "main.use -> lib.make") && ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_x9d_eval_binding) {
+    const char *sources[] = {
+        "export class Port { send() {} } export function make() { return new Port(); } (eval)('Port = Other');",
+        "export class Port { send() {} } export function make() { return new Port(); } function local(eval) { eval('text'); }",
+        "export class Port { send() {} } export function make() { return new Port(); } const eval = (x) => x; (eval)('text');",
+        "export class Port { send() {} } export function make() { return new Port(); } function local(eval) {} (eval)('Port = Other');",
+        "export class Port { send() {} } export function make() { return new Port(); } var eval = (x) => x; var eval; eval('text');",
+        "export class Port { send() {} } export function make() { return new Port(); } function local(value = eval('Port = Other')) { var eval; }",
+        "export class Port { send() {} } export function make() { return new Port(); } class Other { static { var eval; } } (eval)('Port = Other');",
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        ok = x9d_calls(sources[i], "make().send();", i == 1 || i == 2 || i == 4
+                        ? "main.use -> lib.Port.send; main.use -> lib.make"
+                        : "main.use -> lib.make") && ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_x9d_mutated_members) {
+    const char *sources[] = {
+        "export class Port { send() {} } Object.assign(Port.prototype, { send: replacement }); export function make() { return new Port(); }",
+        "export class Port { send() {} } Port.prototype.send = replacement; export function make() { return new Port(); }",
+        "@decorate export class Port { send() {} } export function make() { return new Port(); }",
+        "export class Port { send() {} } (Object . assign)(Port.prototype, { send: replacement }); export function make() { return new Port(); }",
+        "export class Port { send() {} } Port['prototype'].send = replacement; export function make() { return new Port(); }",
+        "export class Port { send() {} } Port[key].send = replacement; export function make() { return new Port(); }",
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        ok = x9d_calls(sources[i], "make().send();", "main.use -> lib.make") && ok;
+    ok = x9d_calls("export class Port { send() {} } export function make() { return new Port(); } make.cache = 1;",
+                    "make().send();", "main.use -> lib.Port.send; main.use -> lib.make") && ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_x9d_member_edit_incremental) {
+    char tmp[256] = "/tmp/cbm_x9d_edit_XXXXXX", db[512], body[2048], got[2048];
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    XlangEnvSave env = xlang_env_select(true);
+    x9c_parallel_fixture(tmp);
+    write_temp_file(tmp, "main.ts", "import { make } from './lib';\nexport function use() { make().send(); }\n");
+    const char *tails[] = {"", "Object.assign(Port.prototype, { send: replacement });",
+                           "Port.prototype.send = replacement;", ""};
+    bool ok = true;
+    snprintf(db, sizeof(db), "%s/g.db", tmp);
+    for (int phase = 0; phase < 4; phase++) {
+        snprintf(body, sizeof(body), "%sexport class Port { send() {} } export function make() { return new Port(); } %s\n",
+                 phase == 3 ? "@decorate " : "", tails[phase]);
+        write_temp_file(tmp, "lib.ts", body);
+        char path[512];
+        snprintf(path, sizeof(path), "%s/lib.ts", tmp);
+        ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000 + phase * 100, 0), 0);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(p);
+        ASSERT_EQ(x9c_parallel_run(p, phase == 0), 0);
+        if (phase) ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+        const char *project = cbm_pipeline_project_name(p);
+        js_twin_calls_at(db, project, "main.ts", 2, got, sizeof(got));
+        ok = js_twin_expect("member edit", got, phase ? "main.use -> lib.make"
+                            : "main.use -> lib.Port.send; main.use -> lib.make") && ok;
+        if (phase) ok = x9c_fresh_calls_equal(tmp, db, project, phase) && ok;
+        cbm_pipeline_free(p);
+    }
+    xlang_env_restore(&env);
+    th_rmtree(tmp);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_x9d_literal_members) {
+    const char *sources[] = {
+        "export const api2 = { 'run'() {} };",
+        "export const api2 = { 7() {} };",
+        "function run() {} export const api2 = { run };",
+        "const run = () => {}; export const api2 = { run };",
+        "let run = () => {}; run = replacement; export const api2 = { run };",
+        "function outer() { function run() {} } export const api2 = { run };",
+        "function run() {} run = replacement; export const api2 = { run };",
+        "function run() {} export const api2 = { 'run'() {} };",
+        "function run() {} run! = replacement; export const api2 = { run };",
+    };
+    const char *calls[] = {"api2.run();", "api2[7]();", "api2.run();",
+                           "api2.run();", "api2.run();", "api2.run();", "api2.run();", "api2.run();", "api2.run();"};
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        ok = x9d_calls(sources[i], calls[i], i < 4
+                        ? (i == 1 ? "main.use -> lib.7" : "main.use -> lib.run")
+                        : (i == 7 ? "main.use -> lib.api2.run" : "")) && ok;
+    ok = x9d_calls(sources[0], "api2['run']();", "main.use -> lib.run") && ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_x9d_side_effect_import) {
+    ASSERT_TRUE(x9d_calls("import './x'; import { Other } from './other'; export class Port { send() {} } export function make() { return new Port(); }",
+                           "make().send();", "main.use -> lib.Port.send; main.use -> lib.make"));
+    PASS();
+}
+
+TEST(pipeline_x9d_finally_returns) {
+    ASSERT_TRUE(x9d_calls("export class Port { send() {} } export function make() { try { return new Port(); } finally { cleanup(); } }",
+                           "make().send();", "main.use -> lib.Port.send; main.use -> lib.make"));
+    ASSERT_TRUE(x9d_calls("export class Port { send() {} } export function make() { try { return new Port(); } finally { return outside; } }",
+                           "make().send();", "main.use -> lib.make"));
+    PASS();
+}
+
+TEST(pipeline_x9d_static_writes_keep_constructor_binding) {
+    const char *provider = "export class Port { static count = 0; static build() {} send() {} } "
+                           "Port.count++; export function make() { return new Port(); }";
+    bool ok = x9d_calls(provider, "make().send();", "main.use -> lib.Port.send; main.use -> lib.make");
+    ok = x9d_calls(provider, "new Port().send();", "main.use -> lib.Port; main.use -> lib.Port.send") && ok;
+    ok = x9d_calls(provider, "Port.build();", "main.use -> lib.Port.build") && ok;
+    ok = x9d_calls("export class Port { static slot; send() {} } Port.slot = new Port(); export function make() { return new Port(); }",
+                    "make().send();", "main.use -> lib.Port.send; main.use -> lib.make") && ok;
+    ok = x9d_calls("export class Port { static build() {} } Port.build = replacement;",
+                    "Port.build();", "") && ok;
+    ok = x9d_calls("export class Port { static build() {} } Object.assign(Port, { build: replacement });",
+                    "Port.build();", "") && ok;
+    ok = x9d_calls("export class Port { static key = 0; static build() {} } Port[key] = replacement;",
+                    "Port.build();", "") && ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_x9d_static_writes_keep_constructor_binding);
+    RUN_TEST(pipeline_x9d_side_effect_import);
+    RUN_TEST(pipeline_x9d_finally_returns);
+
+    RUN_TEST(pipeline_x9d_literal_members);
+
+    RUN_TEST(pipeline_x9d_mutated_members);
+    RUN_TEST(pipeline_x9d_member_edit_incremental);
+
+    RUN_TEST(pipeline_x9d_eval_binding);
+
+    RUN_TEST(pipeline_x9d_await_adoption);
+
+    RUN_TEST(pipeline_x9d_generator_returns);
+
+    RUN_TEST(pipeline_x9d_default_export_binding);
+
+    RUN_TEST(pipeline_unknown_member_write_preserves_local_types);
+    RUN_TEST(pipeline_member_self_calls_reject_indirect_writes);
+    RUN_TEST(pipeline_js_self_edge_requires_unwritten_binding);
+    RUN_TEST(pipeline_js_empty_and_quote_keys_are_distinct);
     RUN_TEST(pipeline_x9c_named_class_static_members_are_values);
     RUN_TEST(pipeline_x9c_return_import_work_is_linear);
 

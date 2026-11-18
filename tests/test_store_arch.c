@@ -2028,7 +2028,57 @@ TEST(search_case_sensitive_explicit) {
 
 /* ── Suite ─────────────────────────────────────────────────────── */
 
+TEST(store_arch_self_calls_do_not_inflate_hotspots) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "p", "/tmp/p"), CBM_STORE_OK);
+    const char *names[] = {"alone", "used", "plain", "caller"};
+    int64_t ids[4];
+    for (int i = 0; i < 4; i++) {
+        cbm_node_t n = {.project = "p",
+                        .label = "Function",
+                        .name = names[i],
+                        .qualified_name = names[i],
+                        .file_path = "src/main.js"};
+        ids[i] = cbm_store_upsert_node(s, &n);
+    }
+    const int pairs[][2] = {{0, 0}, {1, 1}, {3, 1}, {3, 2}};
+    for (int i = 0; i < 4; i++) {
+        cbm_edge_t e = {.project = "p",
+                        .source_id = ids[pairs[i][0]],
+                        .target_id = ids[pairs[i][1]],
+                        .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(s, &e), 0);
+    }
+    cbm_search_params_t params = {.project = "p", .min_degree = -1, .max_degree = -1};
+    cbm_search_output_t found = {0};
+    ASSERT_EQ(cbm_store_search(s, &params, &found), CBM_STORE_OK);
+    ASSERT_EQ(found.count, 4);
+    for (int i = 0; i < found.count; i++)
+        for (int j = 0; j < 3; j++)
+            if (found.results[i].node.id == ids[j])
+                ASSERT_EQ(found.results[i].in_degree, j == 0 ? 0 : 1);
+    cbm_store_search_free(&found);
+    const char *aspects[] = {"hotspots"};
+    cbm_architecture_info_t out = {0};
+    ASSERT_EQ(cbm_store_get_architecture(s, "p", NULL, aspects, 1, &out), CBM_STORE_OK);
+    int totals[3] = {0};
+    for (int i = 0; i < out.hotspot_count; i++)
+        for (int j = 0; j < 3; j++)
+            if (strcmp(out.hotspots[i].name, names[j]) == 0)
+                totals[j] = out.hotspots[i].fan_in;
+    printf("  hotspots self-only=%d self+caller=%d plain=%d\n", totals[0], totals[1], totals[2]);
+    ASSERT_EQ(totals[0], 0);
+    ASSERT_EQ(totals[1], 1);
+    ASSERT_EQ(totals[2], 1);
+    cbm_store_architecture_free(&out);
+    cbm_store_close(s);
+    PASS();
+}
+
 SUITE(store_arch) {
+    RUN_TEST(store_arch_self_calls_do_not_inflate_hotspots);
+
     /* Architecture */
     RUN_TEST(arch_get_all);
     RUN_TEST(arch_entry_points_exclude_tests);

@@ -484,9 +484,10 @@ typedef struct {
     const char *js_this_class_qn;
     const char *js_this_base;
     uint8_t js_this;
-    /* JS/TS bare call whose name no assignment in the file writes (closures
-     * and `var` included). Set by the TS resolver; a bare self CALLS edge
-     * needs it, since a write can rebind the callable before the call. */
+    /* JS/TS self-target proof from the TS resolver: no file assignment to
+     * the bare binding (including its resolved name through an alias), its
+     * global-object property, or its this/prototype member. A missing or
+     * incomplete write collection leaves this false in both edge writers. */
     bool callee_never_written;
     /* Java/Kotlin: the arguments written at the site, one entry each,
      * comma-separated: the Kotlin argument name or "_", and "*" for a

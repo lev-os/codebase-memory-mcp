@@ -1847,19 +1847,25 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *     escaped in a literal key's QN segment. */
 /* 31: constructor proofs, captured writes and default/literal values changed
  *     CALLS for unchanged importers; rebuild stored graphs once. */
-/* 32: repair JS/TS suppression without discarding semantic targets; share
+/* 32: self edges require unwritten member/global/alias targets; unchanged
+ *     files rebuild to remove spelling-only recursion and repair literal keys. */
+/* 33: unknown member keys no longer invalidate lexical type proofs; member
+ *     self calls require complete property-write evidence on unchanged files. */
+/* 34: default-export identity, await adoption, member stability and literal
+ *     object members change CALLS for unchanged importers. */
+/* 35: repair JS/TS suppression without discarding semantic targets; share
  *     declaration scopes and retain proven imported values and project globals.
  *     Unchanged files rebuild once to repair their CALLS edges. */
-/* 33: retained constant imports prove exact targets even when literal-key
+/* 36: retained constant imports prove exact targets even when literal-key
  *     names require a binding. Rebuild unchanged importers once. */
-/* 34: native fetch needs an unbound name, not an unknown binding target.
+/* 37: native fetch needs an unbound name, not an unknown binding target.
  *     Function declarations and expression names keep their real scopes.
  *     Registry guesses cannot invoke data variables. Rebuild unchanged
  *     JS/TS callers once to repair CALLS and HTTP_CALLS edges. */
-/* 35: runtime variables can hold callable factory values. Preserve those
+/* 38: runtime variables can hold callable factory values. Preserve those
  *     binding targets and keep call-only presence facts out of ordinary
  *     reference shadowing. Rebuild unchanged CALLS and USAGE edges once. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 35 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 38 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

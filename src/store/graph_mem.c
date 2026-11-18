@@ -701,16 +701,14 @@ static int gm_hop_id_cmp(const void *pa, const void *pb) {
 }
 
 /* One BFS level: expand every frontier node over the masked edges. A node is
- * first reached at its shortest distance; the start is never re-entered (its
- * neighbours were all reached at hop 1), only recorded once at the length of
- * the shortest cycle back to it — the CTE's (start, hop>0) row. */
+ * first reached at its shortest distance. The start is neither re-entered
+ * nor listed as its own neighbour, even when a cycle returns to it. */
 typedef struct {
     const uint32_t *off;
     const uint32_t *nbr;
     const uint8_t *type;
     cbm_graph_mem_types_t mask;
     uint32_t start;
-    bool start_back;
     gm_set_t seen;
     gm_hops_t out;
 } gm_walk_t;
@@ -724,12 +722,6 @@ static bool gm_expand_level(gm_walk_t *w, const gm_list_t *frontier, gm_list_t *
             }
             uint32_t v = w->nbr[e];
             if (v == w->start) {
-                if (!w->start_back) {
-                    w->start_back = true;
-                    if (!gm_hops_push(&w->out, v, hop)) {
-                        return false;
-                    }
-                }
                 continue;
             }
             int added = gm_set_add(&w->seen, v);

@@ -6431,6 +6431,7 @@ int cbm_store_node_neighbor_names(cbm_store_t *s, int64_t node_id, int limit, ch
         s->db,
         "SELECT DISTINCT n.name FROM edges e JOIN nodes n ON e.source_id = n.id "
         "WHERE e.target_id = ?1 AND e.type IN ('CALLS','HTTP_CALLS','ASYNC_CALLS') "
+        "AND e.source_id <> e.target_id "
         "ORDER BY n.name LIMIT ?2",
         node_id, limit, out_callers, caller_count);
 
@@ -6438,6 +6439,7 @@ int cbm_store_node_neighbor_names(cbm_store_t *s, int64_t node_id, int limit, ch
         s->db,
         "SELECT DISTINCT n.name FROM edges e JOIN nodes n ON e.target_id = n.id "
         "WHERE e.source_id = ?1 AND e.type IN ('CALLS','HTTP_CALLS','ASYNC_CALLS') "
+        "AND e.source_id <> e.target_id "
         "ORDER BY n.name LIMIT ?2",
         node_id, limit, out_callees, callee_count);
 
@@ -8041,12 +8043,12 @@ static int bfs_visit_sql(cbm_store_t *s, const bfs_query_t *q, bfs_rows_t *rows,
                  "n.file_path, n.start_line, n.end_line, n.properties, MIN(bfs.hop) AS hop "
                  "FROM bfs "
                  "JOIN nodes n ON n.id = bfs.node_id "
-                 "WHERE bfs.hop > 0 "
+                 "WHERE bfs.hop > 0 AND n.id <> %lld "
                  "GROUP BY n.id "
                  "ORDER BY hop, n.id "
                  "LIMIT %d;",
                  (long long)q->start_id, next_id, join_cond, q->types_clause, q->max_depth,
-                 q->probe_limit);
+                 (long long)q->start_id, q->probe_limit);
     }
 
     sqlite3_stmt *stmt = NULL;
@@ -9390,6 +9392,7 @@ static int arch_hotspots(cbm_store_t *s, const char *project, const char *path,
     char sqlbuf[ST_SQL_BUF];
     const char *base = "SELECT n.name, n.qualified_name, COUNT(*) as fan_in "
                        "FROM nodes n JOIN edges e ON e.target_id = n.id AND e.type = 'CALLS' "
+                       "AND e.source_id <> e.target_id "
                        "WHERE n.project=?1 AND n.label IN ('Function', 'Method') "
                        "AND (json_extract(n.properties, '$.is_test') IS NULL OR "
                        "json_extract(n.properties, '$.is_test') != 1) "
