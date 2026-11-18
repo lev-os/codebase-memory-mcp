@@ -39081,7 +39081,60 @@ TEST(pipeline_x9d_eval_binding) {
     PASS();
 }
 
+TEST(pipeline_x9d_mutated_members) {
+    const char *sources[] = {
+        "export class Port { send() {} } Object.assign(Port.prototype, { send: replacement }); export function make() { return new Port(); }",
+        "export class Port { send() {} } Port.prototype.send = replacement; export function make() { return new Port(); }",
+        "@decorate export class Port { send() {} } export function make() { return new Port(); }",
+        "export class Port { send() {} } (Object . assign)(Port.prototype, { send: replacement }); export function make() { return new Port(); }",
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        ok = x9d_calls(sources[i], "make().send();", "main.use -> lib.make") && ok;
+    ok = x9d_calls("export class Port { send() {} } export function make() { return new Port(); } make.cache = 1;",
+                    "make().send();", "main.use -> lib.Port.send; main.use -> lib.make") && ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_x9d_member_edit_incremental) {
+    char tmp[256] = "/tmp/cbm_x9d_edit_XXXXXX", db[512], body[2048], got[2048];
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    XlangEnvSave env = xlang_env_select(true);
+    x9c_parallel_fixture(tmp);
+    write_temp_file(tmp, "main.ts", "import { make } from './lib';\nexport function use() { make().send(); }\n");
+    const char *tails[] = {"", "Object.assign(Port.prototype, { send: replacement });",
+                           "Port.prototype.send = replacement;", ""};
+    bool ok = true;
+    snprintf(db, sizeof(db), "%s/g.db", tmp);
+    for (int phase = 0; phase < 4; phase++) {
+        snprintf(body, sizeof(body), "%sexport class Port { send() {} } export function make() { return new Port(); } %s\n",
+                 phase == 3 ? "@decorate " : "", tails[phase]);
+        write_temp_file(tmp, "lib.ts", body);
+        char path[512];
+        snprintf(path, sizeof(path), "%s/lib.ts", tmp);
+        ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000 + phase * 100, 0), 0);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(p);
+        ASSERT_EQ(x9c_parallel_run(p, phase == 0), 0);
+        if (phase) ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+        const char *project = cbm_pipeline_project_name(p);
+        js_twin_calls_at(db, project, "main.ts", 2, got, sizeof(got));
+        ok = js_twin_expect("member edit", got, phase ? "main.use -> lib.make"
+                            : "main.use -> lib.Port.send; main.use -> lib.make") && ok;
+        if (phase) ok = x9c_fresh_calls_equal(tmp, db, project, phase) && ok;
+        cbm_pipeline_free(p);
+    }
+    xlang_env_restore(&env);
+    th_rmtree(tmp);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_x9d_mutated_members);
+    RUN_TEST(pipeline_x9d_member_edit_incremental);
+
     RUN_TEST(pipeline_x9d_eval_binding);
 
     RUN_TEST(pipeline_x9d_await_adoption);

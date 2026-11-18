@@ -15780,6 +15780,38 @@ static bool js_return_write_pattern(CBMExtractCtx *ctx, CBMHashTable *writes, TS
     return true;
 }
 
+/* Mutating a constructor or its prototype also invalidates instance proof.
+ * The existing persisted class flag carries this uncertainty to importers. */
+static bool js_return_member_write(CBMExtractCtx *ctx, CBMHashTable *writes, TSNode target, bool value) {
+    target = cbm_ts_unwrap_value(target);
+    if (ts_node_is_null(target))
+        return true;
+    bool member = false;
+    while (strcmp(ts_node_type(target), "member_expression") == 0 ||
+           strcmp(ts_node_type(target), "subscript_expression") == 0) {
+        member = true;
+        target = cbm_ts_unwrap_value(ts_node_child_by_field_name(target, "object", 6));
+        if (ts_node_is_null(target))
+            return false;
+    }
+    if ((!member && !value) || strcmp(ts_node_type(target), "identifier") != 0)
+        return true;
+    const char *name = cbm_node_text(ctx->arena, target, ctx->source);
+    if (!name)
+        return false;
+    for (int i = 0; i < ctx->result->defs.count; i++) {
+        const CBMDefinition *d = &ctx->result->defs.items[i];
+        if (strcmp(d->label, "Class") == 0 && d->name && strcmp(d->name, name) == 0)
+            return js_return_write_pattern(ctx, writes, target, 0);
+        const char *ctor = d->ts_return_constructor ? d->return_type : NULL;
+        if (ctor && strncmp(ctor, "Promise<", 8) == 0)
+            ctor += 8;
+        if (ctor && strcspn(ctor, ">") == strlen(name) && strncmp(ctor, name, strlen(name)) == 0)
+            return js_return_write_pattern(ctx, writes, target, 0);
+    }
+    return true;
+}
+
 static void js_invalidate_written_returns(CBMExtractCtx *ctx) {
     bool needed = false;
     for (int i = 0; i < ctx->result->defs.count; i++)
@@ -15789,6 +15821,13 @@ static void js_invalidate_written_returns(CBMExtractCtx *ctx) {
         return;
     CBMHashTable *writes = cbm_ht_create(32);
     bool complete = writes != NULL;
+    for (int i = 0; complete && i < ctx->result->defs.count; i++) {
+        const CBMDefinition *d = &ctx->result->defs.items[i];
+        if (strcmp(d->label, "Class") == 0 && d->name && d->decorators && d->decorators[0]) {
+            cbm_ht_set(writes, d->name, writes);
+            complete = cbm_ht_has(writes, d->name);
+        }
+    }
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     while (complete) {
         TSNode node = ts_tree_cursor_current_node(&cursor), target = {0};
@@ -15804,7 +15843,32 @@ static void js_invalidate_written_returns(CBMExtractCtx *ctx) {
             target = ts_node_child_by_field_name(node, "left", 4);
         else if (strcmp(kind, "update_expression") == 0)
             target = ts_node_named_child(node, 0);
-        complete = js_return_write_pattern(ctx, writes, target, 0);
+        complete = js_return_write_pattern(ctx, writes, target, 0) &&
+                   js_return_member_write(ctx, writes, target, false);
+        if (complete && strcmp(kind, "call_expression") == 0) {
+            TSNode called = cbm_ts_unwrap_value(ts_node_child_by_field_name(node, "function", 8));
+            TSNode object = ts_node_child_by_field_name(called, "object", 6);
+            TSNode property = ts_node_child_by_field_name(called, "property", 8);
+            if (!ts_node_is_null(object) && !ts_node_is_null(property) &&
+                js_node_text_is(object, ctx->source, "Object") &&
+                (js_node_text_is(property, ctx->source, "assign") ||
+                 js_node_text_is(property, ctx->source, "defineProperty") ||
+                 js_node_text_is(property, ctx->source, "defineProperties"))) {
+                TSNode args = ts_node_child_by_field_name(node, "arguments", 9);
+                TSNode first = ts_node_named_child(args, 0);
+                complete = js_return_member_write(ctx, writes, first, true);
+            }
+        }
+        if (strcmp(kind, "decorator") == 0) {
+            TSNode parent = ts_node_parent(node);
+            if (strcmp(ts_node_type(parent), "export_statement") == 0)
+                parent = ts_node_child_by_field_name(parent, "declaration", 11);
+            if (!ts_node_is_null(parent) &&
+                (strcmp(ts_node_type(parent), "class_declaration") == 0 ||
+                 strcmp(ts_node_type(parent), "class") == 0))
+                complete = complete && js_return_write_pattern(
+                    ctx, writes, ts_node_child_by_field_name(parent, "name", 4), 0);
+        }
         if (!complete)
             break;
         if (ts_tree_cursor_goto_first_child(&cursor))
