@@ -37339,6 +37339,31 @@ TEST(pipeline_js_literal_keys_keep_distinct_nodes) {
     PASS();
 }
 
+/* A built-in named like a keyword (`setTimeout`) has no project target in
+ * either writer; the local call beside it keeps its edge. */
+TEST(pipeline_js_unresolved_builtin_has_no_calls_edge) {
+    static const char *const files[] = {"main.js",
+                                        "function tick() { return 1; }\n"
+                                        "export function run() {\n"
+                                        "  tick();\n"
+                                        "  setTimeout(tick, 1);\n"
+                                        "}\n",
+                                        NULL};
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        js_exact_run_t run;
+        ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+        char got[1024];
+        js_twin_calls_at(run.db, run.project, "main.js", 3, got, sizeof(got));
+        ok = js_twin_expect("local call", got, "main.run -> main.tick") && ok;
+        js_twin_calls_at(run.db, run.project, "main.js", 4, got, sizeof(got));
+        ok = js_twin_expect("built-in call", got, "") && ok;
+        js_exact_done(&run);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 TEST(pipeline_js_generator_expressions) {
     static const char *const exts[] = {"js", "ts", "tsx"};
     bool ok = true;
@@ -38608,6 +38633,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_py_import_alias_self_call_has_no_self_edge);
     RUN_TEST(pipeline_js_quoted_key_keeps_global_fetch_http_call);
     RUN_TEST(pipeline_js_literal_keys_keep_distinct_nodes);
+    RUN_TEST(pipeline_js_unresolved_builtin_has_no_calls_edge);
     RUN_TEST(pipeline_js_generator_expressions);
     RUN_TEST(pipeline_js_constructor_does_not_guess_type_alias);
     RUN_TEST(pipeline_js_keyword_named_local_call);

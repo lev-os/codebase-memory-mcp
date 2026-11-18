@@ -2163,6 +2163,56 @@ TEST(parallel_lsp_exact_index_handles_repeated_synthetic_occurrences_without_lin
     PASS();
 }
 
+/* A JS built-in named like a keyword (`setTimeout`) waits for a binding
+ * proof. When the exact index is complete, its miss is the answer: no call
+ * site may rescan every resolver row of the file. */
+TEST(parallel_unresolved_builtin_calls_use_exact_index_only) {
+    enum { OCCURRENCES = 64, LOCAL_CALLS = 8 };
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_builtin_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/app.js", tmpdir);
+    FILE *file = cbm_fopen(path, "w");
+    if (!file) {
+        rmdir(tmpdir);
+        FAIL("fopen app.js failed");
+    }
+    fprintf(file, "function tick() { return 1; }\n"
+                  "export function run() {\n");
+    for (int i = 0; i < LOCAL_CALLS; i++) {
+        fprintf(file, "  tick();\n");
+    }
+    for (int i = 0; i < OCCURRENCES; i++) {
+        fprintf(file, "  setTimeout(tick, %d);\n", i);
+    }
+    fprintf(file, "}\n");
+    fclose(file);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = path;
+    files[0].rel_path = (char *)"app.js";
+    files[0].language = CBM_LANG_JAVASCRIPT;
+    cbm_pp_lsp_linear_fallback_rows_reset();
+    cbm_gbuf_t *gbuf = run_parallel_with_extract_opts_and_mutator(
+        "cbm_par_builtin", tmpdir, files, 1, 1, NULL, NULL, NULL, false);
+    ASSERT_NOT_NULL(gbuf);
+    ASSERT_NOT_NULL(find_calls_edge_by_tails(gbuf, "app.run", "app.tick"));
+    uint64_t fallback_rows = cbm_pp_lsp_linear_fallback_rows();
+    if (fallback_rows != 0) {
+        printf("  unresolved built-in diagnostic: occurrences=%d linear_rows=%llu\n", OCCURRENCES,
+               (unsigned long long)fallback_rows);
+    }
+    ASSERT_EQ(fallback_rows, 0);
+
+    cbm_gbuf_free(gbuf);
+    unlink(path);
+    rmdir(tmpdir);
+    PASS();
+}
+
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
 enum { CALL_REFERENCE_SCALE_OCCURRENCES = 128 };
 
@@ -6144,6 +6194,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_lsp_index_exact_ambiguity_does_not_fall_through_to_legacy);
     RUN_TEST(parallel_lsp_long_exact_key_never_yields_legacy_target);
     RUN_TEST(parallel_lsp_exact_index_handles_repeated_synthetic_occurrences_without_linear_scan);
+    RUN_TEST(parallel_unresolved_builtin_calls_use_exact_index_only);
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
     RUN_TEST(parallel_call_reference_lookup_rows_grow_linearly);
 #endif

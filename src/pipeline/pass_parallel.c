@@ -3443,8 +3443,16 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             !exact_key_ambiguous) {
             lsp = lsp_idx_lookup(lsp_legacy_idx, call, false, &legacy_key_built, NULL);
         }
-        if (!lsp && (!lsp_legacy_idx_complete || !legacy_key_built || allow_tail ||
-                     call->requires_lsp_resolution)) {
+        /* A call that needs a binding matches only a row at its own site
+         * (cbm_pipeline_invocation_site_rank), so an authoritative exact
+         * index is its full answer, a miss included: an unresolved built-in
+         * such as setTimeout(...) must not scan every resolver row. */
+        bool exact_answered =
+            exact_index_authoritative && !exact_key_ambiguous &&
+            cbm_pipeline_source_site_present(call->site_start_byte, call->site_end_byte);
+        if (!lsp && (allow_tail || (call->requires_lsp_resolution
+                                        ? !exact_answered
+                                        : !lsp_legacy_idx_complete || !legacy_key_built))) {
             /* Fallback to the linear scan for edge cases the index may
              * miss (e.g. callee_name that wasn't the registered short
              * name). Keeps semantics identical. */
