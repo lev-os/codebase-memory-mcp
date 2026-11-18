@@ -15795,7 +15795,7 @@ static bool js_return_static_data(CBMExtractCtx *ctx, TSNode object, const char 
         TSNode value = cbm_ts_unwrap_value(ts_node_child_by_field_name(member, "value", 5));
         if (found || decorated ||
             (strcmp(kind, "public_field_definition") != 0 && strcmp(kind, "field_definition") != 0) ||
-            (!ts_node_is_null(value) && js_twin_bodied_kind(ts_node_type(value))))
+            (!ts_node_is_null(value) && cbm_js_bodied_kind(ts_node_type(value))))
             return false;
         found = true;
     }
@@ -15972,7 +15972,7 @@ static TSNode js_shorthand_callable(CBMExtractCtx *ctx, TSNode member, const cha
                strcmp(kind, "generator_function_declaration") != 0) {
         return (TSNode){0};
     }
-    if (ts_node_is_null(fn) || !js_twin_bodied_kind(ts_node_type(fn)))
+    if (ts_node_is_null(fn) || !cbm_js_bodied_kind(ts_node_type(fn)))
         return (TSNode){0};
     /* A same-spelled write in another scope can only withhold the fact. */
     CBMHashTable *writes = cbm_ht_create(4);
