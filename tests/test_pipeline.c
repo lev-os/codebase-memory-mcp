@@ -10139,7 +10139,6 @@ TEST(pipeline_semantic_version_24_index_is_rebuilt_once) {
     return pipeline_exact_inputs_migrate_metadata_and_mode(24);
 }
 
-
 /* Published branch version 8 predates language doc links and diagrams. */
 TEST(pipeline_semantic_version_8_index_is_rebuilt_once) {
     return pipeline_exact_inputs_migrate_metadata_and_mode(8);
@@ -36865,7 +36864,6 @@ TEST(pipeline_x9c_provider_edits_invalidate_return_proof) {
     PASS();
 }
 
-
 TEST(pipeline_ts_factory_returns_keep_import_identity) {
     char tmp[256] = "/tmp/cbm_ts_factory_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
@@ -38027,7 +38025,40 @@ TEST(pipeline_x9c_return_import_work_is_linear) {
     PASS();
 }
 
+TEST(pipeline_x9c_named_class_static_members_are_values) {
+    bool ok = true;
+    for (int parallel = 0; parallel < 2; parallel++) {
+        char tmp[256] = "/tmp/cbm_x9c_static_XXXXXX", db[512], got[1024];
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        XlangEnvSave env = xlang_env_select(parallel != 0);
+        if (parallel)
+            x9c_parallel_fixture(tmp);
+        write_temp_file(tmp, "lib.ts",
+                        "export class Port { static from() {} static load = () => 1; send() {} "
+                        "}\nexport function from() {}\nexport function halt() {}\n");
+        write_temp_file(tmp, "main.ts",
+                        "import { Port } from './lib';\nexport function first() { Port.from(); "
+                        "}\nexport function second() { Port.load(); }\nexport function reject() { "
+                        "Port.halt(); }\nexport function instance() { Port.send(); }\n");
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        cbm_pipeline_t *p = js_twin_index(tmp, db);
+        ASSERT_NOT_NULL(p);
+        const char *want[] = {"main.first -> lib.Port.from", "main.second -> lib.Port.load", "",
+                              ""};
+        for (int i = 0; i < 4; i++) {
+            js_twin_calls_at(db, cbm_pipeline_project_name(p), "main.ts", i + 2, got, sizeof(got));
+            ok = js_twin_expect("named class static value", got, want[i]) && ok;
+        }
+        cbm_pipeline_free(p);
+        xlang_env_restore(&env);
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_x9c_named_class_static_members_are_values);
     RUN_TEST(pipeline_x9c_return_import_work_is_linear);
 
     RUN_TEST(pipeline_x9c_default_import_value_boundaries);

@@ -3141,10 +3141,14 @@ static const CBMRegisteredFunc *ts_lookup_namespace_call(TSLSPContext *ctx, cons
             if (strcmp(ts_import_export_name(ctx, object_name), "default") == 0)
                 import_module = qn;
             const CBMRegisteredType *constructor = cbm_registry_lookup_type(ctx->registry, qn);
-            if (strcmp(ts_import_export_name(ctx, object_name), "default") == 0 && constructor &&
-                !constructor->is_interface && !constructor->alias_of) {
+            if (constructor && !constructor->is_interface && !constructor->alias_of &&
+                !constructor->ts_value_binding_written) {
                 const CBMRegisteredFunc *method = ts_lookup_method_for_call(
                     ctx, cbm_type_named(ctx->arena, qn), method_name, args);
+                if (!method) {
+                    const char *member_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", qn, method_name);
+                    method = ts_lookup_func(ctx, ctx->registry, member_qn);
+                }
                 return method && (method->flags & CBM_FUNC_FLAG_STATICMETHOD) ? method : NULL;
             }
             const CBMVarBinding *value = ts_registry_value(ctx, qn);

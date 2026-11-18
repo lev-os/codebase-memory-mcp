@@ -15862,7 +15862,9 @@ static const char **js_object_members(CBMExtractCtx *ctx, TSNode object, CBMDefi
 static void js_record_object_members(CBMExtractCtx *ctx, int mod_idx) {
     bool needed = false;
     for (int i = 0; i < ctx->result->defs.count; i++)
-        needed |= ctx->result->defs.items[i].js_object_literal;
+        needed |= ctx->result->defs.items[i].js_object_literal ||
+                  (ctx->result->defs.items[i].label &&
+                   strcmp(ctx->result->defs.items[i].label, "Class") == 0);
     for (uint32_t i = 0; !needed && i < ts_node_named_child_count(ctx->root); i++) {
         TSNode node = ts_node_named_child(ctx->root, i);
         if (strcmp(ts_node_type(node), "export_statement") == 0)
@@ -15882,12 +15884,20 @@ static void js_record_object_members(CBMExtractCtx *ctx, int mod_idx) {
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     for (;;) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
-        if (strcmp(ts_node_type(node), "method_definition") == 0) {
+        const char *kind = ts_node_type(node);
+        bool method = strcmp(kind, "method_definition") == 0;
+        if (method || strcmp(kind, "public_field_definition") == 0 ||
+            strcmp(kind, "field_definition") == 0) {
+            TSNode callable =
+                method ? node : cbm_ts_unwrap_value(ts_node_child_by_field_name(node, "value", 5));
+            if (!method && !ts_node_is_null(callable) &&
+                !js_twin_bodied_kind(ts_node_type(callable)))
+                callable = (TSNode){0};
             bool is_static = false;
             for (uint32_t i = 0; i < ts_node_child_count(node); i++)
                 is_static |= strcmp(ts_node_type(ts_node_child(node, i)), "static") == 0;
-            if (is_static) {
-                uint32_t start = ts_node_start_byte(node);
+            if (is_static && !ts_node_is_null(callable)) {
+                uint32_t start = ts_node_start_byte(callable);
                 int lo = 0, hi = count;
                 while (lo < hi) {
                     int mid = lo + (hi - lo) / 2;
