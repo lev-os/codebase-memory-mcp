@@ -70,13 +70,14 @@ static inline bool cbm_pipeline_exact_self_call(CBMLanguage lang, const CBMCall 
     return false;
 }
 
-/* A registry name match onto a JS/TS type alias does not prove a runtime
- * callable. Semantic targets take their existing resolution path separately. */
-static inline bool cbm_pipeline_js_type_only_target(CBMLanguage lang,
+/* A registry name match onto a JS/TS type or data variable does not
+ * prove a callable. Semantic targets keep their separate proof path. */
+static inline bool cbm_pipeline_js_non_callable_guess(CBMLanguage lang,
                                                     const cbm_gbuf_node_t *target) {
     bool js = lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
               lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS;
-    return js && target && target->label && strcmp(target->label, "Type") == 0;
+    return js && target && target->label &&
+           (strcmp(target->label, "Type") == 0 || strcmp(target->label, "Variable") == 0);
 }
 
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
@@ -414,6 +415,27 @@ static inline int cbm_pipeline_invocation_site_rank(const CBMResolvedCall *resol
 static inline bool cbm_pipeline_lsp_external_receiver(const CBMResolvedCall *resolved) {
     return resolved && resolved->strategy &&
            strcmp(resolved->strategy, "php_external_receiver") == 0;
+}
+
+/* Failed target resolution does not make a bound value the global API.
+ * The extractor proves absence of a binding separately from target identity. */
+static inline bool cbm_pipeline_global_fetch_call(CBMLanguage lang, const CBMCall *call,
+                                                   const cbm_registry_t *registry) {
+    if (!call || !cbm_service_pattern_is_global_fetch(call->callee_name)) return false;
+    switch (lang) {
+    case CBM_LANG_JAVASCRIPT:
+    case CBM_LANG_TYPESCRIPT:
+    case CBM_LANG_TSX:
+    case CBM_LANG_HTML:
+    case CBM_LANG_VUE:
+    case CBM_LANG_SVELTE:
+    case CBM_LANG_ASTRO:
+        return call->callee_is_unbound && !call->callee_is_locally_bound &&
+               !call->js_import_module && !cbm_registry_has_js_global(registry, call->callee_name);
+    default:
+        /* Other extractors do not produce these lexical facts. */
+        return true;
+    }
 }
 
 /* The service-pattern name of a call: its callee text, or, when that names no

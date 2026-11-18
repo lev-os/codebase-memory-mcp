@@ -2538,7 +2538,15 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
         uint32_t function_id = lexical_ancestor_of_kind(state, current_id, true, false);
         const CBMLexicalScope *function_scope = usage_lexical_scope(state, function_id);
         uint32_t parent_id = function_scope ? function_scope->parent_id : 0;
-        if (ctx->language == CBM_LANG_PYTHON) {
+        const char *function_kind = ts_node_type(function_declaration);
+        bool js = js_call_classifier_lang(ctx->language);
+        bool expression = js && (strcmp(function_kind, "function_expression") == 0 ||
+                                 strcmp(function_kind, "function") == 0 ||
+                                 strcmp(function_kind, "generator_function") == 0);
+        if (expression) {
+            /* A named function value binds its own name only inside itself. */
+            scope_id = function_id;
+        } else if (ctx->language == CBM_LANG_PYTHON) {
             scope_id = python_nearest_namespace(state, parent_id);
             const CBMLexicalScope *owner = usage_lexical_scope(state, scope_id);
             if (!owner || (owner->kind != CBM_LEXICAL_SCOPE_FUNCTION &&
@@ -2548,9 +2556,15 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
         } else {
             scope_id = lexical_ancestor_of_kind(state, parent_id, true, true);
         }
-        /* Top-level/class callable declarations are themselves semantic
-         * targets, not local-value blockers. Nested declarations still bind
-         * their enclosing executable scope and must block raw-name fallback. */
+        /* A module function still binds its name when no target is proven.
+         * Callable bindings remain eligible for resolution; they are not
+         * unknown-value blockers. Methods do not bind a module identifier. */
+        if (scope_id == 0 && js &&
+            (strcmp(function_kind, "function_declaration") == 0 ||
+             strcmp(function_kind, "generator_function_declaration") == 0 ||
+             strcmp(function_kind, "function_signature") == 0)) {
+            scope_id = state->root_lexical_scope_id;
+        }
         if (scope_id == 0) {
             return;
         }

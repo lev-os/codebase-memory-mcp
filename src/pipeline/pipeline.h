@@ -364,6 +364,8 @@ bool cbm_node_props_generated(const char *properties_json);
 const char *cbm_def_js_global_name(const char *const *props);
 void cbm_registry_add_js_global(cbm_registry_t *registry, const char *name, const char *qn);
 void cbm_registry_add_js_global_node(cbm_registry_t *registry, const char *qn, const char *props);
+/* Includes ambiguous source-proven global bindings. */
+bool cbm_registry_has_js_global(const cbm_registry_t *registry, const char *name);
 bool cbm_receiver_suppress_name_guess(bool requires_proof, const char *strategy);
 
 /* True when a definition's extra_props carry CBM_PROP_FUNCTION_LOCAL: a

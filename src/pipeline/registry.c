@@ -1889,6 +1889,10 @@ bool cbm_receiver_suppress_name_guess(bool requires_proof, const char *strategy)
            (strncmp(strategy, "lsp_", 4) != 0 && strcmp(strategy, "import_binding") != 0 &&
             strcmp(strategy, "global_binding") != 0));
 }
+bool cbm_registry_has_js_global(const cbm_registry_t *r, const char *name) {
+    /* An ambiguous global is still a binding, even without an exact target. */
+    return r && r->js_globals && name && cbm_ht_get(r->js_globals, name) != NULL;
+}
 static cbm_resolution_t js_resolve_global(const cbm_registry_t *r, const char *name) {
     const char *qn = r->js_globals ? cbm_ht_get(r->js_globals, name) : NULL;
     return qn && qn[0] ? (cbm_resolution_t){.qualified_name = qn, .confidence = 0.95,
@@ -5766,6 +5770,11 @@ cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const
     if (js && call->callee_is_locally_bound) {
         return empty_result(); /* a parameter, variable or catch clause holds the callee */
     }
+    if (js && call->callee_is_unbound) {
+        /* Real module declarations are recorded as bindings. A same-file
+         * function value's private name is not visible outside that value. */
+        return js_resolve_global(r, callee_name);
+    }
     if (js) {
         bool no_edge = false;
         cbm_resolution_t member = resolve_js_this_member(
@@ -5780,9 +5789,6 @@ cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const
         js_nested_callable(r, res.qualified_name)) {
         return empty_result();
     }
-    if (js && call->callee_is_unbound &&
-        (!res.qualified_name || !res.qualified_name[0] || js_guess_refuted(r, call, module_qn, &res)))
-        return js_resolve_global(r, callee_name);
     if (js && js_guess_refuted(r, call, module_qn, &res)) {
         return empty_result();
     }

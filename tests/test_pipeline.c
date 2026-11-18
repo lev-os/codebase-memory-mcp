@@ -15455,16 +15455,17 @@ static int count_nodes_named(cbm_store_t *s, const char *project, const char *na
  * resolver is the one exercised. */
 enum { SMR_LANGS = 8, SMR_PAD_FILES = 52 };
 
-/* CALLS edges whose source and target qualified names end in `.caller` and
+/* Edges whose source and target qualified names end in `.caller` and
  * `.callee`. */
-static int smr_calls(cbm_store_t *s, const char *project, const char *caller, const char *callee) {
+static int smr_relationships(cbm_store_t *s, const char *project, const char *caller,
+                              const char *callee, const char *relation) {
     char src_tail[128];
     char tgt_tail[128];
     snprintf(src_tail, sizeof(src_tail), ".%s", caller);
     snprintf(tgt_tail, sizeof(tgt_tail), ".%s", callee);
     cbm_edge_t *edges = NULL;
     int edge_count = 0;
-    if (cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &edge_count) != CBM_STORE_OK) {
+    if (cbm_store_find_edges_by_type(s, project, relation, &edges, &edge_count) != CBM_STORE_OK) {
         return -1;
     }
     int hits = 0;
@@ -15490,6 +15491,10 @@ static int smr_calls(cbm_store_t *s, const char *project, const char *caller, co
         cbm_store_free_edges(edges, edge_count);
     }
     return hits;
+}
+
+static int smr_calls(cbm_store_t *s, const char *project, const char *caller, const char *callee) {
+    return smr_relationships(s, project, caller, callee, "CALLS");
 }
 
 static int check_same_module_bound_receiver(bool parallel) {
@@ -15665,7 +15670,7 @@ TEST(pipeline_tsjs_same_module_bound_receiver_not_bound_parallel) {
  * files, runs the sequential resolver or (padded past
  * MIN_FILES_FOR_PARALLEL, CBM_WORKERS pinned) the parallel one, and counts
  * the CALLS edges of each (caller tail, callee tail) pair. */
-enum { NG_MAX_PAIRS = 16, NG_PAD_FILES = 52 };
+enum { NG_MAX_PAIRS = 24, NG_PAD_FILES = 52 };
 
 typedef struct {
     const char *path;
@@ -15679,8 +15684,10 @@ typedef struct {
     const char *why;
 } ng_pair_t;
 
-static int ng_check(const ng_file_t *files, int nfiles, const ng_pair_t *pairs, int npairs,
-                    bool parallel) {
+static int ng_check_with_http(const ng_file_t *files, int nfiles, const ng_pair_t *pairs, int npairs,
+                    const ng_pair_t *http, int nhttp, bool parallel) {
+    int total = npairs + nhttp;
+    ASSERT_TRUE(total <= NG_MAX_PAIRS);
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_ng_XXXXXX");
     if (!cbm_mkdtemp(tmp)) {
@@ -15717,21 +15724,23 @@ static int ng_check(const ng_file_t *files, int nfiles, const ng_pair_t *pairs, 
     cbm_store_t *s = run_rc == 0 ? cbm_store_open_path(db_path) : NULL;
     bool store_opened = s != NULL;
     int got[NG_MAX_PAIRS];
-    for (int i = 0; i < npairs && i < NG_MAX_PAIRS; i++) {
-        got[i] = s ? smr_calls(s, cbm_pipeline_project_name(p), pairs[i].caller, pairs[i].callee)
-                   : -1;
-        if (s && strcmp(pairs[i].callee, "*") == 0) {
-            const char *leaf = strrchr(pairs[i].caller, '.');
+    for (int i = 0; i < total && i < NG_MAX_PAIRS; i++) {
+        const ng_pair_t *pair = i < npairs ? &pairs[i] : &http[i - npairs];
+        const char *relation = i < npairs ? "CALLS" : "HTTP_CALLS";
+        got[i] = s ? smr_relationships(s, cbm_pipeline_project_name(p), pair->caller, pair->callee,
+                                       relation) : -1;
+        if (s && strcmp(pair->callee, "*") == 0) {
+            const char *leaf = strrchr(pair->caller, '.');
             cbm_node_t *nodes = NULL;
             int count = 0;
             bool found = false;
-            cbm_store_find_nodes_by_name(s, cbm_pipeline_project_name(p), leaf ? leaf + 1 : pairs[i].caller,
+            cbm_store_find_nodes_by_name(s, cbm_pipeline_project_name(p), leaf ? leaf + 1 : pair->caller,
                                          &nodes, &count);
-            size_t len = strlen(pairs[i].caller);
+            size_t len = strlen(pair->caller);
             for (int j = 0; j < count; j++) {
                 size_t n = strlen(nodes[j].qualified_name);
                 if (n > len && nodes[j].qualified_name[n - len - 1] == '.' &&
-                    strcmp(nodes[j].qualified_name + n - len, pairs[i].caller) == 0)
+                    strcmp(nodes[j].qualified_name + n - len, pair->caller) == 0)
                     found = true;
             }
             cbm_store_free_nodes(nodes, count);
@@ -15739,7 +15748,10 @@ static int ng_check(const ng_file_t *files, int nfiles, const ng_pair_t *pairs, 
         }
     }
     bool mismatch = false;
-    for (int i = 0; i < npairs; i++) mismatch = mismatch || got[i] != pairs[i].want;
+    for (int i = 0; i < total; i++) {
+        const ng_pair_t *pair = i < npairs ? &pairs[i] : &http[i - npairs];
+        mismatch = mismatch || got[i] != pair->want;
+    }
     if (s && mismatch) {
         cbm_edge_t *edges = NULL;
         int count = 0;
@@ -15748,7 +15760,8 @@ static int ng_check(const ng_file_t *files, int nfiles, const ng_pair_t *pairs, 
             cbm_node_t source = {0}, target = {0};
             if (cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK &&
                 cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK)
-                printf("  actual %s -> %s\n", source.qualified_name, target.qualified_name);
+                printf("  actual %s -> %s (%s, %s)\n", source.qualified_name, target.qualified_name,
+                       target.label, edges[i].properties_json ? edges[i].properties_json : "{}");
             cbm_node_free_fields(&source);
             cbm_node_free_fields(&target);
         }
@@ -15772,18 +15785,112 @@ static int ng_check(const ng_file_t *files, int nfiles, const ng_pair_t *pairs, 
     ASSERT_EQ(restore_single_rc, 0);
     ASSERT_EQ(run_rc, 0);
     ASSERT_TRUE(store_opened);
-    ASSERT_TRUE(npairs <= NG_MAX_PAIRS);
     int bad = 0;
-    for (int i = 0; i < npairs; i++) {
-        if (got[i] != pairs[i].want) {
-            printf("  %s -> %s: %d edge(s), want %d (%s)\n", pairs[i].caller, pairs[i].callee,
-                   got[i], pairs[i].want, pairs[i].why);
+    for (int i = 0; i < total; i++) {
+        const ng_pair_t *pair = i < npairs ? &pairs[i] : &http[i - npairs];
+        if (got[i] != pair->want) {
+            printf("  %s %s -> %s: %d edge(s), want %d (%s)\n",
+                   i < npairs ? "CALLS" : "HTTP_CALLS", pair->caller, pair->callee,
+                   got[i], pair->want, pair->why);
             bad++;
         }
     }
     ASSERT_EQ(bad, 0);
     PASS();
 }
+
+static int ng_check(const ng_file_t *files, int nfiles, const ng_pair_t *pairs, int npairs,
+                    bool parallel) {
+    return ng_check_with_http(files, nfiles, pairs, npairs, NULL, 0, parallel);
+}
+
+static int check_x11b_bound_fetch(bool parallel) {
+    static const ng_file_t files[] = {
+        {"src/fetch_values.js",
+         "const hooks = { 'fetch': () => 0 };\n"
+         "export function load(fetch) { return fetch('/api/items'); }\n"
+         "export function local(value) { const fetch = value; return fetch('/api/items'); }\n"
+         "export function free() { return fetch('/api/items'); }\n"},
+        {"src/fetch_import.js",
+         "import { fetch } from 'external-client';\n"
+         "export function imported() { return fetch('/api/items'); }\n"},
+        {"src/fetch_root.js",
+         "export let fetch;\n"
+         "export function root() { return fetch('/api/items'); }\n"},
+        {"src/fetch_self.js",
+         "const hooks = { 'fetch': () => 0 };\n"
+         "function replacement() {}\n"
+         "export function fetch() { fetch = replacement; fetch('/api/items'); }\n"},
+        {"src/fetch_owned.js",
+         "export function fetch() { return fetch('/api/items'); }\n"},
+        {"src/fetch_known.js",
+         "import { fetch } from './fetch_owned';\n"
+         "export function known() { return fetch('/api/items'); }\n"},
+        {"src/fetch_expression.js",
+         "export const invoke = function fetch(replacement) {\n"
+         "  fetch = replacement; return fetch('/api/inside');\n"
+         "};\n"
+         "export function outside() { return fetch('/api/outside'); }\n"},
+    };
+    static const ng_pair_t calls[] = {
+        {"fetch_values.load", "*", 0, "unknown parameter is not a project callable"},
+        {"fetch_values.local", "*", 0, "unknown local is not a project callable"},
+        {"fetch_values.free", "*", 0, "global fetch has no CALLS target"},
+        {"fetch_import.imported", "*", 0, "external import has no project target"},
+        {"fetch_root.root", "*", 0, "unknown module value is not a project callable"},
+        {"fetch_self.fetch", "*", 0, "reassigned self target is rejected"},
+        {"fetch_owned.fetch", "*", 1, "proven immutable self call is kept"},
+        {"fetch_owned.fetch", "fetch_owned.fetch", 1, "exact self target"},
+        {"fetch_known.known", "*", 1, "proven import is kept"},
+        {"fetch_known.known", "fetch_owned.fetch", 1, "exact imported target"},
+        {"fetch_expression.fetch", "*", 0, "private expression name has an unknown written value"},
+        {"fetch_expression.outside", "*", 0, "private expression name does not bind the module"},
+    };
+    static const ng_pair_t http[] = {
+        {"fetch_values.load", "*", 0, "parameter spelling is not global fetch"},
+        {"fetch_values.local", "*", 0, "local spelling is not global fetch"},
+        {"fetch_values.free", "*", 1, "unbound fetch stays HTTP beside a literal key"},
+        {"fetch_import.imported", "*", 0, "unknown import is not global fetch"},
+        {"fetch_root.root", "*", 0, "module binding is not global fetch"},
+        {"fetch_self.fetch", "*", 0, "rejected self target must not fall back to HTTP"},
+        {"fetch_owned.fetch", "*", 0, "proven self call is not HTTP"},
+        {"fetch_known.known", "*", 0, "proven project import is not HTTP"},
+        {"fetch_expression.fetch", "*", 0, "private expression name is not global fetch"},
+        {"fetch_expression.outside", "*", 1, "outer unbound fetch stays HTTP"},
+    };
+    int values_rc = ng_check_with_http(files, 7, calls, (int)(sizeof(calls) / sizeof(calls[0])),
+                                      http, (int)(sizeof(http) / sizeof(http[0])), parallel);
+    static const ng_file_t globals[] = {
+        {"src/fetch_global_one.js", "function fetch(url) { return url; }\n"},
+        {"src/fetch_global_use.js", "const hooks = { 'fetch': () => 0 };\n"
+         "export function load() { return fetch('/api/global'); }\n"},
+        {"src/fetch_global_two.js", "function fetch(url) { return url; }\n"},
+    };
+    static const ng_pair_t global_calls[] = {
+        {"fetch_global_use.load", "fetch_global_one.fetch", 1, "source-proven project global"},
+        {"fetch_global_use.load", "*", 1, "complete outgoing set"},
+    };
+    static const ng_pair_t ambiguous_calls[] = {
+        {"fetch_global_use.load", "*", 0, "two project globals have no unique target"},
+    };
+    static const ng_pair_t global_http[] = {
+        {"fetch_global_use.load", "*", 0, "project global binding is not the native API"},
+    };
+    int global_rc = ng_check_with_http(globals, 2, global_calls, 2, global_http, 1, parallel);
+    int ambiguous_rc = ng_check_with_http(globals, 3, ambiguous_calls, 1, global_http, 1, parallel);
+    static const ng_file_t arkts[] = {
+        {"src/fetch_arkts.ets", "export function load() { return fetch('/api/native'); }\n"},
+    };
+    static const ng_pair_t arkts_calls[] = {{"fetch_arkts.load", "*", 0, "no project target"}};
+    static const ng_pair_t arkts_http[] = {
+        {"fetch_arkts.load", "*", 1, "retain native behavior without JS lexical facts"},
+    };
+    int arkts_rc = ng_check_with_http(arkts, 1, arkts_calls, 1, arkts_http, 1, parallel);
+    ASSERT_EQ(values_rc + global_rc + ambiguous_rc + arkts_rc, 0);
+    PASS();
+}
+TEST(pipeline_x11b_bound_fetch) { return check_x11b_bound_fetch(false); }
+TEST(pipeline_x11b_bound_fetch_parallel) { return check_x11b_bound_fetch(true); }
 
 /* The wildcard counts every outgoing CALLS edge; named pairs and that count
  * together assert the complete target set, including constructor calls. */
@@ -39374,6 +39481,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_module_callers_parallel);
     RUN_TEST(pipeline_tsjs_same_module_bound_receiver_not_bound);
     RUN_TEST(pipeline_tsjs_same_module_bound_receiver_not_bound_parallel);
+    RUN_TEST(pipeline_x11b_bound_fetch);
+    RUN_TEST(pipeline_x11b_bound_fetch_parallel);
     RUN_TEST(pipeline_x11b_default_scope);
     RUN_TEST(pipeline_x11b_default_scope_parallel);
     RUN_TEST(pipeline_x11b_import_values);

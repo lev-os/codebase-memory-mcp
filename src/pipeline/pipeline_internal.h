@@ -1842,7 +1842,11 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *     Unchanged files rebuild once to repair their CALLS edges. */
 /* 33: retained constant imports prove exact targets even when literal-key
  *     names require a binding. Rebuild unchanged importers once. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 33 };
+/* 34: native fetch needs an unbound name, not an unknown binding target.
+ *     Function declarations and expression names keep their real scopes.
+ *     Registry guesses cannot invoke data variables. Rebuild unchanged
+ *     JS/TS callers once to repair CALLS and HTTP_CALLS edges. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 34 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

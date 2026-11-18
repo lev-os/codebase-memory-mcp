@@ -1065,7 +1065,7 @@ static int calls_emit_unresolved_service(cbm_pipeline_ctx_t *ctx, const CBMCall 
         return SKIP_ONE;
     }
     cbm_svc_kind_t svc = cbm_service_pattern_match(call->callee_name);
-    if (svc == CBM_SVC_NONE && cbm_service_pattern_is_global_fetch(call->callee_name)) {
+    if (svc == CBM_SVC_NONE && cbm_pipeline_global_fetch_call(lang, call, ctx->registry)) {
         svc = CBM_SVC_HTTP;
     }
     return calls_emit_service_call(ctx, call, source_node, svc, NULL, evidence);
@@ -1580,12 +1580,13 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
                                                ctx->project_name));
     cbm_resolution_t res = {0};
     if (swift_candidates >= 0) {
-        /* A retained constant import is binding proof, even when a literal
-         * key of this name forbids name guesses. MUST match pass_parallel.c. */
+        /* Constant imports and verified project globals prove bindings.
+         * Unbound calls use only the global map, even when a literal key
+         * forbids name guesses. MUST match pass_parallel.c. */
         if (call->js_import_module && !rust_external && !php_vendor_call && !java_external)
             res = cbm_pipeline_js_import_value(ctx->gbuf, ctx->project_name, rel, call,
                                                imp_keys, imp_vals, imp_count);
-        else if (!call->requires_lsp_resolution)
+        else if (!call->requires_lsp_resolution || call->callee_is_unbound)
             res = calls_registry_resolution(ctx, call, module_qn, imp_keys, imp_vals, imp_count, lang,
                                         rust_external, php_vendor_call, java_external,
                                         cbm_pipeline_caller_is_test(source_node, rel, lang));
@@ -1777,7 +1778,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
                          !cbm_pipeline_exact_self_call(lang, call, &res))) {
         return 0;
     }
-    if (cbm_pipeline_js_type_only_target(lang, target_node)) {
+    if (cbm_pipeline_js_non_callable_guess(lang, target_node)) {
         drop_plain_call = true;
     }
     /* A call that resolved onto a struct Field: refused across languages and
