@@ -38680,8 +38680,50 @@ TEST(pipeline_js_self_edge_requires_unwritten_binding) {
     PASS();
 }
 
+TEST(pipeline_js_empty_and_quote_keys_are_distinct) {
+    static const char *const files[] = {"main.js",
+                                        "function work() {} function halt() {}\n"
+                                        "const ops = {\n"
+                                        "  ''() { work(); },\n"
+                                        "  '\"\"'() { halt(); },\n"
+                                        "  'a.b'() { work(); }\n"
+                                        "};\n"
+                                        "const alt = {\n"
+                                        "  ''() { halt(); },\n"
+                                        "  '\"\"'() { work(); },\n"
+                                        "  'a.b'() { halt(); }\n"
+                                        "};\n",
+                                        NULL};
+    static const struct {
+        int line;
+        const char *name, *qn, *target;
+    } cases[] = {{3, "\"\"", "main.ops.\"\"", "main.ops.\"\" -> main.work"},
+                 {4, "\"\"", "main.ops.%22%22", "main.ops.%22%22 -> main.halt"},
+                 {5, "a.b", "main.ops.a%2Eb", "main.ops.a%2Eb -> main.work"},
+                 {8, "\"\"", "main.alt.\"\"", "main.alt.\"\" -> main.halt"},
+                 {9, "\"\"", "main.alt.%22%22", "main.alt.%22%22 -> main.work"},
+                 {10, "a.b", "main.alt.a%2Eb", "main.alt.a%2Eb -> main.halt"}};
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        js_exact_run_t run;
+        ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            char got[1024];
+            js_twin_qn_at(run.db, run.project, "main.js", cases[i].name, cases[i].line, got,
+                          sizeof(got));
+            ok = js_twin_expect("quoted key QN", got, cases[i].qn) && ok;
+            js_twin_calls_at(run.db, run.project, "main.js", cases[i].line, got, sizeof(got));
+            ok = js_twin_expect("quoted key caller", got, cases[i].target) && ok;
+        }
+        js_exact_done(&run);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
     RUN_TEST(pipeline_js_self_edge_requires_unwritten_binding);
+    RUN_TEST(pipeline_js_empty_and_quote_keys_are_distinct);
     RUN_TEST(pipeline_js_quoted_callable_names);
     RUN_TEST(pipeline_js_quoted_key_keeps_lexical_binding);
     RUN_TEST(pipeline_js_reassigned_callable_has_no_self_edge);

@@ -1225,7 +1225,7 @@ char *cbm_js_literal_key_name(CBMArena *a, TSNode name_node, const char *source)
 /* One QN segment per key: '%', '.' and a key's own '"' are percent-escaped,
  * so `'a.b'` is not `a: { b }`, and no key is spelled like the empty `""`. */
 static char *js_literal_key_segment(CBMArena *a, char *key) {
-    if (!key || strcmp(key, "\"\"") == 0 || !strpbrk(key, "%.\"")) {
+    if (!key || !strpbrk(key, "%.\"")) {
         return key;
     }
     size_t len = strlen(key);
@@ -1283,6 +1283,11 @@ char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source,
     /* Literal JS/TS property names have one spelling in definitions and
      * caller scopes: the QN segment of cbm_js_literal_key_name. */
     if (text && cbm_js_literal_key_node(name_node, lang)) {
+        /* The sentinel belongs only to an empty source string. A real key
+         * containing two quotes must pass through percent encoding. */
+        if (strcmp(ts_node_type(name_node), "string") == 0 &&
+            ts_node_end_byte(name_node) - ts_node_start_byte(name_node) == 2)
+            return cbm_arena_strdup(a, "\"\"");
         return js_literal_key_segment(a, cbm_js_literal_key_name(a, name_node, source));
     }
     /* Nix quoted attrpath segment: `"kebab-case" = a: a;` and `services."my.svc" = …`

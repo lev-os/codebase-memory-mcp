@@ -15157,15 +15157,14 @@ static const char **js_twin_all_qns(const CBMExtractCtx *ctx, int *count) {
  * owner + name, unless another definition of the file holds that. */
 static const char *js_twin_preferred(CBMExtractCtx *ctx, const js_twin_member_t *m,
                                      const char *base, const char **all_qns, int nall) {
-    const char *name = m->defs[0]->name;
-    size_t bl = strlen(base);
-    size_t nl = strlen(name);
-    if (m->rank != JS_TWIN_RANK_NESTED || !m->owner || bl <= nl + SKIP_ONE ||
-        base[bl - nl - SKIP_ONE] != '.' || strcmp(base + bl - nl, name) != 0) {
+    /* The QN suffix is already encoded. Reuse that segment instead of
+     * comparing it with the raw literal name (a.b versus a%2Eb). */
+    const char *segment = strrchr(base, '.');
+    if (m->rank != JS_TWIN_RANK_NESTED || !m->owner || !segment || segment == base) {
         return base;
     }
-    const char *qn = cbm_arena_sprintf(ctx->arena, "%.*s.%s.%s", (int)(bl - nl - SKIP_ONE), base,
-                                       m->owner, name);
+    const char *qn = cbm_arena_sprintf(ctx->arena, "%.*s.%s.%s", (int)(segment - base), base,
+                                       m->owner, segment + 1);
     if (!qn || bsearch(&qn, all_qns, (size_t)nall, sizeof(*all_qns), js_qn_ptr_cmp)) {
         return base;
     }
