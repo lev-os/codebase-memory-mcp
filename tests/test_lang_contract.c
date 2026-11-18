@@ -479,16 +479,18 @@ TEST(contract_python_aliased_from_import_calls) {
     char **callees = NULL;
     int n_callers = 0;
     int n_callees = 0;
+    int caller_total = 0, callee_total = 0;
     ASSERT_EQ(cbm_store_node_neighbor_names(store, nodes[0].id, 32, &callers, &n_callers, &callees,
-                                            &n_callees),
+                                            &n_callees, &caller_total, &callee_total),
               0);
     int saw_execute = 0;
     int saw_alias_ghost = 0;
     for (int i = 0; i < n_callees; i++) {
-        if (callees[i] && strcmp(callees[i], "execute") == 0) {
+        const char *name = callees[i] ? strrchr(callees[i], '.') : NULL;
+        if (name && strcmp(name + 1, "execute") == 0) {
             saw_execute = 1;
         }
-        if (callees[i] && strcmp(callees[i], "bridge_execute") == 0) {
+        if (name && strcmp(name + 1, "bridge_execute") == 0) {
             saw_alias_ghost = 1;
         }
     }
@@ -529,16 +531,18 @@ TEST(contract_python_absolute_aliased_from_import_calls) {
     char **callees = NULL;
     int n_callers = 0;
     int n_callees = 0;
+    int caller_total = 0, callee_total = 0;
     ASSERT_EQ(cbm_store_node_neighbor_names(store, nodes[0].id, 32, &callers, &n_callers, &callees,
-                                            &n_callees),
+                                            &n_callees, &caller_total, &callee_total),
               0);
     int saw_execute = 0;
     int saw_alias_ghost = 0;
     for (int i = 0; i < n_callees; i++) {
-        if (callees[i] && strcmp(callees[i], "execute") == 0) {
+        const char *name = callees[i] ? strrchr(callees[i], '.') : NULL;
+        if (name && strcmp(name + 1, "execute") == 0) {
             saw_execute = 1;
         }
-        if (callees[i] && strcmp(callees[i], "bridge_execute") == 0) {
+        if (name && strcmp(name + 1, "bridge_execute") == 0) {
             saw_alias_ghost = 1;
         }
     }
@@ -573,8 +577,9 @@ TEST(contract_python_ghost_module_aliased_from_import_no_calls) {
     char **callees = NULL;
     int n_callers = 0;
     int n_callees = 0;
+    int caller_total = 0, callee_total = 0;
     ASSERT_EQ(cbm_store_node_neighbor_names(store, nodes[0].id, 32, &callers, &n_callers, &callees,
-                                            &n_callees),
+                                            &n_callees, &caller_total, &callee_total),
               0);
     int saw_any_callee = 0;
     for (int i = 0; i < n_callees; i++) {

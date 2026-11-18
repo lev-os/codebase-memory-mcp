@@ -258,9 +258,7 @@ static char *read_file(const char *path, int *out_len, long *out_size,
         }
         return NULL;
     }
-    (void)fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    (void)fseek(f, 0, SEEK_SET);
+    long size = cbm_pipeline_open_file_size(f);
     if (out_size) {
         *out_size = size;
     }
@@ -1847,6 +1845,8 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
             cbm_registry_add_lang_in_module(ctx->registry, def->name, def->qualified_name,
                                             def->label, lang, module_prefix_len, is_test);
         }
+        cbm_registry_add_js_global(ctx->registry, cbm_def_js_global_name(def->extra_props),
+                                    def->qualified_name);
         if (lang == CBM_LANG_SWIFT && def->qn_sig_off) {
             cbm_registry_set_swift_signature(ctx->registry, def->qualified_name,
                                              def->param_default_mask, def->selector_param_count,
@@ -2984,7 +2984,9 @@ static bool emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
      * fetch wrapper). On a classified HTTP call it only minted a method-less
      * __route__ANY__ twin of the typed edge, which cross-repo matching then
      * bound to server handlers of any method. */
-    if (!http_edge_emitted) {
+    /* Bare fetch has one classifier: the unresolved global-binding path.
+     * A URL argument cannot reinterpret a project or unknown bound value. */
+    if (!http_edge_emitted && !cbm_service_pattern_is_global_fetch(call->callee_name)) {
         detect_url_in_args(gbuf, source, call, svc, pp_client_navigation_lang(lang));
     }
     return calls_emitted;
@@ -3525,10 +3527,15 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                                           module_qn, imp_vals, imp_count,
                                                           candidates, CBM_SZ_256);
         }
-        if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution &&
+        if ((!res.qualified_name || !res.qualified_name[0]) &&
             !rust_external && !php_vendor_call && !java_external && count == 0) {
-            /* Python LEGB fallback first (MUST match pass_calls.c). */
-            res = cbm_registry_resolve_call_scoped(
+            /* Constant imports and global-only unbound lookups prove their
+             * bindings; name guesses keep the veto. MUST match pass_calls.c. */
+            if (call->js_import_module)
+                res = cbm_pipeline_js_import_value(rc->main_gbuf, rc->project_name, rel, call,
+                                                   imp_keys, imp_vals, imp_count);
+            else if (!call->requires_lsp_resolution || call->callee_is_unbound)
+                res = cbm_registry_resolve_call_scoped(
                 rc->registry, call, module_qn, imp_keys, imp_vals, imp_count, lang,
                 cbm_pipeline_caller_is_test(source_node, rel, lang));
         }
@@ -3630,7 +3637,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * bound by a package specifier. Suppress only the plain-CALLS
          * fall-through so every Route node stays main-identical. */
         bool drop_plain_call =
-            call->receiver_requires_lsp ||
+            cbm_receiver_suppress_name_guess(call->receiver_requires_lsp, res.strategy) ||
             (cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) &&
              !cbm_weak_member_unique_name_exempt(lang == CBM_LANG_PYTHON,
                                                  call->receiver_is_self_attribute,
@@ -3768,7 +3775,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                     emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &fake_res,
                                       module_qn, rc->project_name, rc->registry, rc->main_gbuf,
                                       imp_keys, imp_vals, imp_count, true, route_mount, lang);
-            } else if (cbm_service_pattern_is_global_fetch(call->callee_name)) {
+            } else if (cbm_pipeline_global_fetch_call(lang, call, rc->registry)) {
                 /* Native `fetch()` (#856): only the global API once resolution
                  * has failed to find a local/imported `fetch`. Call the low-level
                  * emitter directly — emit_service_edge re-derives its own kind

@@ -149,11 +149,14 @@ int cbm_store_list_files(cbm_store_t *s, const char *project, char ***out, int *
 int cbm_store_get_format_version(cbm_store_t *s, int *out);
 int cbm_store_set_format_version(cbm_store_t *s, int version);
 
-/* Get caller/callee names for a node (CALLS/HTTP_CALLS/ASYNC_CALLS edges).
+/* Get distinct qualified caller/callee names and full neighbor totals over
+ * CALLS/HTTP_CALLS/ASYNC_CALLS edges. Counts describe the returned name
+ * arrays; totals include rows beyond the positive limit. Self edges are excluded.
  * Returns 0 on success. Caller must free each out_callers[i]/out_callees[i]
  * and the arrays themselves. */
 int cbm_store_node_neighbor_names(cbm_store_t *s, int64_t node_id, int limit, char ***out_callers,
-                                  int *caller_count, char ***out_callees, int *callee_count);
+                                  int *caller_count, char ***out_callees, int *callee_count,
+                                  int *caller_total, int *callee_total);
 
 /* Batch count in/out degree for multiple nodes.
  * edge_type: filter by edge type (e.g. "CALLS"), or NULL/"" for all types.

@@ -1,3 +1,4 @@
+#include "js_scope.h"
 #include "callable_overload.h"
 #include "cbm.h"
 #include "callable_sig.h"
@@ -9086,7 +9087,7 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     def.label = label;
     def.file_path = ctx->rel_path;
     if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
-        ctx->language == CBM_LANG_TSX)
+        ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS)
         def.node_start_byte = ts_node_start_byte(node);
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
@@ -14402,13 +14403,6 @@ static bool js_twin_lang(CBMLanguage lang) {
 }
 
 /* Callable kinds with a body, which a call can sit in. */
-static bool js_twin_bodied_kind(const char *k) {
-    return strcmp(k, "function_declaration") == 0 ||
-           strcmp(k, "generator_function_declaration") == 0 ||
-           strcmp(k, "function_expression") == 0 || strcmp(k, "function") == 0 ||
-           strcmp(k, "generator_function") == 0 || strcmp(k, "arrow_function") == 0 ||
-           strcmp(k, "method_definition") == 0;
-}
 
 static bool js_twin_function_value_kind(const char *k) {
     return strcmp(k, "function_expression") == 0 || strcmp(k, "function") == 0 ||
@@ -14420,7 +14414,7 @@ static bool js_twin_function_value_kind(const char *k) {
 static bool js_twin_in_body(const TSNode *anc, int depth) {
     for (int i = 0; i < depth; i++) {
         const char *k = ts_node_type(anc[i]);
-        if (js_twin_bodied_kind(k) || strcmp(k, "class_static_block") == 0) {
+        if (cbm_js_bodied_kind(k) || strcmp(k, "class_static_block") == 0) {
             return true;
         }
     }
@@ -14676,7 +14670,7 @@ static const char *js_twin_owner(CBMExtractCtx *ctx, const TSNode *anc, int dept
             }
             continue;
         }
-        if (js_twin_bodied_kind(k)) {
+        if (cbm_js_bodied_kind(k)) {
             if (js_twin_callable_name(ctx, x, parent, &seg[n], &seg_len[n])) {
                 n++;
                 named = true;
@@ -14851,16 +14845,8 @@ static void js_twin_pattern_decls(js_twin_walk_t *w, TSNode pat, uint32_t lo, ui
         js_twin_add_decl(w, pat, lo, hi, (TSNode){0}, true);
         return;
     }
-    TSNode sub = {0};
-    if (strcmp(k, "required_parameter") == 0 || strcmp(k, "optional_parameter") == 0) {
-        sub = ts_node_child_by_field_name(pat, TS_FIELD("pattern"));
-    } else if (strcmp(k, "assignment_pattern") == 0 ||
-               strcmp(k, "object_assignment_pattern") == 0) {
-        sub = ts_node_child_by_field_name(pat, TS_FIELD("left"));
-    } else if (strcmp(k, "pair_pattern") == 0) {
-        sub = ts_node_child_by_field_name(pat, TS_FIELD("value"));
-    } else if (strcmp(k, "formal_parameters") == 0 || strcmp(k, "object_pattern") == 0 ||
-               strcmp(k, "array_pattern") == 0 || strcmp(k, "rest_pattern") == 0) {
+    TSNode sub = cbm_js_pattern_child(pat);
+    if (cbm_js_pattern_container(k)) {
         uint32_t nc = ts_node_named_child_count(pat);
         for (uint32_t i = 0; i < nc; i++) {
             js_twin_pattern_decls(w, ts_node_named_child(pat, i), lo, hi, depth + SKIP_ONE);
@@ -14878,20 +14864,8 @@ static void js_twin_pattern_decls(js_twin_walk_t *w, TSNode pat, uint32_t lo, ui
 static bool js_twin_scope(const TSNode *anc, int depth, bool var_scope, uint32_t *lo,
                           uint32_t *hi) {
     for (int i = depth - SKIP_ONE; i >= 0; i--) {
-        const char *k = ts_node_type(anc[i]);
-        bool hit = strcmp(k, "program") == 0 || strcmp(k, "class_static_block") == 0;
-        TSNode at = anc[i];
-        if (var_scope) {
-            if (js_twin_bodied_kind(k)) {
-                TSNode body = ts_node_child_by_field_name(anc[i], TS_FIELD("body"));
-                hit = true;
-                at = ts_node_is_null(body) ? anc[i] : body;
-            }
-        } else {
-            hit = hit || strcmp(k, "statement_block") == 0 || strcmp(k, "switch_body") == 0 ||
-                  strcmp(k, "for_statement") == 0 || strcmp(k, "for_in_statement") == 0;
-        }
-        if (hit) {
+        TSNode at = cbm_js_scope_node(anc[i], var_scope);
+        if (!ts_node_is_null(at)) {
             *lo = ts_node_start_byte(at);
             *hi = ts_node_end_byte(at);
             return true;
@@ -14905,7 +14879,7 @@ static void js_twin_node_decls(js_twin_walk_t *w, TSNode n, const char *k, const
                                int depth) {
     uint32_t lo = 0;
     uint32_t hi = 0;
-    if (js_twin_bodied_kind(k)) {
+    if (cbm_js_bodied_kind(k)) {
         /* Parameters bind in the callable; a function expression's own name
          * only inside it; a declaration's in the block around it. */
         TSNode params = ts_node_child_by_field_name(n, TS_FIELD("parameters"));
@@ -14928,7 +14902,7 @@ static void js_twin_node_decls(js_twin_walk_t *w, TSNode n, const char *k, const
         TSNode name = ts_node_child_by_field_name(n, TS_FIELD("name"));
         TSNode value = ts_node_child_by_field_name(n, TS_FIELD("value"));
         if (!ts_node_is_null(name) && strcmp(ts_node_type(name), "identifier") == 0) {
-            bool callable = !ts_node_is_null(value) && js_twin_bodied_kind(ts_node_type(value));
+            bool callable = !ts_node_is_null(value) && cbm_js_bodied_kind(ts_node_type(value));
             js_twin_add_decl(w, name, lo, hi, callable ? value : (TSNode){0}, true);
         } else {
             js_twin_pattern_decls(w, name, lo, hi, 0);
@@ -14980,7 +14954,7 @@ static bool js_twin_walk(js_twin_walk_t *w) {
     for (;;) {
         TSNode n = ts_tree_cursor_current_node(&cur);
         const char *k = ts_node_is_named(n) ? ts_node_type(n) : NULL;
-        if (k && js_twin_bodied_kind(k)) {
+        if (k && cbm_js_bodied_kind(k)) {
             uint32_t byte = ts_node_start_byte(n);
             js_twin_member_t *m = bsearch(&byte, w->members, (size_t)w->nmembers,
                                           sizeof(*w->members), js_twin_member_start_cmp);
@@ -15821,7 +15795,7 @@ static bool js_return_static_data(CBMExtractCtx *ctx, TSNode object, const char 
         TSNode value = cbm_ts_unwrap_value(ts_node_child_by_field_name(member, "value", 5));
         if (found || decorated ||
             (strcmp(kind, "public_field_definition") != 0 && strcmp(kind, "field_definition") != 0) ||
-            (!ts_node_is_null(value) && js_twin_bodied_kind(ts_node_type(value))))
+            (!ts_node_is_null(value) && cbm_js_bodied_kind(ts_node_type(value))))
             return false;
         found = true;
     }
@@ -16282,7 +16256,7 @@ static TSNode js_shorthand_callable(CBMExtractCtx *ctx, JsShorthandIndex *idx, T
                strcmp(kind, "generator_function_declaration") != 0) {
         return (TSNode){0};
     }
-    if (ts_node_is_null(fn) || !js_twin_bodied_kind(ts_node_type(fn)))
+    if (ts_node_is_null(fn) || !cbm_js_bodied_kind(ts_node_type(fn)))
         return (TSNode){0};
     return fn;
 }
@@ -16304,7 +16278,7 @@ static const char **js_object_members(CBMExtractCtx *ctx, JsShorthandIndex *idx,
         if (strcmp(kind, "pair") == 0) {
             name = ts_node_child_by_field_name(member, "key", 3);
             fn = cbm_ts_unwrap_value(ts_node_child_by_field_name(member, "value", 5));
-            if (ts_node_is_null(fn) || !js_twin_bodied_kind(ts_node_type(fn)))
+            if (ts_node_is_null(fn) || !cbm_js_bodied_kind(ts_node_type(fn)))
                 fn = (TSNode){0};
         } else if (strcmp(kind, "shorthand_property_identifier") == 0) {
             name = member;
@@ -16373,8 +16347,18 @@ static const char **js_object_members(CBMExtractCtx *ctx, JsShorthandIndex *idx,
 /* A default export reads a module binding, never a nested namesake. */
 static TSNode js_module_binding(CBMExtractCtx *ctx, const char *name) {
     TSNode found = {0};
-    for (uint32_t i = 0; name && i < ts_node_named_child_count(ctx->root); i++) {
-        TSNode node = ts_node_named_child(ctx->root, i);
+    if (!name)
+        return found;
+    /* A cursor keeps this walk linear on a file with many top-level statements. */
+    TSTreeCursor top = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&top)) {
+        ts_tree_cursor_delete(&top);
+        return found;
+    }
+    do {
+        TSNode node = ts_tree_cursor_current_node(&top);
+        if (!ts_node_is_named(node))
+            continue;
         if (strcmp(ts_node_type(node), "export_statement") == 0)
             node = ts_node_child_by_field_name(node, "declaration", 11);
         if (ts_node_is_null(node))
@@ -16393,11 +16377,14 @@ static TSNode js_module_binding(CBMExtractCtx *ctx, const char *name) {
             TSNode binding = ts_node_child_by_field_name(decl, "name", 4);
             if (ts_node_is_null(binding) || !js_node_text_is(binding, ctx->source, name))
                 continue;
-            if (!ts_node_is_null(found))
+            if (!ts_node_is_null(found)) {
+                ts_tree_cursor_delete(&top);
                 return (TSNode){0}; /* Ambiguous declarations have no exact value. */
+            }
             found = decl;
         }
-    }
+    } while (ts_tree_cursor_goto_next_sibling(&top));
+    ts_tree_cursor_delete(&top);
     return found;
 }
 
@@ -16449,16 +16436,20 @@ static void js_record_object_members(CBMExtractCtx *ctx, int mod_idx) {
         needed |= ctx->result->defs.items[i].js_object_literal ||
                   (ctx->result->defs.items[i].label &&
                    strcmp(ctx->result->defs.items[i].label, "Class") == 0);
-    for (uint32_t i = 0; !needed && i < ts_node_named_child_count(ctx->root); i++) {
-        TSNode node = ts_node_named_child(ctx->root, i);
-        int aliases = 0;
-        if (strcmp(ts_node_type(node), "export_statement") == 0) {
-            for (uint32_t j = 0; j < ts_node_child_count(node); j++)
-                needed |= strcmp(ts_node_type(ts_node_child(node, j)), "default") == 0;
-            js_default_specifier(ctx, node, &aliases);
-            needed |= aliases > 0;
-        }
+    TSTreeCursor roots = ts_tree_cursor_new(ctx->root);
+    if (!needed && ts_tree_cursor_goto_first_child(&roots)) {
+        do {
+            TSNode node = ts_tree_cursor_current_node(&roots);
+            int aliases = 0;
+            if (strcmp(ts_node_type(node), "export_statement") == 0) {
+                for (uint32_t j = 0; j < ts_node_child_count(node); j++)
+                    needed |= strcmp(ts_node_type(ts_node_child(node, j)), "default") == 0;
+                js_default_specifier(ctx, node, &aliases);
+                needed |= aliases > 0;
+            }
+        } while (!needed && ts_tree_cursor_goto_next_sibling(&roots));
     }
+    ts_tree_cursor_delete(&roots);
     if (!needed)
         return;
     int count = ctx->result->defs.count;
@@ -16480,7 +16471,7 @@ static void js_record_object_members(CBMExtractCtx *ctx, int mod_idx) {
             TSNode callable =
                 method ? node : cbm_ts_unwrap_value(ts_node_child_by_field_name(node, "value", 5));
             if (!method && !ts_node_is_null(callable) &&
-                !js_twin_bodied_kind(ts_node_type(callable)))
+                !cbm_js_bodied_kind(ts_node_type(callable)))
                 callable = (TSNode){0};
             bool is_static = false;
             for (uint32_t i = 0; i < ts_node_child_count(node); i++)
@@ -16526,69 +16517,72 @@ static void js_record_object_members(CBMExtractCtx *ctx, int mod_idx) {
     }
 defaults:
     ts_tree_cursor_delete(&cursor);
-    uint32_t n = ts_node_named_child_count(ctx->root);
     int defaults = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        TSNode stmt = ts_node_named_child(ctx->root, i);
-        if (strcmp(ts_node_type(stmt), "export_statement") != 0)
-            continue;
-        bool is_default = false;
-        for (uint32_t j = 0; j < ts_node_child_count(stmt); j++)
-            is_default |= strcmp(ts_node_type(ts_node_child(stmt, j)), "default") == 0;
-        TSNode value = cbm_ts_unwrap_value(ts_node_child_by_field_name(stmt, "value", 5));
-        /* `export { run as default }` binds the default as `export default run` does. */
-        if (is_default)
-            defaults++;
-        else
-            value = js_default_specifier(ctx, stmt, &defaults);
-        if (!is_default && ts_node_is_null(value))
-            continue;
-        TSNode declaration = ts_node_child_by_field_name(stmt, "declaration", 11);
-        if (!ts_node_is_null(declaration)) {
-            TSNode name = ts_node_child_by_field_name(declaration, "name", 4);
-            const char *text =
-                ts_node_is_null(name) ? NULL : cbm_node_text(ctx->arena, name, ctx->source);
-            for (int j = 0; text && j < count; j++) {
-                CBMDefinition *d = &ctx->result->defs.items[j];
-                if (d->name && strcmp(d->name, text) == 0 && !d->parent_class &&
-                    d->node_start_byte == ts_node_start_byte(declaration) &&
-                    (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Class") == 0))
-                    mod->alias_target = d->qualified_name;
-            }
-        }
-        if (ts_node_is_null(value))
-            continue;
-        mod->return_type = "unknown";
-        if (cbm_ts_plain_object(value)) {
-            mod->js_object_literal = true;
-            mod->js_object_members = js_object_members(ctx, &idx, value, defs, count);
-        } else if (strcmp(ts_node_type(value), "identifier") == 0) {
-            const char *name = cbm_node_text(ctx->arena, value, ctx->source);
-            TSNode binding = js_module_binding(ctx, name);
-            if (ts_node_is_null(binding))
+    cursor = ts_tree_cursor_new(ctx->root);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode stmt = ts_tree_cursor_current_node(&cursor);
+            if (strcmp(ts_node_type(stmt), "export_statement") != 0)
                 continue;
-            TSNode fn = cbm_ts_unwrap_value(ts_node_child_by_field_name(binding, "value", 5));
-            uint32_t start = ts_node_start_byte(binding);
-            for (int j = 0; j < count; j++) {
-                CBMDefinition *d = &ctx->result->defs.items[j];
-                bool callable_value = !ts_node_is_null(fn) &&
-                                      d->node_start_byte == ts_node_start_byte(fn);
-                if (!d->name || !name || strcmp(d->name, name) != 0 ||
-                    (d->node_start_byte != start && !callable_value))
-                    continue;
-                if (strcmp(d->label, "Variable") == 0) {
-                    mod->return_type = d->return_type ? d->return_type : "unknown";
-                    mod->ts_return_scope_safe = d->ts_return_scope_safe;
-                    mod->ts_return_constructor = d->ts_return_constructor;
-                    mod->js_object_literal = d->js_object_literal;
-                    mod->js_object_members = d->js_object_members;
-                } else if (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Class") == 0) {
-                    mod->return_type = NULL;
-                    mod->alias_target = d->qualified_name;
+            bool is_default = false;
+            for (uint32_t j = 0; j < ts_node_child_count(stmt); j++)
+                is_default |= strcmp(ts_node_type(ts_node_child(stmt, j)), "default") == 0;
+            TSNode value = cbm_ts_unwrap_value(ts_node_child_by_field_name(stmt, "value", 5));
+            /* `export { run as default }` binds the default as `export default run` does. */
+            if (is_default)
+                defaults++;
+            else
+                value = js_default_specifier(ctx, stmt, &defaults);
+            if (!is_default && ts_node_is_null(value))
+                continue;
+            TSNode declaration = ts_node_child_by_field_name(stmt, "declaration", 11);
+            if (!ts_node_is_null(declaration)) {
+                TSNode name = ts_node_child_by_field_name(declaration, "name", 4);
+                const char *text =
+                    ts_node_is_null(name) ? NULL : cbm_node_text(ctx->arena, name, ctx->source);
+                for (int j = 0; text && j < count; j++) {
+                    CBMDefinition *d = &ctx->result->defs.items[j];
+                    if (d->name && strcmp(d->name, text) == 0 && !d->parent_class &&
+                        d->node_start_byte == ts_node_start_byte(declaration) &&
+                        (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Class") == 0))
+                        mod->alias_target = d->qualified_name;
                 }
             }
-        }
+            if (ts_node_is_null(value))
+                continue;
+            mod->return_type = "unknown";
+            if (cbm_ts_plain_object(value)) {
+                mod->js_object_literal = true;
+                mod->js_object_members = js_object_members(ctx, &idx, value, defs, count);
+            } else if (strcmp(ts_node_type(value), "identifier") == 0) {
+                const char *name = cbm_node_text(ctx->arena, value, ctx->source);
+                TSNode binding = js_module_binding(ctx, name);
+                if (ts_node_is_null(binding))
+                    continue;
+                TSNode fn = cbm_ts_unwrap_value(ts_node_child_by_field_name(binding, "value", 5));
+                uint32_t start = ts_node_start_byte(binding);
+                for (int j = 0; j < count; j++) {
+                    CBMDefinition *d = &ctx->result->defs.items[j];
+                    bool callable_value = !ts_node_is_null(fn) &&
+                                          d->node_start_byte == ts_node_start_byte(fn);
+                    if (!d->name || !name || strcmp(d->name, name) != 0 ||
+                        (d->node_start_byte != start && !callable_value))
+                        continue;
+                    if (strcmp(d->label, "Variable") == 0) {
+                        mod->return_type = d->return_type ? d->return_type : "unknown";
+                        mod->ts_return_scope_safe = d->ts_return_scope_safe;
+                        mod->ts_return_constructor = d->ts_return_constructor;
+                        mod->js_object_literal = d->js_object_literal;
+                        mod->js_object_members = d->js_object_members;
+                    } else if (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Class") == 0) {
+                        mod->return_type = NULL;
+                        mod->alias_target = d->qualified_name;
+                    }
+                }
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
     }
+    ts_tree_cursor_delete(&cursor);
     if (defaults > 1) { /* Two default exports bind no one value. */
         mod->alias_target = NULL;
         mod->return_type = "unknown";

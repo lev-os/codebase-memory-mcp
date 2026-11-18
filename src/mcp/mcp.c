@@ -11284,6 +11284,9 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                                              .do_inbound = do_inbound};
     trace_call_coverage(store, project, &coverage_scope, trace_includes_calls, &unresolved_out,
                         &unresolved_in);
+    bool callable_roots = node_count > 0;
+    for (int i = 0; i < node_count; i++)
+        callable_roots &= trace_label_is_callable(nodes[i].label);
     trace_recursion_t recursion = trace_recursion_metadata(nodes, node_count);
     const char *out_relation = unresolved_out ? "unknown" : (tr_out.truncated ? "gte" : "eq");
     const char *in_relation = unresolved_in ? "unknown" : (tr_in.truncated ? "gte" : "eq");
@@ -11365,7 +11368,8 @@ render_trace_output:;
         if (mode) {
             cbm_tree_scalar_str(&sb, "mode", mode);
         }
-        trace_recursion_tree(&sb, &recursion, trace_includes_calls);
+        if (callable_roots)
+            trace_recursion_tree(&sb, &recursion, trace_includes_calls);
         /* Grouped tree is THE default; risk_labels/data_flow keep the flat
          * table (extra columns) in the same tree syntax. */
         bool render_risk = risk_labels && emit_optional_fields;
@@ -11461,7 +11465,8 @@ render_trace_output:;
         if (mode) {
             yyjson_mut_obj_add_str(doc, root, "mode", mode);
         }
-        trace_recursion_json(doc, root, &recursion, trace_includes_calls);
+        if (callable_roots)
+            trace_recursion_json(doc, root, &recursion, trace_includes_calls);
         if (do_outbound) {
             yyjson_mut_obj_add_int(doc, root, "callees_total", out_total);
             yyjson_mut_obj_add_str(doc, root, "callees_total_relation", out_relation);
@@ -11547,7 +11552,8 @@ render_trace_output:;
             if (!trace_legacy_json) {
                 cbm_sb_t floor;
                 cbm_sb_init(&floor);
-                trace_recursion_tree(&floor, &recursion, trace_includes_calls);
+                if (callable_roots)
+                    trace_recursion_tree(&floor, &recursion, trace_includes_calls);
                 if (do_outbound) {
                     cbm_tree_scalar_int(&floor, "callees_total", out_total);
                     cbm_tree_scalar_str(&floor, "callees_total_relation", out_relation);
@@ -11579,7 +11585,8 @@ render_trace_output:;
                 yyjson_mut_doc *floor_doc = yyjson_mut_doc_new(NULL);
                 yyjson_mut_val *floor = yyjson_mut_obj(floor_doc);
                 yyjson_mut_doc_set_root(floor_doc, floor);
-                trace_recursion_json(floor_doc, floor, &recursion, trace_includes_calls);
+                if (callable_roots)
+                    trace_recursion_json(floor_doc, floor, &recursion, trace_includes_calls);
                 if (do_outbound) {
                     yyjson_mut_obj_add_int(floor_doc, floor, "callees_total", out_total);
                     yyjson_mut_obj_add_str(floor_doc, floor, "callees_total_relation",
@@ -15018,7 +15025,15 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     cbm_store_t *store = srv->store;
     int in_deg = 0;
     int out_deg = 0;
-    cbm_store_node_degree(store, node->id, &in_deg, &out_deg);
+    char **nb_callers = NULL;
+    int nb_caller_count = 0;
+    char **nb_callees = NULL;
+    int nb_callee_count = 0;
+    /* The same grouped edge query supplies totals and qualified identities.
+     * Fetch one row for totals when names were not requested. */
+    cbm_store_node_neighbor_names(store, node->id, include_neighbors ? MCP_DEFAULT_LIMIT : 1,
+                                  &nb_callers, &nb_caller_count, &nb_callees, &nb_callee_count,
+                                  &in_deg, &out_deg);
     yyjson_mut_obj_add_int(doc, root_obj, "callers", in_deg);
     yyjson_mut_obj_add_int(doc, root_obj, "callees", out_deg);
     if (trace_label_is_callable(node->label)) {
@@ -15028,15 +15043,13 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
 
     add_snippet_coverage_note(doc, root_obj, store, node);
 
-    char **nb_callers = NULL;
-    int nb_caller_count = 0;
-    char **nb_callees = NULL;
-    int nb_callee_count = 0;
     if (include_neighbors) {
-        cbm_store_node_neighbor_names(store, node->id, MCP_DEFAULT_LIMIT, &nb_callers,
-                                      &nb_caller_count, &nb_callees, &nb_callee_count);
         add_string_array(doc, root_obj, "caller_names", nb_callers, nb_caller_count);
         add_string_array(doc, root_obj, "callee_names", nb_callees, nb_callee_count);
+        if (nb_caller_count < in_deg)
+            yyjson_mut_obj_add_bool(doc, root_obj, "caller_names_truncated", true);
+        if (nb_callee_count < out_deg)
+            yyjson_mut_obj_add_bool(doc, root_obj, "callee_names_truncated", true);
     }
 
     /* Alternatives (when auto-resolved from ambiguous) */

@@ -336,12 +336,21 @@ static inline bool cbm_ts_plain_object(TSNode node) {
 /* A script (no import or export statement) keeps its top-level bindings in
  * the global scope, where an indirect eval runs. */
 static inline bool cbm_ts_script(TSNode root) {
-    for (uint32_t i = 0; i < ts_node_named_child_count(root); i++) {
-        const char *kind = ts_node_type(ts_node_named_child(root, i));
-        if (strcmp(kind, "import_statement") == 0 || strcmp(kind, "export_statement") == 0)
-            return false;
+    /* A cursor keeps this linear: an indexed child read restarts from the
+     * first child, and a wide script file then costs n * n. */
+    bool script = true;
+    TSTreeCursor top = ts_tree_cursor_new(root);
+    if (ts_tree_cursor_goto_first_child(&top)) {
+        do {
+            const char *kind = ts_node_type(ts_tree_cursor_current_node(&top));
+            if (strcmp(kind, "import_statement") == 0 || strcmp(kind, "export_statement") == 0) {
+                script = false;
+                break;
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&top));
     }
-    return true;
+    ts_tree_cursor_delete(&top);
+    return script;
 }
 
 /* An indirect eval: `globalThis.eval(...)`, `window.eval(...)`, `self.eval`,

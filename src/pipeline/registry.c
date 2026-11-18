@@ -149,6 +149,7 @@ struct cbm_registry {
 
     /* byName: simpleName → qn_array_t* (heap-owned) */
     CBMHashTable *by_name;
+    CBMHashTable *js_globals; /* global identifier -> exact QN; empty means ambiguous */
 
     CBMHashTable *swift_signatures; /* borrowed exact-map keys; owned values */
     CBMHashTable *swift_overloads;  /* base callable QN -> overloads */
@@ -1735,6 +1736,10 @@ void cbm_registry_free(cbm_registry_t *r) {
     /* by_name first: its items borrow exact's keys. */
     cbm_ht_foreach(r->by_name, free_qn_array, NULL);
     cbm_ht_free(r->by_name);
+    if (r->js_globals) {
+        cbm_ht_foreach(r->js_globals, free_label, NULL);
+        cbm_ht_free(r->js_globals);
+    }
     if (r->swift_signatures) {
         cbm_ht_foreach(r->swift_signatures, free_swift_signature, NULL);
         cbm_ht_free(r->swift_signatures);
@@ -1851,6 +1856,48 @@ bool cbm_registry_qn_is_function_local(const cbm_registry_t *r, const char *qual
         }
     }
     return false;
+}
+
+const char *cbm_def_js_global_name(const char *const *props) {
+    for (int i = 0; props && props[i] && props[i + 1]; i += 2)
+        if (strcmp(props[i], CBM_PROP_JS_GLOBAL_NAME) == 0) return props[i + 1];
+    return NULL;
+}
+void cbm_registry_add_js_global(cbm_registry_t *r, const char *name, const char *qn) {
+    if (!r || !name || !qn) return;
+    const char *owned = cbm_ht_get_key(r->exact, qn);
+    if (!owned) return;
+    if (!r->js_globals) r->js_globals = cbm_ht_create(64);
+    if (!r->js_globals) return;
+    const char *old = cbm_ht_get(r->js_globals, name);
+    if (old) {
+        if (strcmp(old, owned) != 0) cbm_ht_set(r->js_globals, cbm_ht_get_key(r->js_globals, name), (void *)"");
+    } else {
+        char *key = strdup(name);
+        if (key) cbm_ht_set(r->js_globals, key, (void *)owned);
+    }
+}
+void cbm_registry_add_js_global_node(cbm_registry_t *r, const char *qn, const char *props) {
+    if (!props || !strstr(props, CBM_PROP_JS_GLOBAL_NAME)) return;
+    yyjson_doc *doc = yyjson_read(props, strlen(props), 0);
+    const char *name = doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), CBM_PROP_JS_GLOBAL_NAME)) : NULL;
+    cbm_registry_add_js_global(r, name, qn);
+    if (doc) yyjson_doc_free(doc);
+}
+bool cbm_receiver_suppress_name_guess(bool requires_proof, const char *strategy) {
+    return requires_proof && (!strategy ||
+           (strncmp(strategy, "lsp_", 4) != 0 && strcmp(strategy, "import_binding") != 0 &&
+            strcmp(strategy, "global_binding") != 0));
+}
+bool cbm_registry_has_js_global(const cbm_registry_t *r, const char *name) {
+    /* An ambiguous global is still a binding, even without an exact target. */
+    return r && r->js_globals && name && cbm_ht_get(r->js_globals, name) != NULL;
+}
+static cbm_resolution_t js_resolve_global(const cbm_registry_t *r, const char *name) {
+    const char *qn = r->js_globals ? cbm_ht_get(r->js_globals, name) : NULL;
+    return qn && qn[0] ? (cbm_resolution_t){.qualified_name = qn, .confidence = 0.95,
+                                            .strategy = "global_binding", .candidate_count = 1}
+                       : empty_result();
 }
 
 /* Record `qualified_name` in the exact map. Returns the registry's owned copy
@@ -5652,6 +5699,37 @@ static bool js_guess_refuted(const cbm_registry_t *r, const CBMCall *call, const
     return false;
 }
 
+cbm_resolution_t cbm_pipeline_js_import_value(const cbm_gbuf_t *gbuf, const char *project,
+                                              const char *rel, const CBMCall *call,
+                                              const char **keys, const char **vals, int count) {
+    if (!call->js_import_module || !call->js_import_member) return empty_result();
+    const cbm_gbuf_node_t *base = NULL;
+    if (call->js_import_root) {
+        for (int i = 0; i < count; i++) {
+            if (strcmp(keys[i], call->js_import_root) == 0) {
+                base = cbm_gbuf_find_by_qn(gbuf, vals[i]);
+                break;
+            }
+        }
+    } else {
+        cbm_pipeline_ctx_t ctx = {.gbuf = (cbm_gbuf_t *)gbuf, .project_name = project};
+        char *qn = cbm_pipeline_resolve_module(&ctx, rel, call->js_import_module);
+        base = qn ? cbm_gbuf_find_by_qn(gbuf, qn) : NULL;
+        free(qn);
+    }
+    if (!base) return empty_result();
+    const cbm_gbuf_node_t *target = base;
+    if (strcmp(base->label, "Module") == 0) {
+        char qn[CBM_SZ_1K];
+        int n = snprintf(qn, sizeof(qn), "%s.%s", base->qualified_name, call->js_import_member);
+        target = n > 0 && (size_t)n < sizeof(qn) ? cbm_gbuf_find_by_qn(gbuf, qn) : NULL;
+    }
+    if (!target || (strcmp(target->label, "Function") != 0 && strcmp(target->label, "Class") != 0))
+        return empty_result();
+    return (cbm_resolution_t){.qualified_name = target->qualified_name, .confidence = 0.95,
+                              .strategy = "import_binding", .candidate_count = 1};
+}
+
 /* The registry step both call resolvers (pass_calls.c, pass_parallel.c) run
  * once the LSP has not answered: a Python bare name bound in an enclosing def
  * first (the LSP binds those locals itself; this covers the sites it did not
@@ -5677,8 +5755,25 @@ cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const
         }
     }
     bool js = lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
+    if (js && call->js_receiver_ctor) {
+        cbm_resolution_t constructor = js_resolve_global(r, call->js_receiver_ctor);
+        const char *dot = strrchr(callee_name, '.');
+        const char *label = constructor.qualified_name ? cbm_ht_get(r->exact, constructor.qualified_name) : NULL;
+        if (dot && label && strcmp(label, "Class") == 0) {
+            char qn[CBM_SZ_1K];
+            int n = snprintf(qn, sizeof(qn), "%s.%s", constructor.qualified_name, dot + 1);
+            const char *owned = n > 0 && (size_t)n < sizeof(qn) ? cbm_ht_get_key(r->exact, qn) : NULL;
+            if (owned) { constructor.qualified_name = owned; return constructor; }
+        }
+        return empty_result();
+    }
     if (js && call->callee_is_locally_bound) {
         return empty_result(); /* a parameter, variable or catch clause holds the callee */
+    }
+    if (js && call->callee_is_unbound) {
+        /* Real module declarations are recorded as bindings. A same-file
+         * function value's private name is not visible outside that value. */
+        return js_resolve_global(r, callee_name);
     }
     if (js) {
         bool no_edge = false;

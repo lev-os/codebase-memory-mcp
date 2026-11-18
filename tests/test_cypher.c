@@ -6587,7 +6587,59 @@ TEST(cypher_exists_uses_bound_endpoint_and_labels) {
     PASS();
 }
 
+
+TEST(cypher_exists_bound_pair_and_with_identity) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "p", "/tmp/p"), CBM_STORE_OK);
+    int64_t ids[3];
+    const char *qns[] = {"p.a", "p.b", "p.decoy"};
+    for (int i = 0; i < 3; i++) {
+        cbm_node_t n = {.project = "p", .label = "Function", .name = "walk", .qualified_name = qns[i]};
+        ids[i] = cbm_store_upsert_node(s, &n);
+    }
+    cbm_edge_t e = {.project = "p", .source_id = ids[0], .target_id = ids[1], .type = "USAGE"};
+    ASSERT_GT(cbm_store_insert_edge(s, &e), 0);
+    e.type = "CALLS"; e.target_id = ids[2];
+    ASSERT_GT(cbm_store_insert_edge(s, &e), 0);
+    e.target_id = ids[0];
+    ASSERT_GT(cbm_store_insert_edge(s, &e), 0);
+    const struct { const char *query; int rows; const char *want; } cases[] = {
+        {"MATCH (a)-[:USAGE]->(b) WHERE EXISTS { (a)-[:CALLS]->(b) } RETURN b.qualified_name", 0, NULL},
+        {"MATCH (a)-[:USAGE]->(b) WHERE NOT EXISTS { (a)-[:CALLS]->(b) } RETURN b.qualified_name", 1, "p.b"},
+        {"MATCH (a)-[:USAGE]->(b) WITH a AS root WHERE EXISTS { (root)-[:CALLS]->() } RETURN root.qualified_name", 1, "p.a"},
+        {"MATCH (a)-[:CALLS]->(b) WITH a AS root, b AS leaf WHERE root <> leaf RETURN leaf.qualified_name", 1, "p.decoy"},
+        {"MATCH (a)-[:CALLS]->(b) WITH a AS root, b AS leaf WHERE root = leaf RETURN leaf.qualified_name", 1, "p.a"},
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
+        cbm_cypher_result_t r = {0};
+        int rc = cbm_cypher_execute(s, cases[i].query, "p", 0, &r);
+        printf("  bound WITH case=%zu rc=%d rows=%d expected=%d error=%s\n", i, rc, r.row_count, cases[i].rows, r.error ? r.error : "absent");
+        ok = rc == 0 && r.row_count == cases[i].rows &&
+             (!cases[i].want || (r.row_count == 1 && strcmp(r.rows[0][0], cases[i].want) == 0)) && ok;
+        cbm_cypher_result_free(&r);
+    }
+    cbm_store_close(s);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(cypher_exists_multitype_teaches_or) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (a) WHERE EXISTS { (a)-[:CALLS|ASYNC_CALLS]->() } RETURN a", "p", 0, &r);
+    printf("  multi-type EXISTS rc=%d error=%s\n", rc, r.error ? r.error : "absent");
+    bool ok = rc != 0 && r.error && strstr(r.error, "EXISTS {...} OR EXISTS {...}");
+    cbm_cypher_result_free(&r); cbm_store_close(s);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(cypher) {
+    RUN_TEST(cypher_exists_bound_pair_and_with_identity);
+    RUN_TEST(cypher_exists_multitype_teaches_or);
     RUN_TEST(cypher_node_comparisons_use_identity);
     RUN_TEST(cypher_exists_uses_bound_endpoint_and_labels);
     RUN_TEST(cypher_exists_retains_stored_self_relationships);

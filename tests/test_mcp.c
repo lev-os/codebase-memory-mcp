@@ -28873,7 +28873,172 @@ TEST(tool_recursive_neighbors_and_noncallable_snippet) {
     PASS();
 }
 
+
+TEST(tool_snippet_neighbor_counts_and_names_agree) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *s = cbm_mcp_server_store(srv);
+    cbm_mcp_server_set_project(srv, "p");
+    ASSERT_EQ(cbm_store_upsert_project(s, "p", "/tmp/p"), CBM_STORE_OK);
+    cbm_node_t root = {.project = "p", .label = "Function", .name = "hub", .qualified_name = "p.hub"};
+    int64_t hub = cbm_store_upsert_node(s, &root);
+    const char *types[] = {"CALLS", "HTTP_CALLS", "ASYNC_CALLS"};
+    bool ok = true;
+    for (int i = 0; i < 12; i++) {
+        char qn[64], file[64];
+        snprintf(qn, sizeof(qn), "p.file%02d.walk", i);
+        snprintf(file, sizeof(file), "file%02d.js", i);
+        cbm_node_t n = {.project = "p", .label = "Function", .name = "walk", .qualified_name = qn, .file_path = file};
+        int64_t id = cbm_store_upsert_node(s, &n);
+        for (int dir = 0; dir < 2; dir++) {
+            cbm_edge_t e = {.project = "p", .source_id = dir ? hub : id,
+                            .target_id = dir ? id : hub, .type = types[i % 3]};
+            ASSERT_GT(cbm_store_insert_edge(s, &e), 0);
+            /* One neighbor reached through two edge kinds still has one identity. */
+            if (i == 0) {
+                e.type = "ASYNC_CALLS";
+                ASSERT_GT(cbm_store_insert_edge(s, &e), 0);
+            }
+        }
+        if (i != 2 && i != 11) continue;
+        /* The separate degree API also serves Cypher's CALLS-only metrics. */
+        int calls_in = 0, calls_out = 0;
+        cbm_store_node_degree(s, hub, &calls_in, &calls_out);
+        printf("  CALLS-only degree=%d/%d expected=%d\n", calls_in, calls_out, i / 3 + 1);
+        ok = calls_in == i / 3 + 1 && calls_out == i / 3 + 1 && ok;
+        for (int include = 0; include < 2; include++) {
+            char args[256];
+            snprintf(args, sizeof(args), "{\"project\":\"p\",\"qualified_name\":\"p.hub\",\"format\":\"json\",\"include_neighbors\":%s}", include ? "true" : "false");
+            char *response = cbm_mcp_handle_tool(srv, "get_code_snippet", args);
+            char *inner = extract_text_content(response);
+            ASSERT_NOT_NULL(inner);
+            yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+            ASSERT_NOT_NULL(doc);
+            yyjson_val *obj = yyjson_doc_get_root(doc);
+            const char *counts[] = {"callers", "callees"};
+            const char *lists[] = {"caller_names", "callee_names"};
+            const char *cuts[] = {"caller_names_truncated", "callee_names_truncated"};
+            for (int d = 0; d < 2; d++) {
+                int total = (int)yyjson_get_int(yyjson_obj_get(obj, counts[d]));
+                yyjson_val *names = yyjson_obj_get(obj, lists[d]);
+                printf("  snippet %s include=%d total=%d expected=%d names=%zu\n", counts[d], include, total, i+1, yyjson_arr_size(names));
+                ok = total == i + 1 && ok;
+                if (include) {
+                    int want = i == 2 ? 3 : 10;
+                    ok = yyjson_arr_size(names) == (size_t)want && ok;
+                    for (int j = 0; j < want; j++) {
+                        char expected[64];
+                        snprintf(expected, sizeof(expected), "p.file%02d.walk", j);
+                        const char *got = yyjson_get_str(yyjson_arr_get(names, j));
+                        ok = got && strcmp(got, expected) == 0 && ok;
+                    }
+                    ok = yyjson_get_bool(yyjson_obj_get(obj, cuts[d])) == (i == 11) && ok;
+                }
+            }
+            yyjson_doc_free(doc); free(inner); free(response);
+        }
+    }
+    cbm_mcp_server_free(srv);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(tool_trace_noncallable_omits_recursion) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *s = cbm_mcp_server_store(srv);
+    cbm_mcp_server_set_project(srv, "p");
+    ASSERT_EQ(cbm_store_upsert_project(s, "p", "/tmp/p"), CBM_STORE_OK);
+    const char *labels[] = {"Class", "Route", "Resource", "Function", "Method"};
+    bool ok = true;
+    char large[4096]; memset(large, 'q', sizeof(large)-1); large[sizeof(large)-1] = 0;
+    cbm_node_t n = {.project = "p", .label = "Function", .name = large, .qualified_name = large};
+    int64_t child = cbm_store_upsert_node(s, &n);
+    for (int i = 0; i < 5; i++) {
+        n.label = labels[i]; n.name = labels[i]; n.qualified_name = labels[i];
+        n.properties_json = "{\"self_recursive\":true,\"recursive\":true}";
+        int64_t id = cbm_store_upsert_node(s, &n);
+        cbm_edge_t e = {.project = "p", .source_id = id, .target_id = child, .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(s, &e), 0);
+        for (int json = 0; json < 2; json++) {
+            for (int floor = 0; floor < 2; floor++) {
+                char args[256];
+                snprintf(args, sizeof(args), "{\"project\":\"p\",\"function_name\":\"%s\",\"direction\":\"outbound\",\"format\":\"%s\",\"max_output_tokens\":%d}", labels[i], json ? "json" : "tree", floor ? 128 : 8000);
+                char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+                char *inner = extract_text_content(response);
+                ASSERT_NOT_NULL(inner);
+                bool recursion = strstr(inner, "self_recursive") != NULL;
+                printf("  trace %s json=%d floor=%d recursion=%d\n", labels[i], json, floor, recursion);
+                ok = recursion == (i >= 3) && ok;
+                if (i < 3) ok = !strstr(inner, "recursive") && !strstr(inner, "self_call_policy") && ok;
+                if (floor) ok = strstr(inner, "output_budget_floor_exceeded") && ok;
+                free(inner); free(response);
+            }
+        }
+    }
+    cbm_mcp_server_free(srv);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+
+TEST(tool_recursive_root_cursor_pages) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *s = cbm_mcp_server_store(srv);
+    cbm_mcp_server_set_project(srv, "p");
+    ASSERT_EQ(cbm_store_upsert_project(s, "p", "/tmp/p"), CBM_STORE_OK);
+    cbm_node_t n = {.project = "p", .label = "Function", .name = "hub", .qualified_name = "p.hub",
+                    .properties_json = "{\"self_recursive\":true,\"recursive\":true}"};
+    int64_t hub = cbm_store_upsert_node(s, &n);
+    cbm_edge_t e = {.project = "p", .source_id = hub, .target_id = hub, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(s, &e), 0);
+    const char *names[] = {"alpha", "beta", "gamma"};
+    for (int i = 0; i < 3; i++) {
+        n.name = names[i]; n.qualified_name = names[i]; n.properties_json = "{}";
+        e.source_id = cbm_store_upsert_node(s, &n);
+        ASSERT_GT(cbm_store_insert_edge(s, &e), 0);
+    }
+    char cursor[256] = "";
+    unsigned seen = 0;
+    for (int page = 0; page < 3; page++) {
+        char args[512];
+        snprintf(args, sizeof(args), "{\"project\":\"p\",\"function_name\":\"hub\",\"direction\":\"inbound\",\"limit\":1,\"format\":\"json\"%s%s%s}", cursor[0] ? ",\"cursor\":\"" : "", cursor, cursor[0] ? "\"" : "");
+        char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+        char *inner = extract_text_content(response);
+        ASSERT_NOT_NULL(inner);
+        yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *obj = yyjson_doc_get_root(doc);
+        ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(obj, "self_recursive")));
+        ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(obj, "recursive")));
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(obj, "callers_total")), 3);
+        yyjson_val *rows = yyjson_obj_get(obj, "callers");
+        ASSERT_NULL(trace_grouped_row_named(rows, "hub", NULL));
+        int found = 0;
+        for (int i = 0; i < 3; i++) {
+            if (trace_grouped_row_named(rows, names[i], NULL)) {
+                ASSERT_EQ(seen & (1u << i), 0);
+                seen |= 1u << i;
+                found++;
+            }
+        }
+        ASSERT_EQ(found, 1);
+        const char *next = yyjson_get_str(yyjson_obj_get(obj, "next_cursor"));
+        printf("  recursive cursor page=%d caller_rows=%d has_next=%d\n", page, found, next != NULL);
+        ASSERT_EQ(next != NULL, page < 2);
+        snprintf(cursor, sizeof(cursor), "%s", next ? next : "");
+        yyjson_doc_free(doc); free(inner); free(response);
+    }
+    ASSERT_EQ(seen, 7);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 SUITE(mcp) {
+    RUN_TEST(tool_recursive_root_cursor_pages);
+    RUN_TEST(tool_snippet_neighbor_counts_and_names_agree);
+    RUN_TEST(tool_trace_noncallable_omits_recursion);
     RUN_TEST(tool_recursive_neighbors_and_noncallable_snippet);
     RUN_TEST(tool_caller_summary_keeps_other_same_name_roots);
     RUN_TEST(tool_caller_summaries_exclude_recursive_root);

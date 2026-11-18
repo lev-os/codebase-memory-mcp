@@ -6374,9 +6374,10 @@ int cbm_store_set_format_version(cbm_store_t *s, int version) {
 /* ── Node neighbor names ──────────────────────────────────────── */
 
 static int query_neighbor_names(sqlite3 *db, const char *sql, int64_t node_id, int limit,
-                                char ***out, int *out_count) {
+                                char ***out, int *out_count, int *total) {
     *out = NULL;
     *out_count = 0;
+    *total = 0;
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         return CBM_NOT_FOUND;
@@ -6398,6 +6399,7 @@ static int query_neighbor_names(sqlite3 *db, const char *sql, int64_t node_id, i
             names = safe_realloc(names, (size_t)cap * sizeof(char *));
         }
         names[count++] = strdup(name);
+        *total = sqlite3_column_int(stmt, 1);
     }
     if (scan_rc10 != SQLITE_DONE) { /* SCANCHK:10:stmt */
         /* No store handle here; neighbor names are include_connected
@@ -6409,6 +6411,7 @@ static int query_neighbor_names(sqlite3 *db, const char *sql, int64_t node_id, i
         free(names);
         *out = NULL;
         *out_count = 0;
+        *total = 0;
         return CBM_NOT_FOUND;
     }
     sqlite3_finalize(stmt);
@@ -6418,7 +6421,8 @@ static int query_neighbor_names(sqlite3 *db, const char *sql, int64_t node_id, i
 }
 
 int cbm_store_node_neighbor_names(cbm_store_t *s, int64_t node_id, int limit, char ***out_callers,
-                                  int *caller_count, char ***out_callees, int *callee_count) {
+                                  int *caller_count, char ***out_callees, int *callee_count,
+                                  int *caller_total, int *callee_total) {
     if (!s) {
         return CBM_NOT_FOUND;
     }
@@ -6426,22 +6430,24 @@ int cbm_store_node_neighbor_names(cbm_store_t *s, int64_t node_id, int limit, ch
     *caller_count = 0;
     *out_callees = NULL;
     *callee_count = 0;
+    *caller_total = 0;
+    *callee_total = 0;
 
     query_neighbor_names(
         s->db,
-        "SELECT DISTINCT n.name FROM edges e JOIN nodes n ON e.source_id = n.id "
+        "SELECT n.qualified_name, COUNT(*) OVER() FROM edges e JOIN nodes n ON e.source_id = n.id "
         "WHERE e.target_id = ?1 AND e.type IN ('CALLS','HTTP_CALLS','ASYNC_CALLS') "
         "AND e.source_id <> e.target_id "
-        "ORDER BY n.name LIMIT ?2",
-        node_id, limit, out_callers, caller_count);
+        "GROUP BY n.id ORDER BY n.qualified_name LIMIT ?2",
+        node_id, limit, out_callers, caller_count, caller_total);
 
     query_neighbor_names(
         s->db,
-        "SELECT DISTINCT n.name FROM edges e JOIN nodes n ON e.target_id = n.id "
+        "SELECT n.qualified_name, COUNT(*) OVER() FROM edges e JOIN nodes n ON e.target_id = n.id "
         "WHERE e.source_id = ?1 AND e.type IN ('CALLS','HTTP_CALLS','ASYNC_CALLS') "
         "AND e.source_id <> e.target_id "
-        "ORDER BY n.name LIMIT ?2",
-        node_id, limit, out_callees, callee_count);
+        "GROUP BY n.id ORDER BY n.qualified_name LIMIT ?2",
+        node_id, limit, out_callees, callee_count, callee_total);
 
     return 0;
 }

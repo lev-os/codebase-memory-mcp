@@ -22,8 +22,18 @@
 #include "cbm.h"
 #include "lsp/php_lsp.h"
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
+#include <stdio.h>
 #include <stdatomic.h>
 #include <string.h>
+
+/* Length of the opened regular source, without moving or reading the stream.
+ * Returns -1 on metadata failure or when the size cannot fit in long. */
+long cbm_pipeline_open_file_size(FILE *file);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Descriptor advancement caused by size probes, not by content reads. */
+void cbm_pipeline_size_probe_test_reset(void);
+uint64_t cbm_pipeline_size_probe_test_bytes(void);
+#endif
 
 typedef struct cbm_pipeline_frozen cbm_pipeline_frozen_t;
 
@@ -954,6 +964,11 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                                                         const CBMImport *imp,
                                                         CBMHashTable *namespace_map);
 
+/* Resolve a constant local's call-scoped imported value without name guessing. */
+cbm_resolution_t cbm_pipeline_js_import_value(const cbm_gbuf_t *gbuf, const char *project,
+                                              const char *rel, const CBMCall *call,
+                                              const char **keys, const char **vals, int count);
+
 /* PHP binding arrays borrow current result and graph strings. Free before
  * releasing/reloading the result; never cache this state across files. */
 typedef CBMPHPImportBindings cbm_php_vendor_names_t;
@@ -1838,7 +1853,21 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *     self calls require complete property-write evidence on unchanged files. */
 /* 34: default-export identity, await adoption, member stability and literal
  *     object members change CALLS for unchanged importers. */
-/* 35: nullable awaited unions keep their receiver; unchanged importers of an
+/* 35: repair JS/TS suppression without discarding semantic targets; share
+ *     declaration scopes and retain proven imported values and project globals.
+ *     Unchanged files rebuild once to repair their CALLS edges. */
+/* 36: retained constant imports prove exact targets even when literal-key
+ *     names require a binding. Rebuild unchanged importers once. */
+/* 37: native fetch needs an unbound name, not an unknown binding target.
+ *     Function declarations and expression names keep their real scopes.
+ *     Registry guesses cannot invoke data variables. Rebuild unchanged
+ *     JS/TS callers once to repair CALLS and HTTP_CALLS edges. */
+/* 38: runtime variables can hold callable factory values. Preserve those
+ *     binding targets and keep call-only presence facts out of ordinary
+ *     reference shadowing. Rebuild unchanged CALLS and USAGE edges once. */
+/* 39: narrowed member writes and script-global mutations change exact CALLS
+ *     proofs for unchanged files; rebuild stored graphs once. */
+/* 40: nullable awaited unions keep their receiver; unchanged importers of an
  *     async provider gain the member edges once. A write to one class member
  *     withholds that member only, at every dispatch path.
  *     A decorator withholds the member or the class it decorates.
@@ -1846,7 +1875,7 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *     a member spelled another way.
  *     A re-exported default binds its exact definition.
  *     A global indirect eval in a script withholds its top-level proofs. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 35 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 40 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
