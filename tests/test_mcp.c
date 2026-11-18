@@ -28745,7 +28745,64 @@ TEST(tool_caller_summaries_exclude_recursive_root) {
     PASS();
 }
 
+TEST(tool_caller_summary_keeps_other_same_name_roots) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *project = "same-name-callers";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/same-name-callers"), CBM_STORE_OK);
+    cbm_node_t a = {.project = project,
+                    .label = "Function",
+                    .name = "walk",
+                    .qualified_name = "same-name-callers.a.walk",
+                    .file_path = "a.ts",
+                    .start_line = 1,
+                    .end_line = 3};
+    cbm_node_t b = a;
+    b.qualified_name = "same-name-callers.b.walk";
+    b.file_path = "b.d.ts";
+    b.end_line = 1;
+    int64_t ids[2] = {cbm_store_upsert_node(st, &a), cbm_store_upsert_node(st, &b)};
+    for (int i = 0; i < 2; i++) {
+        cbm_edge_t e = {
+            .project = project, .source_id = ids[i], .target_id = ids[i], .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(st, &e), 0);
+    }
+    bool ok = true;
+    for (int step = 0; step < 3; step++) {
+        if (step) {
+            cbm_edge_t e = {.project = project,
+                            .source_id = ids[step - 1],
+                            .target_id = ids[2 - step],
+                            .type = "CALLS"};
+            ASSERT_GT(cbm_store_insert_edge(st, &e), 0);
+        }
+        char *resp =
+            cbm_mcp_handle_tool(srv, "trace_path",
+                                "{\"project\":\"same-name-callers\",\"function_name\":\"walk\","
+                                "\"direction\":\"inbound\",\"format\":\"json\",\"depth\":2}");
+        ASSERT_NOT_NULL(resp);
+        ASSERT_NULL(strstr(resp, "\"isError\":true"));
+        char *inner = extract_text_content(resp);
+        ASSERT_NOT_NULL(inner);
+        yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *total = yyjson_obj_get(yyjson_doc_get_root(doc), "callers_total");
+        printf("  same-name callers step=%d total=%lld expected=%d\n", step,
+               (long long)yyjson_get_int(total), step);
+        ok = yyjson_is_int(total) && yyjson_get_int(total) == step && ok;
+        yyjson_doc_free(doc);
+        free(inner);
+        free(resp);
+    }
+    cbm_mcp_server_free(srv);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(mcp) {
+    RUN_TEST(tool_caller_summary_keeps_other_same_name_roots);
     RUN_TEST(tool_caller_summaries_exclude_recursive_root);
 
     RUN_TEST(tool_check_index_coverage_parse_gap_precedes_unresolved_calls);
