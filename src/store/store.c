@@ -6260,7 +6260,8 @@ void cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *ou
     *in_deg = 0;
     *out_deg = 0;
 
-    const char *in_sql = "SELECT COUNT(*) FROM edges WHERE target_id = ?1 AND type = 'CALLS'";
+    const char *in_sql = "SELECT COUNT(*) FROM edges WHERE target_id = ?1 AND type = 'CALLS' "
+                         "AND source_id <> target_id"; /* a self call is no caller */
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, in_sql, CBM_NOT_FOUND, &stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_int64(stmt, SKIP_ONE, node_id);
@@ -6270,7 +6271,8 @@ void cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *ou
         sqlite3_finalize(stmt);
     }
 
-    const char *out_sql = "SELECT COUNT(*) FROM edges WHERE source_id = ?1 AND type = 'CALLS'";
+    const char *out_sql = "SELECT COUNT(*) FROM edges WHERE source_id = ?1 AND type = 'CALLS' "
+                          "AND source_id <> target_id";
     if (sqlite3_prepare_v2(s->db, out_sql, CBM_NOT_FOUND, &stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_int64(stmt, SKIP_ONE, node_id);
         if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -6447,15 +6449,16 @@ static int count_degrees_direction(cbm_store_t *s, const int64_t *node_ids, int 
                                    bool inbound, int *out_counts) {
     char sql[ST_SQL_BUF];
     const char *id_col = inbound ? "target_id" : "source_id";
+    /* A self-loop is no caller and no callee: recursion is not use. */
     if (has_type) {
         snprintf(sql, sizeof(sql),
                  "SELECT %s, COUNT(*) FROM edges "
-                 "WHERE %s IN (%s) AND type = ? GROUP BY %s",
+                 "WHERE %s IN (%s) AND type = ? AND source_id <> target_id GROUP BY %s",
                  id_col, id_col, in_clause, id_col);
     } else {
         snprintf(sql, sizeof(sql),
                  "SELECT %s, COUNT(*) FROM edges "
-                 "WHERE %s IN (%s) GROUP BY %s",
+                 "WHERE %s IN (%s) AND source_id <> target_id GROUP BY %s",
                  id_col, id_col, in_clause, id_col);
     }
 
@@ -7447,12 +7450,13 @@ static void search_where_advanced(const cbm_search_params_t *params, char *where
     }
     if (params->exclude_entry_points) {
         /* Exclude nodes with no inbound CALLS but at least one outbound CALLS.
-         * Dead code (degree=0) is NOT excluded — only true entry points. */
+         * Dead code (degree=0) is NOT excluded — only true entry points. A
+         * self call is neither: a function only it calls stays dead code. */
         *wlen = where_append(where, where_sz, *wlen, nparams,
                              "NOT (NOT EXISTS(SELECT 1 FROM edges e WHERE e.target_id = n.id "
-                             "AND e.type = 'CALLS') "
+                             "AND e.source_id <> n.id AND e.type = 'CALLS') "
                              "AND EXISTS(SELECT 1 FROM edges e2 WHERE e2.source_id = n.id "
-                             "AND e2.type = 'CALLS'))");
+                             "AND e2.target_id <> n.id AND e2.type = 'CALLS'))");
     }
     if (params->exclude_labels) {
         char excl_clause[CBM_SZ_512];
@@ -7631,11 +7635,13 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     const char *select_cols = "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
                               "n.file_path, n.start_line, n.end_line, n.properties, "
                               "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND "
+                              "e.source_id <> n.id AND "
                               "e.type IN ('CALLS', 'USAGE', 'CALL_REFERENCE', 'INHERITS', "
                               "'IMPLEMENTS')) AS in_deg, "
                               "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND "
+                              "e.target_id <> n.id AND "
                               "e.type IN ('CALLS', 'USAGE', 'CALL_REFERENCE', 'INHERITS', "
-                              "'IMPLEMENTS')) AS out_deg ";
+                              "'IMPLEMENTS')) AS out_deg "; /* self-loops are not use */
     /* A degree filter evaluates both counts for EVERY candidate row (787k
      * Functions on the kernel: two B-tree seeks each, 1.9 s per pass). The
      * adjacency layer answers them from RAM; the query is otherwise the same,

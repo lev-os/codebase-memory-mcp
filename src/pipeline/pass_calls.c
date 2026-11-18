@@ -907,6 +907,12 @@ static bool emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                  const char **imp_keys, const char **imp_vals, int imp_count,
                                  bool suppress_plain_calls, const char *route_mount,
                                  CBMLanguage lang) {
+    /* A proven recursive invocation is plain CALLS. Service classifiers
+     * cannot manufacture a self edge or reinterpret this exact binding. */
+    if (target && source->id == target->id) {
+        return !suppress_plain_calls && cbm_pipeline_exact_self_call(lang, call, res) &&
+               calls_emit_plain(ctx, call, source, target, res);
+    }
     cbm_svc_kind_t svc = cbm_service_pattern_match_in_project(
         res->qualified_name, target ? target->name : NULL,
         target && res->qualified_name && strcmp(target->qualified_name, res->qualified_name) == 0
@@ -950,6 +956,9 @@ static const cbm_gbuf_node_t *calls_overload_target(cbm_pipeline_ctx_t *ctx, con
     const cbm_gbuf_node_t *ovl[CBM_OVERLOAD_TARGETS_MAX];
     int novl =
         cbm_pipeline_overload_targets(ctx->gbuf, target, call, lang, ovl, CBM_OVERLOAD_TARGETS_MAX);
+    if (novl > 1 && target->id == source->id) {
+        return NULL; /* no exact member of this recursive overload group */
+    }
     if (novl > 1) {
         res->strategy = CBM_OVERLOAD_AMBIGUOUS_STRATEGY;
         if (res->confidence > CBM_OVERLOAD_AMBIGUOUS_CONFIDENCE) {
@@ -965,7 +974,7 @@ static const cbm_gbuf_node_t *calls_overload_target(cbm_pipeline_ctx_t *ctx, con
     if (novl > 0) {
         target = ovl[0];
     }
-    return target->id == source->id ? NULL : target;
+    return target->id == source->id && !cbm_pipeline_exact_self_call(lang, call, res) ? NULL : target;
 }
 
 /* Find source node for a call: enclosing function or file node. */
@@ -1343,7 +1352,7 @@ static bool calls_emit_lsp_target(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     target_node = cbm_pipeline_java_same_build_root(ctx->gbuf, ctx->registry, ctx->project_name,
                                                     ctx->repo_path, lang, source_node->file_path,
                                                     lsp->strategy, target_node);
-    if (!target_node || source_node->id == target_node->id) {
+    if (!target_node) {
         return false;
     }
     /* LSP textual fallbacks can also name data, as with static imports. The
@@ -1357,6 +1366,9 @@ static bool calls_emit_lsp_target(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     res.confidence = lsp->confidence;
     res.strategy = lsp->strategy;
     res.candidate_count = PC_SINGLE_CANDIDATE_COUNT;
+    if (source_node->id == target_node->id && !cbm_pipeline_exact_self_call(lang, call, &res)) {
+        return false;
+    }
     target_node =
         calls_overload_target(ctx, call, lang, source_node, target_node, &res, false, evidence);
     if (!target_node) {
@@ -1468,7 +1480,13 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
      * invocation target. Textual registry/service fallbacks would bind an
      * unresolved primitive expression such as `int + int` to an unrelated
      * project `operator+`, fabricating a CALLS edge. */
-    if (call->requires_lsp_resolution) {
+    /* JS/TS: a call that needs a binding (a literal-key or keyword name) gets
+     * no name-guess target, but the service, route and configuration
+     * classification below still runs: `fetch('/x')` beside a `'fetch'` key
+     * is the global HTTP call. MUST match pass_parallel.c. */
+    bool js_family = lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
+                     lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS;
+    if (call->requires_lsp_resolution && !js_family) {
         return 0;
     }
 
@@ -1561,7 +1579,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
                 cbm_pipeline_ts_builtin_target(lang, lsp->strategy, lsp->callee_qn,
                                                ctx->project_name));
     cbm_resolution_t res = {0};
-    if (swift_candidates >= 0) {
+    if (swift_candidates >= 0 && !call->requires_lsp_resolution) {
         if (call->js_import_module)
             res = cbm_pipeline_js_import_value(ctx->gbuf, ctx->project_name, rel, call,
                                                imp_keys, imp_vals, imp_count);
@@ -1752,8 +1770,12 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     if (target_node) {
         res.qualified_name = target_node->qualified_name;
     }
-    if (!target_node || source_node->id == target_node->id) {
+    if (!target_node || (source_node->id == target_node->id &&
+                         !cbm_pipeline_exact_self_call(lang, call, &res))) {
         return 0;
+    }
+    if (cbm_pipeline_js_type_only_target(lang, target_node)) {
+        drop_plain_call = true;
     }
     /* A call that resolved onto a struct Field: refused across languages and
      * for a bare C call; a C/C++ member call takes the Field its object's type

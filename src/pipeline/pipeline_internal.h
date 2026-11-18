@@ -1827,10 +1827,20 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *     name of a module binds only a definition of its file, and a type, or
  *     a method by a bare name, never. Unchanged files rebuild once to drop
  *     those edges. */
-/* 26: repair JS/TS suppression without discarding semantic targets; share
+/* 26: exact JS/TS recursive invocations retain their self CALLS edge. */
+/* 27: JS/TS literal callable keys share unquoted names and keep numeric keys. */
+/* 28: JS/TS generator expressions own their definitions and call scopes. */
+/* 29: JS/TS keyword calls require binding; name guesses cannot call type aliases. */
+/* 30: a self CALLS edge needs a JS/TS callable that no assignment rebinds; a
+ *     JS/TS call that needs a binding keeps its HTTP/route/config edges; the
+ *     empty and `function` literal keys get nodes, and '.', '%' and '"' are
+ *     escaped in a literal key's QN segment. */
+/* 31: constructor proofs, captured writes and default/literal values changed
+ *     CALLS for unchanged importers; rebuild stored graphs once. */
+/* 32: repair JS/TS suppression without discarding semantic targets; share
  *     declaration scopes and retain proven imported values and project globals.
  *     Unchanged files rebuild once to repair their CALLS edges. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 26 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 32 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

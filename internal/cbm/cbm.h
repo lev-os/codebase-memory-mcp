@@ -264,7 +264,11 @@ typedef struct {
     bool is_entry_point;
     bool ts_return_scope_safe;      // TS return spelling has no generic parameter shadow.
     bool ts_return_constructor;     // Inferred `new C()` result; C must prove a runtime class.
+    bool ts_value_binding_written;  // Class value binding is assigned in its provider.
     bool js_object_literal;         // Unannotated module const initialized by a plain object.
+    bool is_static;                 // JS/TS method is declared on its class constructor.
+    /* Alternating own member names and exact callable QNs, NULL terminated. */
+    const char **js_object_members;
     const char *structural_profile; // AST structural profile (arena-allocated) or NULL
     const char *body_tokens; // space-separated raw identifier tokens from body (arena) or NULL
     /* Rust only: raw trait path from the exact `impl Trait for Type` block
@@ -300,6 +304,9 @@ typedef struct {
      * QN from that same node, so the pair names one definition exactly (JS/TS
      * same-name twins, cbm_js_split_twin_callables). 0 when not recorded. */
     uint32_t node_start_byte;
+    /* JS/TS callable name proven by a string/number property-key AST node.
+     * This extraction-only fact keeps literal keys out of the junk-name filter. */
+    bool literal_member_name;
     /* Call matching: defaulted parameters, indexed in declaration order. */
     uint64_t param_default_mask;
     uint8_t selector_param_count;
@@ -477,6 +484,10 @@ typedef struct {
     const char *js_this_class_qn;
     const char *js_this_base;
     uint8_t js_this;
+    /* JS/TS bare call whose name no assignment in the file writes (closures
+     * and `var` included). Set by the TS resolver; a bare self CALLS edge
+     * needs it, since a write can rebind the callable before the call. */
+    bool callee_never_written;
     /* Java/Kotlin: the arguments written at the site, one entry each,
      * comma-separated: the Kotlin argument name or "_", and "*" for a
      * trailing lambda ("" = no arguments). NULL = not recorded. Read

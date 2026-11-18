@@ -263,6 +263,7 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
     cr_list(c, &d->decorators);
     cr_list(c, &d->base_classes);
     cr_list(c, &d->param_names);
+    cr_list(c, &d->js_object_members);
     cr_list(c, &d->param_types);
     cr_counted_list(c, &d->signature_param_types, d->signature_param_count);
     cr_list(c, &d->return_types);

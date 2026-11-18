@@ -1719,6 +1719,85 @@ static int surface_removed_names(const char *stored_json, const char *fresh_json
  * NULL) file: the names it no longer declares go to `removed`. false when the
  * change cannot be repaired file by file (the rules above) or the stored data
  * cannot be read -- either way the caller declines. */
+/* A changed class value can alter a cached factory's constructor result.
+ * Follow the import chain even after the old method edge was removed, so
+ * restoring a class binding also restores callers beyond its direct importer. */
+static bool surface_has_written_ts_class(const char *text) {
+    if (!text)
+        return false;
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    if (!doc)
+        return true;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    int lang = (int)yyjson_get_int(yyjson_obj_get(root, "lang"));
+    bool found = false;
+    if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX || lang == CBM_LANG_JAVASCRIPT) {
+        size_t idx, max;
+        yyjson_val *value;
+        yyjson_arr_foreach(yyjson_obj_get(root, "lsp"), idx, max, value) {
+            const char *label = yyjson_get_str(yyjson_obj_get(value, "lb"));
+            if (label && strcmp(label, "Class") == 0 &&
+                yyjson_get_bool(yyjson_obj_get(value, "bw"))) {
+                found = true;
+                break;
+            }
+        }
+    }
+    yyjson_doc_free(doc);
+    return found;
+}
+
+static const char *closure_follow_class_consumers(cbm_store_t *store, const char *project,
+                                                  CBMHashTable *closure, CBMHashTable *by_path,
+                                                  const cbm_file_info_t *files, int file_count) {
+    const char **pending =
+        cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)(file_count ? file_count : 1) * sizeof(*pending));
+    if (!pending)
+        return "alloc";
+    int count = 0, head = 0;
+    for (int i = 0; i < file_count; i++)
+        if (cbm_ht_has(closure, files[i].rel_path))
+            pending[count++] = files[i].rel_path;
+    const char *decline = NULL;
+    while (head < count && !decline) {
+        int end = count, n = 0;
+        char **deps = NULL;
+        if (cbm_store_get_dependent_files(store, project, pending + head, end - head, &deps, &n) !=
+            CBM_STORE_OK) {
+            decline = "dependent_query_failed";
+        } else {
+            for (int i = 0; i < n; i++) {
+                const cbm_file_info_t *info = cbm_ht_get(by_path, deps[i]);
+                if (!info) {
+                    decline = "dependent_not_discovered";
+                    break;
+                }
+                if (cbm_ht_has(closure, info->rel_path))
+                    continue;
+                if (count >= file_count) {
+                    decline = "budget_exceeded";
+                    break;
+                }
+                cbm_ht_set(closure, info->rel_path, (void *)info->rel_path);
+                if (!cbm_ht_has(closure, info->rel_path)) {
+                    decline = "alloc";
+                    break;
+                }
+                pending[count++] = info->rel_path;
+                if (count > CLOSURE_BUDGET_FLOOR_FILES &&
+                    count * 100 > file_count * CLOSURE_BUDGET_PERCENT) {
+                    decline = "budget_exceeded";
+                    break;
+                }
+            }
+        }
+        cbm_store_free_dependent_files(deps, n);
+        head = end;
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, pending);
+    return decline;
+}
+
 static bool doc_scope_repairable(const char *stored_json, const char *fresh_json,
                                  CBMHashTable *removed) {
     char *stored_dl = NULL;
@@ -3289,6 +3368,7 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     int dep_target_count = 0;
     /* The first file that declines the closure stops both loops; the one exit
      * below releases dep_targets and the row index for every reason. */
+    bool follow_ts_classes = false;
     const char *why = NULL;
     for (int i = 0; i < n_changed && !why; i++) {
         const cbm_lsp_surface_row_t *stored_row = cbm_ht_get(rows_by_path, changed_paths[i]);
@@ -3303,6 +3383,8 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
             why = "missing_surface_row";
             break;
         }
+        follow_ts_classes |= surface_has_written_ts_class(stored_row->defs_json) ||
+                             surface_has_written_ts_class(fresh_row->defs_json);
         why = closure_python_namespace_decline(stored_row->defs_json, fresh_row->defs_json);
         if (why) {
             break;
@@ -3384,6 +3466,12 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
         if (!cbm_ht_get(closure_set, dependents[i])) {
             cbm_ht_set(closure_set, dependents[i], dependents[i]);
         }
+    }
+    if (follow_ts_classes) {
+        decline = closure_follow_class_consumers(store, project, closure_set, files_by_path, files,
+                                                 file_count);
+        if (decline)
+            goto done;
     }
     decline =
         closure_add_variant_partners(store, project, closure_set, files_by_path, changed_paths,

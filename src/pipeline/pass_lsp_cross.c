@@ -25,6 +25,7 @@
 #include "lsp/c_lsp.h"
 #include "lsp/py_lsp.h"
 #include "lsp/ts_lsp.h"
+#include "lsp/lsp_work.h"
 #include "lsp/php_lsp.h"
 #include "lsp/java_lsp.h"
 #include "lsp/kotlin_lsp.h"
@@ -385,7 +386,15 @@ static bool pxc_base_strategy_is_weak(const char *strategy) {
  * uses, plus the facts the external-base gate reads. NULL (the surface-probe
  * path) keeps every base at its raw spelling. */
 typedef struct {
+    const CBMImport *binding;
+    const char *module;
+    bool ambiguous;
+} pxc_ts_return_import_t;
+
+typedef struct {
     const cbm_registry_t *reg;
+    CBMHashTable *ts_return_imports;
+    bool ts_return_imports_complete;
     const char **imp_keys;
     const char **imp_vals;
     int imp_count;
@@ -501,6 +510,42 @@ static const char *pxc_resolve_base_qn(const pxc_base_scope_t *bs, const char *r
 /* Resolve a simple return type in its declaration's import scope, not the
  * caller's. A generic parameter may shadow an imported type with the same
  * spelling; extraction records that scope fact before syntax is discarded. */
+/* Return qualification reads this one per-file index instead of scanning
+ * every import for every declaration. Duplicate bindings fail closed. */
+static void pxc_index_ts_return_imports(CBMArena *arena, pxc_base_scope_t *bs) {
+    bs->ts_return_imports = cbm_ht_create(bs->imports ? (uint32_t)bs->imports->count : 0);
+    if (!bs->ts_return_imports)
+        return;
+    for (int i = 0; bs->imports && i < bs->imports->count; i++) {
+        CBM_LSP_WORK(1);
+        const CBMImport *binding = &bs->imports->items[i];
+        if (!binding->local_name)
+            continue;
+        pxc_ts_return_import_t *entry = cbm_ht_get(bs->ts_return_imports, binding->local_name);
+        if (entry) {
+            entry->ambiguous = true;
+            continue;
+        }
+        entry = cbm_arena_calloc(arena, (1) * sizeof(*entry));
+        if (!entry)
+            return;
+        entry->binding = binding;
+        cbm_ht_set(bs->ts_return_imports, binding->local_name, entry);
+        if (!cbm_ht_has(bs->ts_return_imports, binding->local_name))
+            return;
+    }
+    for (int i = 0; i < bs->imp_count; i++) {
+        CBM_LSP_WORK(1);
+        pxc_ts_return_import_t *entry = cbm_ht_get(bs->ts_return_imports, bs->imp_keys[i]);
+        if (!entry)
+            continue;
+        if (entry->module && strcmp(entry->module, bs->imp_vals[i]) != 0)
+            entry->ambiguous = true;
+        entry->module = bs->imp_vals[i];
+    }
+    bs->ts_return_imports_complete = true;
+}
+
 static const char *pxc_ts_return_qn(CBMArena *arena, const CBMDefinition *def,
                                     const pxc_base_scope_t *bs, const char *module_qn) {
     if (!bs ||
@@ -519,28 +564,19 @@ static const char *pxc_ts_return_qn(CBMArena *arena, const CBMDefinition *def,
     /* Same-module names are already qualified by the TS parser. Only an
      * explicit import needs rewriting, so ordinary primitive/local returns
      * never pay for a syntax or registry lookup here. */
-    int matches = 0;
-    const CBMImport *binding = NULL;
-    for (int i = 0; bs->imports && i < bs->imports->count; i++) {
-        const char *local = bs->imports->items[i].local_name;
-        if (local && strlen(local) == len && memcmp(local, name, len) == 0) {
-            matches++;
-            binding = &bs->imports->items[i];
-        }
-    }
-    if (matches > 1 || (!matches && !def->ts_return_constructor))
+    if (!bs->ts_return_imports_complete)
         return NULL;
     const char *bare = cbm_arena_strndup(arena, name, len);
+    if (!bare)
+        return NULL;
+    CBM_LSP_WORK(1);
+    const pxc_ts_return_import_t *entry = cbm_ht_get(bs->ts_return_imports, bare);
+    if ((entry && entry->ambiguous) || (!entry && !def->ts_return_constructor))
+        return NULL;
+    const CBMImport *binding = entry ? entry->binding : NULL;
     const char *qn = NULL;
     if (binding && binding->member) {
-        const char *module = NULL;
-        for (int i = 0; i < bs->imp_count; i++) {
-            if (strcmp(bs->imp_keys[i], bare) != 0)
-                continue;
-            if (module && strcmp(module, bs->imp_vals[i]) != 0)
-                return NULL;
-            module = bs->imp_vals[i];
-        }
+        const char *module = entry->module;
         if (module) {
             const char *candidate = cbm_arena_sprintf(arena, "%s.%s", module, binding->member);
             if (cbm_label_is_type_like(cbm_registry_label_of(bs->reg, candidate)))
@@ -715,6 +751,10 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
                              const char *namespace_name, CBMLanguage lang, CBMLSPDef *dst,
                              const pxc_base_scope_t *bs) {
     const char *label = pxc_map_label(arena, src->label);
+    if (src->label && strcmp(src->label, "Module") == 0 &&
+        (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX || lang == CBM_LANG_JAVASCRIPT) &&
+        (src->return_type || src->js_object_literal || src->alias_target))
+        label = "Module";
     if (!label || !src->qualified_name || !src->name)
         return -1;
     memset(dst, 0, sizeof(*dst));
@@ -745,6 +785,19 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     }
     dst->is_interface = (strcmp(label, "Interface") == 0 || strcmp(label, "Protocol") == 0);
     dst->js_object_literal = src->js_object_literal;
+    dst->is_static = src->is_static;
+    dst->ts_value_binding_written = src->ts_value_binding_written;
+    dst->ts_return_constructor = src->ts_return_constructor;
+    if (src->js_object_members) {
+        int n = 0;
+        while (src->js_object_members[n])
+            n++;
+        const char **members = cbm_arena_calloc(arena, ((size_t)n + 1) * sizeof(*members));
+        if (members)
+            for (int i = 0; i < n; i++)
+                members[i] = cbm_arena_strdup(arena, src->js_object_members[i]);
+        dst->js_object_members = members;
+    }
     /* The return-type string. The Go registrar splits it on '|' (go_lsp.c
      * split_pipe_types), so a Go result LIST arrives split into its element
      * types: `(*T, error)` as `*T|error`, a named `(t *T)` as `*T`. The raw
@@ -788,7 +841,9 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
         }
     }
     dst->lang = lang;
-    dst->alias_target = (lang == CBM_LANG_GO && src->alias_target)
+    dst->alias_target = ((lang == CBM_LANG_GO || lang == CBM_LANG_TYPESCRIPT ||
+                          lang == CBM_LANG_TSX || lang == CBM_LANG_JAVASCRIPT) &&
+                         src->alias_target)
                             ? cbm_arena_strdup(arena, src->alias_target)
                             : NULL;
     dst->decorators = NULL;
@@ -1361,12 +1416,16 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
                                         files[fi].language, fr, true, &bs.imp_keys, &bs.imp_vals,
                                         &bs.imp_count);
         }
+        if (bs.reg && (bs.lang == CBM_LANG_TYPESCRIPT || bs.lang == CBM_LANG_TSX ||
+                       bs.lang == CBM_LANG_JAVASCRIPT))
+            pxc_index_ts_return_imports(arena, &bs);
         for (int di = 0; di < fr->defs.count; di++) {
             if (pxc_build_lsp_def(arena, &fr->defs.items[di], def_modules[fi], namespace_name,
                                   files[fi].language, &defs[idx], bs.reg ? &bs : NULL) == 0) {
                 idx++;
             }
         }
+        cbm_ht_free(bs.ts_return_imports);
         if (files[fi].language == CBM_LANG_PYTHON) {
             pxc_fold_py_field_types(arena, fr, defs, file_start, idx, &bs, def_modules[fi]);
             /* Package namespace records (re-exports), reserved in the bound
@@ -2673,6 +2732,37 @@ static void pxc_drop_superseded_kt_any(CBMArena *keys, CBMResolvedCallArray *dst
     cbm_ht_free(resolved);
 }
 
+/* A cross-file answer replaces a preliminary unresolved answer for that
+ * exact TS/JS invocation. Otherwise an old weak miss can hide a final veto,
+ * or an old value veto can hide a newly proven namespace target. */
+static int pxc_site_cmp(const void *pa, const void *pb) {
+    const CBMResolvedCall *a = pa, *b = pb;
+    if (a->source_origin != b->source_origin)
+        return (a->source_origin > b->source_origin) - (a->source_origin < b->source_origin);
+    if (a->kind != b->kind)
+        return (a->kind > b->kind) - (a->kind < b->kind);
+    if (a->site_start_byte != b->site_start_byte)
+        return (a->site_start_byte > b->site_start_byte) -
+               (a->site_start_byte < b->site_start_byte);
+    return (a->site_end_byte > b->site_end_byte) - (a->site_end_byte < b->site_end_byte);
+}
+
+static void pxc_retire_ts_misses(CBMResolvedCallArray *old, CBMResolvedCallArray *fresh) {
+    if (!old || !fresh || !fresh->count)
+        return;
+    qsort(fresh->items, (size_t)fresh->count, sizeof(*fresh->items), pxc_site_cmp);
+    int count = 0;
+    for (int i = 0; i < old->count; i++) {
+        CBMResolvedCall *row = &old->items[i];
+        if (row->kind == CBM_RESOLVED_INVOCATION && row->confidence <= 0 &&
+            row->site_end_byte > row->site_start_byte &&
+            bsearch(row, fresh->items, (size_t)fresh->count, sizeof(*fresh->items), pxc_site_cmp))
+            continue;
+        old->items[count++] = *row;
+    }
+    old->count = count;
+}
+
 static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_calls,
                                const CBMResolvedCallArray *src_out) {
     if (!dst_calls || !src_out)
@@ -3057,6 +3147,7 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
     cbm_run_ts_lsp_cross(&scratch, source, source_len, module_qn, js_mode, jsx_mode, dts_mode, defs,
                          def_count, imp_names, imp_qns, imp_count, r->cached_tree, &out);
 
+    pxc_retire_ts_misses(&r->resolved_calls, &out);
     pxc_append_results(&r->arena, &r->resolved_calls, &out);
     cbm_js_rebind_resolved_calls(r);
     pxc_dedup_after_rebind(&r->resolved_calls);
@@ -3252,6 +3343,8 @@ void cbm_pxc_dispatch_file_with_php_bindings(
             break;
         }
         if (used_prebuilt) {
+            if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX)
+                pxc_retire_ts_misses(&result->resolved_calls, &out);
             pxc_append_results(&result->arena, &result->resolved_calls, &out);
             pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
             if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
@@ -3976,6 +4069,83 @@ static void pxc_mark_reexport_targets(const CBMModuleDefIndex *idx, bool *select
     cbm_free(CBM_MEM_CLASS_EXTRACT, queued);
 }
 
+/* Keep class providers referenced by selected TS return/field/base facts.
+ * Incremental fallback registries need the same type universe as a full
+ * shared registry. Each module and each selected definition is visited once. */
+static bool pxc_queue_type_modules(const CBMModuleDefIndex *idx, const CBMLSPDef *defs,
+                                   CBMLanguage lang, const char *text, bool *selected, int *queue,
+                                   int *tail, int *total, CBMHashTable *seen) {
+    if (!text)
+        return true;
+    static const char delimiters[] = "<>|:,(){}[] &\t\r\n";
+    while (*text) {
+        text += strspn(text, delimiters);
+        size_t len = strcspn(text, delimiters);
+        if (len && memchr(text, '.', len)) {
+            char *key = malloc(len + 1);
+            if (!key)
+                return false;
+            memcpy(key, text, len);
+            key[len] = '\0';
+            for (;;) {
+                pxc_module_entry_t *entry = cbm_ht_get(idx->ht, key);
+                if (entry) {
+                    const char *canonical = cbm_ht_get_key(idx->ht, key);
+                    if (!cbm_ht_has(seen, canonical)) {
+                        cbm_ht_set(seen, canonical, entry);
+                        if (!cbm_ht_has(seen, canonical)) {
+                            free(key);
+                            return false;
+                        }
+                        for (int j = 0; j < entry->count; j++) {
+                            int di = entry->indices[j];
+                            if (!selected[di] && pxc_def_lang_matches(lang, defs[di].lang)) {
+                                selected[di] = true;
+                                queue[(*tail)++] = di;
+                                (*total)++;
+                            }
+                        }
+                    }
+                    break;
+                }
+                char *dot = strrchr(key, '.');
+                if (!dot)
+                    break;
+                *dot = '\0';
+            }
+            free(key);
+        }
+        text += len;
+    }
+    return true;
+}
+
+static bool pxc_follow_ts_type_facts(const CBMModuleDefIndex *idx, const CBMLSPDef *defs,
+                                     CBMLanguage lang, bool *selected, int *total) {
+    int *queue = malloc((size_t)idx->def_count * sizeof(*queue));
+    CBMHashTable *seen = cbm_ht_create(64);
+    if (!queue || !seen) {
+        free(queue);
+        cbm_ht_free(seen);
+        return false;
+    }
+    int head = 0, tail = 0;
+    for (int i = 0; i < idx->def_count; i++)
+        if (selected[i])
+            queue[tail++] = i;
+    bool ok = true;
+    while (head < tail && ok) {
+        const CBMLSPDef *d = &defs[queue[head++]];
+        const char *facts[] = {d->return_types, d->embedded_types, d->field_defs, d->alias_target};
+        for (int i = 0; i < 4 && ok; i++)
+            ok = pxc_queue_type_modules(idx, defs, lang, facts[i], selected, queue, &tail, total,
+                                        seen);
+    }
+    free(queue);
+    cbm_ht_free(seen);
+    return ok;
+}
+
 CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef *all_defs,
                                         CBMLanguage caller_lang, const char *caller_namespace,
                                         const char *own_module, const char *const *imp_qns,
@@ -4011,6 +4181,10 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
     if (caller_lang == CBM_LANG_PYTHON) {
         pxc_mark_reexport_targets(idx, selected, all_defs, &total);
     }
+
+    if (pxc_is_js_family(caller_lang) &&
+        !pxc_follow_ts_type_facts(idx, all_defs, caller_lang, selected, &total))
+        goto failed;
 
     if (total == 0) {
         cbm_free(CBM_MEM_CLASS_EXTRACT, selected);
