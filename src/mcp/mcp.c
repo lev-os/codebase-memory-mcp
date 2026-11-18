@@ -15018,7 +15018,15 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     cbm_store_t *store = srv->store;
     int in_deg = 0;
     int out_deg = 0;
-    cbm_store_node_degree(store, node->id, &in_deg, &out_deg);
+    char **nb_callers = NULL;
+    int nb_caller_count = 0;
+    char **nb_callees = NULL;
+    int nb_callee_count = 0;
+    /* The same grouped edge query supplies totals and qualified identities.
+     * Fetch one row for totals when names were not requested. */
+    cbm_store_node_neighbor_names(store, node->id, include_neighbors ? MCP_DEFAULT_LIMIT : 1,
+                                  &nb_callers, &nb_caller_count, &nb_callees, &nb_callee_count,
+                                  &in_deg, &out_deg);
     yyjson_mut_obj_add_int(doc, root_obj, "callers", in_deg);
     yyjson_mut_obj_add_int(doc, root_obj, "callees", out_deg);
     if (trace_label_is_callable(node->label)) {
@@ -15028,15 +15036,13 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
 
     add_snippet_coverage_note(doc, root_obj, store, node);
 
-    char **nb_callers = NULL;
-    int nb_caller_count = 0;
-    char **nb_callees = NULL;
-    int nb_callee_count = 0;
     if (include_neighbors) {
-        cbm_store_node_neighbor_names(store, node->id, MCP_DEFAULT_LIMIT, &nb_callers,
-                                      &nb_caller_count, &nb_callees, &nb_callee_count);
         add_string_array(doc, root_obj, "caller_names", nb_callers, nb_caller_count);
         add_string_array(doc, root_obj, "callee_names", nb_callees, nb_callee_count);
+        if (nb_caller_count < in_deg)
+            yyjson_mut_obj_add_bool(doc, root_obj, "caller_names_truncated", true);
+        if (nb_callee_count < out_deg)
+            yyjson_mut_obj_add_bool(doc, root_obj, "callee_names_truncated", true);
     }
 
     /* Alternatives (when auto-resolved from ambiguous) */

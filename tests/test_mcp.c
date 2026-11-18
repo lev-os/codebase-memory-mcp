@@ -28873,7 +28873,81 @@ TEST(tool_recursive_neighbors_and_noncallable_snippet) {
     PASS();
 }
 
+
+TEST(tool_snippet_neighbor_counts_and_names_agree) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *s = cbm_mcp_server_store(srv);
+    cbm_mcp_server_set_project(srv, "p");
+    ASSERT_EQ(cbm_store_upsert_project(s, "p", "/tmp/p"), CBM_STORE_OK);
+    cbm_node_t root = {.project = "p", .label = "Function", .name = "hub", .qualified_name = "p.hub"};
+    int64_t hub = cbm_store_upsert_node(s, &root);
+    const char *types[] = {"CALLS", "HTTP_CALLS", "ASYNC_CALLS"};
+    bool ok = true;
+    for (int i = 0; i < 12; i++) {
+        char qn[64], file[64];
+        snprintf(qn, sizeof(qn), "p.file%02d.walk", i);
+        snprintf(file, sizeof(file), "file%02d.js", i);
+        cbm_node_t n = {.project = "p", .label = "Function", .name = "walk", .qualified_name = qn, .file_path = file};
+        int64_t id = cbm_store_upsert_node(s, &n);
+        for (int dir = 0; dir < 2; dir++) {
+            cbm_edge_t e = {.project = "p", .source_id = dir ? hub : id,
+                            .target_id = dir ? id : hub, .type = types[i % 3]};
+            ASSERT_GT(cbm_store_insert_edge(s, &e), 0);
+            /* One neighbor reached through two edge kinds still has one identity. */
+            if (i == 0) {
+                e.type = "ASYNC_CALLS";
+                ASSERT_GT(cbm_store_insert_edge(s, &e), 0);
+            }
+        }
+        if (i != 2 && i != 11) continue;
+        /* The separate degree API also serves Cypher's CALLS-only metrics. */
+        int calls_in = 0, calls_out = 0;
+        cbm_store_node_degree(s, hub, &calls_in, &calls_out);
+        printf("  CALLS-only degree=%d/%d expected=%d\n", calls_in, calls_out, i / 3 + 1);
+        ok = calls_in == i / 3 + 1 && calls_out == i / 3 + 1 && ok;
+        for (int include = 0; include < 2; include++) {
+            char args[256];
+            snprintf(args, sizeof(args), "{\"project\":\"p\",\"qualified_name\":\"p.hub\",\"format\":\"json\",\"include_neighbors\":%s}", include ? "true" : "false");
+            char *response = cbm_mcp_handle_tool(srv, "get_code_snippet", args);
+            char *inner = extract_text_content(response);
+            ASSERT_NOT_NULL(inner);
+            yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+            ASSERT_NOT_NULL(doc);
+            yyjson_val *obj = yyjson_doc_get_root(doc);
+            const char *counts[] = {"callers", "callees"};
+            const char *lists[] = {"caller_names", "callee_names"};
+            const char *cuts[] = {"caller_names_truncated", "callee_names_truncated"};
+            for (int d = 0; d < 2; d++) {
+                int total = (int)yyjson_get_int(yyjson_obj_get(obj, counts[d]));
+                yyjson_val *names = yyjson_obj_get(obj, lists[d]);
+                printf("  snippet %s include=%d total=%d expected=%d names=%zu\n", counts[d], include, total, i+1, yyjson_arr_size(names));
+                ok = total == i + 1 && ok;
+                if (include) {
+                    int want = i == 2 ? 3 : 10;
+                    ok = yyjson_arr_size(names) == (size_t)want && ok;
+                    for (int j = 0; j < want; j++) {
+                        char expected[64];
+                        snprintf(expected, sizeof(expected), "p.file%02d.walk", j);
+                        const char *got = yyjson_get_str(yyjson_arr_get(names, j));
+                        ok = got && strcmp(got, expected) == 0 && ok;
+                    }
+                    ok = yyjson_get_bool(yyjson_obj_get(obj, cuts[d])) == (i == 11) && ok;
+                }
+            }
+            yyjson_doc_free(doc); free(inner); free(response);
+        }
+    }
+    cbm_mcp_server_free(srv);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+
+
+
 SUITE(mcp) {
+    RUN_TEST(tool_snippet_neighbor_counts_and_names_agree);
     RUN_TEST(tool_recursive_neighbors_and_noncallable_snippet);
     RUN_TEST(tool_caller_summary_keeps_other_same_name_roots);
     RUN_TEST(tool_caller_summaries_exclude_recursive_root);
