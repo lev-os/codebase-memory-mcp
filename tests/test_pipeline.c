@@ -38991,7 +38991,56 @@ TEST(pipeline_x9c_named_class_static_members_are_values) {
     PASS();
 }
 
+/* Each fixture checks the complete caller edge set through both writers. */
+static bool x9d_calls(const char *provider, const char *call, const char *want) {
+    bool ok = true;
+    for (int parallel = 0; parallel < 2; parallel++) {
+        char tmp[256] = "/tmp/cbm_x9d_calls_XXXXXX", db[512], main[2048], got[4096];
+        if (!cbm_mkdtemp(tmp)) return false;
+        XlangEnvSave env = xlang_env_select(parallel != 0);
+        if (parallel) x9c_parallel_fixture(tmp);
+        write_temp_file(tmp, "lib.ts", provider);
+        write_temp_file(tmp, "x.ts", "export const loaded = true;\n");
+        write_temp_file(tmp, "other.ts", "export class Other {}\n");
+        snprintf(main, sizeof(main), "%s\nexport async function use() { %s }\n",
+                 "import api, { make, Builder, api2, Port } from './lib';", call);
+        write_temp_file(tmp, "main.ts", main);
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        int rc = p ? x9c_parallel_run(p, parallel != 0) : -1;
+        if (rc == 0) {
+            js_twin_calls_at(db, cbm_pipeline_project_name(p), "main.ts", 2, got, sizeof(got));
+            ok = js_twin_expect(parallel ? "parallel exact CALLS" : "sequential exact CALLS",
+                                got, want) && ok;
+        } else ok = false;
+        cbm_pipeline_free(p);
+        xlang_env_restore(&env);
+        th_rmtree(tmp);
+    }
+    return ok;
+}
+
+TEST(pipeline_x9d_default_export_binding) {
+    const char *sources[] = {
+        "function run() {}\nfunction outer() { function run() {} }\nexport default run;\n",
+        "function run() {} function outer() { function run() {} } export default run;\n",
+        "export default function run() {} function outer() { function run() {} }\n",
+        "const run = () => {}; function outer() { const run = () => {}; } export default run;\n",
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        ok = x9d_calls(sources[i], "api();", "main.use -> lib.run") && ok;
+    ok = x9d_calls("export default class Port { static run() {} } function outer() { class Port {} }",
+                    "api.run();", "main.use -> lib.Port.run") && ok;
+    ok = x9d_calls("class Port { send() {} } const value = new Port(); export default value;",
+                    "api.send();", "main.use -> lib.Port.send") && ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_x9d_default_export_binding);
+
     RUN_TEST(pipeline_x9c_named_class_static_members_are_values);
     RUN_TEST(pipeline_x9c_return_import_work_is_linear);
 

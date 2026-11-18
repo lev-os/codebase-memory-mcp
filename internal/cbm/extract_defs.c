@@ -9081,6 +9081,9 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     def.qualified_name = class_qn;
     def.label = label;
     def.file_path = ctx->rel_path;
+    if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
+        ctx->language == CBM_LANG_TSX)
+        def.node_start_byte = ts_node_start_byte(node);
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
@@ -10596,6 +10599,9 @@ static void push_var_def_qn_doc(CBMExtractCtx *ctx, const char *name, const char
      * is additive metadata that lets cross-file resolution attach the
      * property to its receiver type. */
     def.parent_class = ctx->var_parent_class;
+    if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
+        ctx->language == CBM_LANG_TSX)
+        def.node_start_byte = ts_node_start_byte(node);
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
     def.is_exported = cbm_is_exported(name, ctx->language);
@@ -15927,6 +15933,37 @@ static const char **js_object_members(CBMExtractCtx *ctx, TSNode object, CBMDefi
     return members;
 }
 
+/* A default export reads a module binding, never a nested namesake. */
+static TSNode js_module_binding(CBMExtractCtx *ctx, const char *name) {
+    TSNode found = {0};
+    for (uint32_t i = 0; name && i < ts_node_named_child_count(ctx->root); i++) {
+        TSNode node = ts_node_named_child(ctx->root, i);
+        if (strcmp(ts_node_type(node), "export_statement") == 0)
+            node = ts_node_child_by_field_name(node, "declaration", 11);
+        if (ts_node_is_null(node))
+            continue;
+        bool variables = strcmp(ts_node_type(node), "lexical_declaration") == 0 ||
+                         strcmp(ts_node_type(node), "variable_declaration") == 0;
+        uint32_t count = variables ? ts_node_named_child_count(node) : 1;
+        for (uint32_t j = 0; j < count; j++) {
+            TSNode decl = variables ? ts_node_named_child(node, j) : node;
+            const char *kind = ts_node_type(decl);
+            if (strcmp(kind, "variable_declarator") != 0 &&
+                strcmp(kind, "function_declaration") != 0 &&
+                strcmp(kind, "generator_function_declaration") != 0 &&
+                strcmp(kind, "class_declaration") != 0)
+                continue;
+            TSNode binding = ts_node_child_by_field_name(decl, "name", 4);
+            if (ts_node_is_null(binding) || !js_node_text_is(binding, ctx->source, name))
+                continue;
+            if (!ts_node_is_null(found))
+                return (TSNode){0}; /* Ambiguous declarations have no exact value. */
+            found = decl;
+        }
+    }
+    return found;
+}
+
 static void js_record_object_members(CBMExtractCtx *ctx, int mod_idx) {
     bool needed = false;
     for (int i = 0; i < ctx->result->defs.count; i++)
@@ -16023,7 +16060,7 @@ defaults:
             for (int j = 0; text && j < count; j++) {
                 CBMDefinition *d = &ctx->result->defs.items[j];
                 if (d->name && strcmp(d->name, text) == 0 && !d->parent_class &&
-                    d->start_line == ts_node_start_point(declaration).row + 1 &&
+                    d->node_start_byte == ts_node_start_byte(declaration) &&
                     (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Class") == 0))
                     mod->alias_target = d->qualified_name;
             }
@@ -16036,9 +16073,17 @@ defaults:
             mod->js_object_members = js_object_members(ctx, value, defs, count);
         } else if (strcmp(ts_node_type(value), "identifier") == 0) {
             const char *name = cbm_node_text(ctx->arena, value, ctx->source);
+            TSNode binding = js_module_binding(ctx, name);
+            if (ts_node_is_null(binding))
+                continue;
+            TSNode fn = cbm_ts_unwrap_value(ts_node_child_by_field_name(binding, "value", 5));
+            uint32_t start = ts_node_start_byte(binding);
             for (int j = 0; j < count; j++) {
                 CBMDefinition *d = &ctx->result->defs.items[j];
-                if (!d->name || !name || strcmp(d->name, name) != 0)
+                bool callable_value = !ts_node_is_null(fn) &&
+                                      d->node_start_byte == ts_node_start_byte(fn);
+                if (!d->name || !name || strcmp(d->name, name) != 0 ||
+                    (d->node_start_byte != start && !callable_value))
                     continue;
                 if (strcmp(d->label, "Variable") == 0) {
                     mod->return_type = d->return_type ? d->return_type : "unknown";

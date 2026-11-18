@@ -1832,7 +1832,8 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *     escaped in a literal key's QN segment. */
 /* 31: constructor proofs, captured writes and default/literal values changed
  *     CALLS for unchanged importers; rebuild stored graphs once. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 31 };
+/* Default-export identity and return proofs also change unchanged importers. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 32 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
