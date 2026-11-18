@@ -38626,7 +38626,62 @@ TEST(pipeline_js_twin_callables_scale) {
     PASS();
 }
 
+TEST(pipeline_js_self_edge_requires_unwritten_binding) {
+    static const char *const files[] = {
+        "member.js",
+        "function replacement() {}\n"
+        "class C { walk() { this.walk = replacement; this.walk(); } }\n"
+        "class D { step() { this.step(); } }\n"
+        "D.prototype.step = replacement;\n"
+        "class Stable { run() { this.other = replacement; this.run(); } }\n",
+        "script.js",
+        "function replacement() {}\n"
+        "function walk() { globalThis.walk = replacement; walk(); }\n"
+        "function step() { window.step = replacement; step(); }\n"
+        "function run() { self.run = replacement; run(); }\n"
+        "function stable() { stable(); }\n",
+        "self.js",
+        "import { walk as again } from './self';\n"
+        "function replacement() {}\n"
+        "export function walk() { again(); }\n"
+        "walk = replacement;\n",
+        "clean.js",
+        "import { walk as again } from './clean';\n"
+        "export function walk() { again(); }\n",
+        NULL};
+    static const struct {
+        const char *file;
+        int line;
+        const char *want;
+    } cases[] = {{"member.js", 2, ""},
+                 {"member.js", 3, ""},
+                 {"member.js", 5, "member.Stable.run -> member.Stable.run"},
+                 {"script.js", 2, ""},
+                 {"script.js", 3, ""},
+                 {"script.js", 4, ""},
+                 {"script.js", 5, "script.stable -> script.stable"},
+                 {"self.js", 3, ""},
+                 {"clean.js", 2, "clean.walk -> clean.walk"}};
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        js_exact_run_t run;
+        ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            char got[1024], what[128];
+            snprintf(what, sizeof(what), "binding mode=%d %s:%d", mode, cases[i].file,
+                     cases[i].line);
+            js_twin_calls_at(run.db, run.project, cases[i].file, cases[i].line, got, sizeof(got));
+            printf("  %s [%s]\n", what, got);
+            ok = js_twin_expect(what, got, cases[i].want) && ok;
+        }
+        js_exact_done(&run);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_js_self_edge_requires_unwritten_binding);
     RUN_TEST(pipeline_js_quoted_callable_names);
     RUN_TEST(pipeline_js_quoted_key_keeps_lexical_binding);
     RUN_TEST(pipeline_js_reassigned_callable_has_no_self_edge);

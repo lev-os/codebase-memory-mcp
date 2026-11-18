@@ -1711,6 +1711,14 @@ static void ts_site_push(TSLSPContext *ctx, TsSiteVec *v, TSNode name, uint32_t 
 
 /* Every identifier a destructuring target writes. Nesting past 64 levels
  * marks the set incomplete, which fails closed. */
+static bool ts_write_name_is(TSLSPContext *ctx, TSNode node, const char *name) {
+    if (ts_node_is_null(node))
+        return false;
+    uint32_t lo = ts_node_start_byte(node), hi = ts_node_end_byte(node);
+    return hi >= lo && hi <= (uint32_t)ctx->source_len && hi - lo == strlen(name) &&
+           memcmp(ctx->source + lo, name, hi - lo) == 0;
+}
+
 static void ts_site_push_pattern(TSLSPContext *ctx, TsSiteVec *v, TSNode pattern, uint32_t fs,
                                  uint32_t fe, int depth) {
     while (ts_write_wrapper(pattern))
@@ -1725,6 +1733,49 @@ static void ts_site_push_pattern(TSLSPContext *ctx, TsSiteVec *v, TSNode pattern
     if (strcmp(kind, "identifier") == 0 ||
         strcmp(kind, "shorthand_property_identifier_pattern") == 0) {
         ts_site_push(ctx, v, pattern, fs, fe);
+    } else if (strcmp(kind, "member_expression") == 0 ||
+               strcmp(kind, "subscript_expression") == 0) {
+        TSNode object = ts_node_child_by_field_name(pattern, "object", 6);
+        TSNode prop = ts_node_child_by_field_name(pattern, "property", 8);
+        if (ts_node_is_null(prop))
+            prop = ts_node_child_by_field_name(pattern, "index", 5);
+        const char *prefix = NULL;
+        if (node_kind_is(object, "this")) {
+            prefix = "this.";
+        } else if (node_kind_is(object, "member_expression")) {
+            TSNode part = ts_node_child_by_field_name(object, "property", 8);
+            if (ts_write_name_is(ctx, part, "prototype"))
+                prefix = "this."; /* a prototype write can replace an instance method */
+        } else if (node_kind_is(object, "identifier") &&
+                   (ts_write_name_is(ctx, object, "globalThis") ||
+                    ts_write_name_is(ctx, object, "window") ||
+                    ts_write_name_is(ctx, object, "self"))) {
+            prefix = "globalThis.";
+        }
+        if (prefix) {
+            int before = v->count;
+            ts_site_push(ctx, v, prop, fs, fe);
+            if (v->failed || v->count == before)
+                return;
+            const char *name = v->items[before].name;
+            if (node_kind_is(prop, "string")) {
+                size_t len = strlen(name);
+                if (len < 2 || strchr(name, '\\')) {
+                    v->failed = true;
+                    return;
+                }
+                name = cbm_arena_strndup(ctx->arena, name + 1, len - 2);
+            } else if (node_kind_is(pattern, "subscript_expression")) {
+                v->failed = true; /* an unknown key may replace any method/global */
+                return;
+            }
+            const char *key = name ? cbm_arena_sprintf(ctx->arena, "%s%s", prefix, name) : NULL;
+            if (!key) {
+                v->failed = true;
+                return;
+            }
+            v->items[before].name = key;
+        }
     } else if (strcmp(kind, "pair_pattern") == 0) {
         TSNode value = ts_node_child_by_field_name(pattern, "value", TS_LSP_FIELD_LEN("value"));
         ts_site_push_pattern(ctx, v, value, fs, fe, depth + 1);
@@ -7695,10 +7746,15 @@ static int ts_name_ptr_cmp(const void *a, const void *b) {
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
-/* Mark each bare call whose name no assignment in the file writes and no
- * `var` declares (closures included). Only such a call keeps a self CALLS
- * edge: `walk = other; walk();` inside walk reaches other, not walk. An
- * incomplete site set marks nothing, so the self edge fails closed. */
+/* Assignment sites are collected once and sorted. A self target has the
+ * enclosing callable's name, even when the call uses an import alias. */
+static bool ts_name_unwritten(const struct TsAssignSites *s, const char **vars, const char *name) {
+    int at = ts_proof_first_name(s->by_name, s->count, name);
+    return !(at < s->count && strcmp(s->by_name[at].name, name) == 0) &&
+           !(vars &&
+             bsearch(&name, vars, (size_t)s->hoisted_count, sizeof(*vars), ts_name_ptr_cmp));
+}
+
 static void ts_mark_unwritten_callees(TSLSPContext *ctx, CBMFileResult *result) {
     const struct TsAssignSites *s = ctx->assign_sites;
     if (!s || !s->complete)
@@ -7713,17 +7769,47 @@ static void ts_mark_unwritten_callees(TSLSPContext *ctx, CBMFileResult *result) 
             vars[i] = s->hoisted[i].name;
         qsort(vars, (size_t)s->hoisted_count, sizeof(*vars), ts_name_ptr_cmp);
     }
+    bool script = true;
+    uint32_t statements = ts_node_named_child_count(s->root);
+    for (uint32_t i = 0; i < statements; i++) {
+        TSNode stmt = ts_node_named_child(s->root, i);
+        if (node_kind_is(stmt, "import_statement") || node_kind_is(stmt, "export_statement")) {
+            script = false;
+            break;
+        }
+    }
     for (int i = 0; i < result->calls.count; i++) {
         CBMCall *call = &result->calls.items[i];
         const char *name = call->callee_name;
-        if (!name || !name[0] || strchr(name, '.'))
+        if (!name || !name[0])
             continue;
-        int at = ts_proof_first_name(s->by_name, s->count, name);
-        if (at < s->count && strcmp(s->by_name[at].name, name) == 0)
+        const char *leaf = strrchr(name, '.');
+        if (leaf) {
+            const char *member = cbm_arena_sprintf(ctx->arena, "this.%s", leaf + 1);
+            call->callee_never_written = member && ts_name_unwritten(s, vars, member);
             continue;
-        if (vars && bsearch(&name, vars, (size_t)s->hoisted_count, sizeof(*vars),
-                            ts_name_ptr_cmp))
+        }
+        if (!ts_name_unwritten(s, vars, name))
             continue;
+        /* A self edge resolves to the enclosing callable, not to the alias
+         * spelling. A same-name shadow write may conservatively withhold it. */
+        const char *target = call->enclosing_func_qn;
+        target = target ? strrchr(target, '.') : NULL;
+        if (!target)
+            continue;
+        target++;
+        /* Same-name callable identities may carry a #number suffix. Bare
+         * JS identifiers cannot contain '#', so it is not part of the binding. */
+        const char *suffix = strchr(target, '#');
+        if (suffix)
+            target = cbm_arena_strndup(ctx->arena, target, (size_t)(suffix - target));
+        if (!target || !ts_name_unwritten(s, vars, target))
+            continue;
+        if (script) {
+            const char *global = cbm_arena_sprintf(ctx->arena, "globalThis.%s", target);
+            if (!global || !ts_name_unwritten(s, vars, global))
+                continue;
+        }
         call->callee_never_written = true;
     }
 }
