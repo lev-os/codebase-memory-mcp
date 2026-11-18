@@ -38835,6 +38835,45 @@ TEST(pipeline_unknown_member_write_preserves_local_types) {
     PASS();
 }
 
+TEST(pipeline_member_self_calls_reject_indirect_writes) {
+    const char *sources[] = {
+        "class C { walk() { Object.defineProperty(this, 'walk', {value: replacement}); this.walk(); } }\n",
+        "class C { walk() { Object.defineProperties(this, {walk: {value: replacement}}); this.walk(); } }\n",
+        "class C { walk() { Object.assign(this, {walk: replacement}); this.walk(); } }\n",
+        "class C { walk() { Object.assign(C.prototype, {walk: replacement}); this.walk(); } }\n",
+        "class C { walk() { Reflect.set(this, 'walk', replacement); this.walk(); } }\n",
+        "class C { walk() { const that = this; that.walk = replacement; this.walk(); } }\n",
+        "class C { walk() { const self = this; self.walk = replacement; this.walk(); } }\n",
+        "class C { static walk() { C.walk = replacement; C.walk(); } }\n",
+        "class C { static walk() { C.walk = replacement; this.walk(); } }\n",
+        "const api = { walk() { api.walk = replacement; api.walk(); } };\n",
+        "class C { walk() { other.walk = replacement; this.walk(); } }\n",
+        "class C { walk() { other.step = replacement; this.walk(); } }\n",
+    };
+    const char *files[25] = {0};
+    char paths[12][32];
+    for (int i = 0; i < 12; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "case%d.js", i);
+        files[2 * i] = paths[i];
+        files[2 * i + 1] = sources[i];
+    }
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        js_exact_run_t run;
+        ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+        for (int i = 0; i < 12; i++) {
+            char got[1024], what[128];
+            snprintf(what, sizeof(what), "indirect write mode=%d case=%d", mode, i);
+            js_twin_calls_at(run.db, run.project, paths[i], 1, got, sizeof(got));
+            ok = js_twin_expect(what, got,
+                                i == 11 ? "case11.C.walk -> case11.C.walk" : "") && ok;
+        }
+        js_exact_done(&run);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 TEST(pipeline_js_self_edge_requires_unwritten_binding) {
     static const char *const files[] = {
         "member.js",
@@ -39156,6 +39195,7 @@ TEST(pipeline_x9c_named_class_static_members_are_values) {
 
 SUITE(pipeline) {
     RUN_TEST(pipeline_unknown_member_write_preserves_local_types);
+    RUN_TEST(pipeline_member_self_calls_reject_indirect_writes);
     RUN_TEST(pipeline_js_self_edge_requires_unwritten_binding);
     RUN_TEST(pipeline_js_empty_and_quote_keys_are_distinct);
     RUN_TEST(pipeline_x9c_named_class_static_members_are_values);

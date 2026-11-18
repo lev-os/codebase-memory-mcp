@@ -1726,6 +1726,15 @@ static bool ts_write_name_is(TSLSPContext *ctx, TSNode node, const char *name) {
            memcmp(ctx->source + lo, name, hi - lo) == 0;
 }
 
+/* Recognize dotted and unescaped quoted helper properties. */
+static bool ts_write_key_is(TSLSPContext *ctx, TSNode node, const char *name) {
+    if (!node_kind_is(node, "string"))
+        return ts_write_name_is(ctx, node, name);
+    uint32_t lo = ts_node_start_byte(node), hi = ts_node_end_byte(node);
+    return hi >= lo && hi <= (uint32_t)ctx->source_len && hi - lo == strlen(name) + 2 &&
+           memcmp(ctx->source + lo + 1, name, hi - lo - 2) == 0;
+}
+
 static void ts_site_push_pattern(TSLSPContext *ctx, TsSiteVec *v, TSNode pattern, uint32_t fs,
                                  uint32_t fe, int depth) {
     while (ts_write_wrapper(pattern))
@@ -1748,24 +1757,13 @@ static void ts_site_push_pattern(TSLSPContext *ctx, TsSiteVec *v, TSNode pattern
         TSNode prop = ts_node_child_by_field_name(pattern, "property", 8);
         if (ts_node_is_null(prop))
             prop = ts_node_child_by_field_name(pattern, "index", 5);
-        const char *prefix = NULL;
-        if (node_kind_is(object, "this")) {
-            prefix = "this.";
-        } else if (node_kind_is(object, "member_expression") ||
-                   node_kind_is(object, "subscript_expression")) {
-            TSNode part = ts_node_child_by_field_name(object, "property", 8);
-            if (ts_node_is_null(part))
-                part = ts_node_child_by_field_name(object, "index", 5);
-            if (ts_write_name_is(ctx, part, "prototype") ||
-                ts_write_name_is(ctx, part, "'prototype'") ||
-                ts_write_name_is(ctx, part, "\"prototype\""))
-                prefix = "this."; /* a prototype write can replace an instance method */
-        } else if (node_kind_is(object, "identifier") &&
-                   (ts_write_name_is(ctx, object, "globalThis") ||
-                    ts_write_name_is(ctx, object, "window") ||
-                    ts_write_name_is(ctx, object, "self"))) {
-            prefix = "globalThis.";
-        }
+        /* Any receiver can alias this, a class, or a namespace object. A
+         * same-name write may conservatively withhold another class's self edge. */
+        const char *prefix = "this.";
+        bool global = node_kind_is(object, "identifier") &&
+                      (ts_write_name_is(ctx, object, "globalThis") ||
+                       ts_write_name_is(ctx, object, "window") ||
+                       ts_write_name_is(ctx, object, "self"));
         if (prefix) {
             if (node_kind_is(pattern, "subscript_expression") && !node_kind_is(prop, "string")) {
                 v->unknown_member_key = true;
@@ -1791,6 +1789,17 @@ static void ts_site_push_pattern(TSLSPContext *ctx, TsSiteVec *v, TSNode pattern
                 return;
             }
             v->items[before].name = key;
+            if (global) {
+                const char *global_key = cbm_arena_sprintf(ctx->arena, "globalThis.%s", name);
+                if (!global_key) {
+                    v->failed = true;
+                    return;
+                }
+                before = v->count;
+                ts_site_push(ctx, v, prop, fs, fe);
+                if (!v->failed && v->count > before)
+                    v->items[before].name = global_key;
+            }
         }
     } else if (strcmp(kind, "pair_pattern") == 0) {
         TSNode value = ts_node_child_by_field_name(pattern, "value", TS_LSP_FIELD_LEN("value"));
@@ -1829,6 +1838,28 @@ static void ts_site_visit_var(TSLSPContext *ctx, TsSiteVec *v, TsSiteVec *hoist,
 static void ts_site_visit(TSLSPContext *ctx, TsSiteVec *v, TsSiteVec *hoist,
                           const TSTreeCursor *cursor, TSNode node, uint32_t fs, uint32_t fe) {
     const char *kind = ts_node_type(node);
+    if (strcmp(kind, "call_expression") == 0) {
+        TSNode called = ts_node_child_by_field_name(node, "function", 8);
+        while (ts_write_wrapper(called))
+            called = ts_write_operand(called);
+        if (node_kind_is(called, "member_expression") ||
+            node_kind_is(called, "subscript_expression")) {
+            TSNode object = ts_node_child_by_field_name(called, "object", 6);
+            while (ts_write_wrapper(object))
+                object = ts_write_operand(object);
+            TSNode prop = ts_node_child_by_field_name(called, "property", 8);
+            if (ts_node_is_null(prop))
+                prop = ts_node_child_by_field_name(called, "index", 5);
+            bool object_helper = ts_write_name_is(ctx, object, "Object") &&
+                                 (ts_write_key_is(ctx, prop, "defineProperty") ||
+                                  ts_write_key_is(ctx, prop, "defineProperties") ||
+                                  ts_write_key_is(ctx, prop, "assign"));
+            bool reflect_helper = ts_write_name_is(ctx, object, "Reflect") &&
+                                  ts_write_key_is(ctx, prop, "set");
+            if (object_helper || reflect_helper)
+                v->unknown_member_key = true;
+        }
+    }
     if (kind[0] == 'v' && strcmp(kind, "variable_declaration") == 0) {
         ts_site_visit_var(ctx, v, hoist, cursor, node, fs, fe);
         return;
