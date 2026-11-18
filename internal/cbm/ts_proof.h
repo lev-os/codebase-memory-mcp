@@ -132,7 +132,9 @@ static inline bool cbm_ts_eval_function(TSNode node) {
     const char *kind = ts_node_type(node);
     return strcmp(kind, "function_declaration") == 0 || strcmp(kind, "function_expression") == 0 ||
            strcmp(kind, "function") == 0 || strcmp(kind, "arrow_function") == 0 ||
-           strcmp(kind, "method_definition") == 0 || strstr(kind, "generator");
+           strcmp(kind, "method_definition") == 0 || strcmp(kind, "class_static_block") == 0 ||
+           strcmp(kind, "internal_module") == 0 || strcmp(kind, "module") == 0 ||
+           strstr(kind, "generator");
 }
 
 /* Return one visible syntax declaration. Ambiguity leaves identity unproved. */
@@ -192,7 +194,15 @@ static inline TSNode cbm_ts_lexical_binding_at(TSNode site, const char *source, 
                     own)
                     break;
             }
-            if (!ts_node_is_null(scope) && ts_node_start_byte(scope) <= ts_node_start_byte(site) &&
+            /* Body vars are not visible in a non-simple parameter list.
+             * A static block or namespace also owns its var declarations. */
+            TSNode body = var && !ts_node_is_null(scope) && cbm_ts_eval_function(scope)
+                              ? ts_node_child_by_field_name(scope, "body", 4) : (TSNode){0};
+            bool body_visible = ts_node_is_null(body) ||
+                                (ts_node_start_byte(body) <= ts_node_start_byte(site) &&
+                                 ts_node_end_byte(site) <= ts_node_end_byte(body));
+            if (!ts_node_is_null(scope) && body_visible &&
+                ts_node_start_byte(scope) <= ts_node_start_byte(site) &&
                 ts_node_end_byte(site) <= ts_node_end_byte(scope)) {
                 uint32_t size = ts_node_end_byte(scope) - ts_node_start_byte(scope);
                 if (size < width) {

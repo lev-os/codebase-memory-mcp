@@ -39071,6 +39071,8 @@ TEST(pipeline_x9d_eval_binding) {
         "export class Port { send() {} } export function make() { return new Port(); } const eval = (x) => x; (eval)('text');",
         "export class Port { send() {} } export function make() { return new Port(); } function local(eval) {} (eval)('Port = Other');",
         "export class Port { send() {} } export function make() { return new Port(); } var eval = (x) => x; var eval; eval('text');",
+        "export class Port { send() {} } export function make() { return new Port(); } function local(value = eval('Port = Other')) { var eval; }",
+        "export class Port { send() {} } export function make() { return new Port(); } class Other { static { var eval; } } (eval)('Port = Other');",
     };
     bool ok = true;
     for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
