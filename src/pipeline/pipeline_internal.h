@@ -1830,9 +1830,11 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *     JS/TS call that needs a binding keeps its HTTP/route/config edges; the
  *     empty and `function` literal keys get nodes, and '.', '%' and '"' are
  *     escaped in a literal key's QN segment. */
-/* 31: self edges require unwritten member/global/alias targets; unchanged
+/* 31: constructor proofs, captured writes and default/literal values changed
+ *     CALLS for unchanged importers; rebuild stored graphs once. */
+/* 32: self edges require unwritten member/global/alias targets; unchanged
  *     files rebuild to remove spelling-only recursion and repair literal keys. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 31 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 32 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
