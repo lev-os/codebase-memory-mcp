@@ -39451,7 +39451,8 @@ TEST(pipeline_x9e_member_stability) {
         {"Object.defineProperty(Port.prototype, 'send', { value: replacement });", typed,
          "make().send();", "main.use -> lib.make"},
         {"Reflect.set(Port, 'build', replacement);", make, "Port.build();", ""},
-        {"Port.prototype['send'] = replacement;", make, "new Port().send();", "main.use -> lib.Port"},
+        {"Port.prototype['send'] = replacement;", make, "new Port().send();",
+         "main.use -> lib.Port"},
         /* A write to one named member withholds that member only. */
         {"Port.prototype.send = replacement;", make, "make().ping();",
          "main.use -> lib.Port.ping; main.use -> lib.make"},
@@ -39483,7 +39484,37 @@ TEST(pipeline_x9e_member_stability) {
     PASS();
 }
 
+TEST(pipeline_x9e_member_decorators) {
+    const char *make = "export function make() { return new Port(); }";
+    struct {
+        const char *port, *call, *want;
+    } cases[] = {
+        {"export class Port { @replacement send() {} ping() {} }", "make().send();",
+         "main.use -> lib.make"},
+        {"export class Port { @replacement send() {} ping() {} }",
+         "const p: Port = get(); p.send();", ""},
+        {"export class Port { @replacement static build() {} send() {} }", "Port.build();", ""},
+        {"@replacement export class Port { send() {} }", "const p: Port = get(); p.send();", ""},
+        /* A decorator on another member does not withhold send. */
+        {"export class Port { @replacement send() {} ping() {} }", "make().ping();",
+         "main.use -> lib.Port.ping; main.use -> lib.make"},
+        {"export class Port { send() {} @replacement ping() {} }", "make().send();",
+         "main.use -> lib.Port.send; main.use -> lib.make"},
+        {"export class Port { send() {} ping(@replacement value) {} }", "make().ping();",
+         "main.use -> lib.Port.ping; main.use -> lib.make"},
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char provider[1024];
+        snprintf(provider, sizeof(provider), "%s\n%s", cases[i].port, make);
+        ok = x9e_calls(provider, cases[i].call, cases[i].want) && ok;
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_x9e_member_decorators);
     RUN_TEST(pipeline_x9e_member_stability);
     RUN_TEST(pipeline_x9e_nullable_await);
     RUN_TEST(pipeline_x9d_static_writes_keep_constructor_binding);

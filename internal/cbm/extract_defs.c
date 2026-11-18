@@ -15841,7 +15841,8 @@ static bool js_member_fact(CBMExtractCtx *ctx, JsMemberFacts *f, const char *cls
                            const char *member) {
     if (f->count + 2 > f->cap) {
         int cap = f->cap ? f->cap * 2 : 16;
-        const char **items = (const char **)cbm_arena_alloc(ctx->arena, (size_t)cap * sizeof(*items));
+        const char **items =
+            (const char **)cbm_arena_alloc(ctx->arena, (size_t)cap * sizeof(*items));
         if (!items)
             return !(f->failed = true);
         if (f->count)
@@ -15981,6 +15982,65 @@ static bool js_helper_member_writes(CBMExtractCtx *ctx, CBMHashTable *writes, Js
     return ok;
 }
 
+static bool js_class_kind(TSNode node) {
+    const char *kind = ts_node_type(node);
+    return strcmp(kind, "class_declaration") == 0 || strcmp(kind, "class") == 0 ||
+           strcmp(kind, "abstract_class_declaration") == 0;
+}
+
+/* A decorator can replace what it decorates: a class decorator the class
+ * binding and every member, a member decorator that one member. TypeScript
+ * puts a method decorator under class_body before its method; JavaScript and
+ * field decorators sit inside the member. A parameter decorator replaces
+ * nothing. An unnamed class leaves the file without proof. */
+static bool js_decorator_facts(CBMExtractCtx *ctx, CBMHashTable *writes, JsMemberFacts *facts,
+                               TSNode decorator) {
+    TSNode parent = ts_node_parent(decorator), member = {0};
+    if (strcmp(ts_node_type(parent), "export_statement") == 0)
+        parent = ts_node_child_by_field_name(parent, "declaration", 11);
+    if (ts_node_is_null(parent))
+        return true;
+    if (strcmp(ts_node_type(parent), "class_body") == 0) {
+        member = ts_node_next_named_sibling(decorator);
+        while (!ts_node_is_null(member) && (strcmp(ts_node_type(member), "decorator") == 0 ||
+                                            strcmp(ts_node_type(member), "comment") == 0))
+            member = ts_node_next_named_sibling(member);
+        if (ts_node_is_null(member))
+            return false;
+        parent = ts_node_parent(parent);
+    } else if (!js_class_kind(parent)) {
+        TSNode body = ts_node_parent(parent);
+        if (ts_node_is_null(body) || strcmp(ts_node_type(body), "class_body") != 0)
+            return true;
+        member = parent;
+        parent = ts_node_parent(body);
+    }
+    if (ts_node_is_null(parent) || !js_class_kind(parent))
+        return true;
+    TSNode name = ts_node_child_by_field_name(parent, "name", 4);
+    TSNode holder = ts_node_parent(parent);
+    if (ts_node_is_null(name) && !ts_node_is_null(holder) &&
+        strcmp(ts_node_type(holder), "variable_declarator") == 0)
+        name = ts_node_child_by_field_name(holder, "name", 4);
+    const char *nk = ts_node_is_null(name) ? "" : ts_node_type(name);
+    const char *cls = strcmp(nk, "identifier") == 0 || strcmp(nk, "type_identifier") == 0
+                          ? cbm_node_text(ctx->arena, name, ctx->source)
+                          : NULL;
+    if (!cls)
+        return false;
+    if (ts_node_is_null(member)) {
+        cbm_ht_set(writes, cls, writes);
+        return cbm_ht_has(writes, cls) && js_member_fact(ctx, facts, cls, "*");
+    }
+    TSNode key = ts_node_child_by_field_name(member, "name", 4);
+    const char *kk = ts_node_is_null(key) ? "" : ts_node_type(key);
+    const char *replaced = strcmp(kk, "property_identifier") == 0 ||
+                                   strcmp(kk, "private_property_identifier") == 0
+                               ? cbm_node_text(ctx->arena, key, ctx->source)
+                               : js_fact_literal(ctx, key);
+    return js_member_fact(ctx, facts, cls, replaced);
+}
+
 /* The members of class `name` that the file's writes can replace. */
 static const char **js_class_facts(CBMExtractCtx *ctx, const JsMemberFacts *f, const char *name,
                                    bool complete) {
@@ -16022,7 +16082,7 @@ static void js_invalidate_written_returns(CBMExtractCtx *ctx) {
         const CBMDefinition *d = &ctx->result->defs.items[i];
         if (strcmp(d->label, "Class") == 0 && d->name && d->decorators && d->decorators[0]) {
             cbm_ht_set(writes, d->name, writes);
-            complete = cbm_ht_has(writes, d->name);
+            complete = cbm_ht_has(writes, d->name) && js_member_fact(ctx, &facts, d->name, "*");
         }
     }
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
@@ -16043,7 +16103,8 @@ static void js_invalidate_written_returns(CBMExtractCtx *ctx) {
         complete = js_return_write_pattern(ctx, writes, target, 0) &&
                    js_return_member_write(ctx, writes, &facts, target, false, NULL);
         if (complete && strcmp(kind, "unary_expression") == 0 &&
-            js_node_text_is(ts_node_child_by_field_name(node, "operator", 8), ctx->source, "delete"))
+            js_node_text_is(ts_node_child_by_field_name(node, "operator", 8), ctx->source,
+                            "delete"))
             complete = js_return_member_write(
                 ctx, writes, &facts, ts_node_child_by_field_name(node, "argument", 8), false, NULL);
         int helper = complete ? cbm_ts_member_helper(node, ctx->source) : 0;
@@ -16051,16 +16112,8 @@ static void js_invalidate_written_returns(CBMExtractCtx *ctx) {
             complete = js_helper_member_writes(ctx, writes, &facts,
                                                ts_node_child_by_field_name(node, "arguments", 9),
                                                helper);
-        if (strcmp(kind, "decorator") == 0) {
-            TSNode parent = ts_node_parent(node);
-            if (strcmp(ts_node_type(parent), "export_statement") == 0)
-                parent = ts_node_child_by_field_name(parent, "declaration", 11);
-            if (!ts_node_is_null(parent) &&
-                (strcmp(ts_node_type(parent), "class_declaration") == 0 ||
-                 strcmp(ts_node_type(parent), "class") == 0))
-                complete = complete && js_return_write_pattern(
-                    ctx, writes, ts_node_child_by_field_name(parent, "name", 4), 0);
-        }
+        if (complete && strcmp(kind, "decorator") == 0)
+            complete = js_decorator_facts(ctx, writes, &facts, node);
         if (!complete)
             break;
         if (ts_tree_cursor_goto_first_child(&cursor))

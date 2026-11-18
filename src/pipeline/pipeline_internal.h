@@ -1840,7 +1840,8 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *     object members change CALLS for unchanged importers. */
 /* 35: nullable awaited unions keep their receiver; unchanged importers of an
  *     async provider gain the member edges once. A write to one class member
- *     withholds that member only, at every dispatch path. */
+ *     withholds that member only, at every dispatch path.
+ *     A decorator withholds the member or the class it decorates. */
 enum { CBM_SEMANTIC_INDEX_VERSION = 35 };
 
 typedef struct {
