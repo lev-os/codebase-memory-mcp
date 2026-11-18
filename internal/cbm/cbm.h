@@ -269,6 +269,9 @@ typedef struct {
     bool is_static;                 // JS/TS method is declared on its class constructor.
     /* Alternating own member names and exact callable QNs, NULL terminated. */
     const char **js_object_members;
+    /* JS/TS Class: the member names that a write, a helper call or a decorator
+     * in this file can replace, NULL terminated; "*" is any member. */
+    const char **ts_mutated_members;
     const char *structural_profile; // AST structural profile (arena-allocated) or NULL
     const char *body_tokens; // space-separated raw identifier tokens from body (arena) or NULL
     /* Rust only: raw trait path from the exact `impl Trait for Type` block

@@ -39406,7 +39406,11 @@ static bool x9e_calls(const char *provider, const char *call, const char *want) 
     char source[4096];
     snprintf(source, sizeof(source),
              "export function replacement() {}\nexport class Other { send() {} }\n%s\n", provider);
-    return x9d_calls(source, call, want);
+    if (x9d_calls(source, call, want)) return true;
+    fprintf(stderr, "  ^ provider [");
+    for (const char *c = provider; *c; c++) fputc(*c == '\n' ? ' ' : *c, stderr);
+    fprintf(stderr, "] call [%s]\n", call);
+    return false;
 }
 
 TEST(pipeline_x9e_nullable_await) {
@@ -39430,7 +39434,57 @@ TEST(pipeline_x9e_nullable_await) {
     PASS();
 }
 
+TEST(pipeline_x9e_member_stability) {
+    const char *make = "export function make() { return new Port(); }";
+    const char *typed = "export function make(): Port { return new Port(); }";
+    struct {
+        const char *write, *factory, *call, *want;
+    } cases[] = {
+        {"Reflect.set(Port.prototype, 'send', replacement);", make, "make().send();",
+         "main.use -> lib.make"},
+        {"Object['assign'](Port.prototype, { send: replacement });", make, "make().send();",
+         "main.use -> lib.make"},
+        {"Port.prototype.send = replacement;", typed, "make().send();", "main.use -> lib.make"},
+        {"Port.prototype.send = replacement;", make, "const p: Port = get(); p.send();", ""},
+        {"Port.prototype.send = replacement;", make, "const p = get() as Port; p.send();", ""},
+        {"delete Port.prototype.send;", make, "const p: Port = get(); p.send();", ""},
+        {"Object.defineProperty(Port.prototype, 'send', { value: replacement });", typed,
+         "make().send();", "main.use -> lib.make"},
+        {"Reflect.set(Port, 'build', replacement);", make, "Port.build();", ""},
+        {"Port.prototype['send'] = replacement;", make, "new Port().send();", "main.use -> lib.Port"},
+        /* A write to one named member withholds that member only. */
+        {"Port.prototype.send = replacement;", make, "make().ping();",
+         "main.use -> lib.Port.ping; main.use -> lib.make"},
+        {"Reflect.set(Port.prototype, 'send', replacement);", typed,
+         "const p: Port = get(); p.ping();", "main.use -> lib.Port.ping"},
+        {"Other.prototype.send = replacement;", make, "make().send();",
+         "main.use -> lib.Port.send; main.use -> lib.make"},
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char provider[1024];
+        snprintf(provider, sizeof(provider),
+                 "export class Port { static build() {} send() {} ping() {} }\n%s\n%s",
+                 cases[i].write, cases[i].factory);
+        ok = x9e_calls(provider, cases[i].call, cases[i].want) && ok;
+    }
+    /* Inherited members: a write to the base or the derived prototype. */
+    const char *bases[] = {"Base.prototype.send = replacement;",
+                           "Port.prototype.send = replacement;"};
+    for (int i = 0; i < 2; i++) {
+        char provider[1024];
+        snprintf(provider, sizeof(provider),
+                 "export class Base { send() {} ping() {} }\nexport class Port extends Base {}\n%s",
+                 bases[i]);
+        ok = x9e_calls(provider, "const p: Port = get(); p.send(); p.ping();",
+                       "main.use -> lib.Base.ping") && ok;
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_x9e_member_stability);
     RUN_TEST(pipeline_x9e_nullable_await);
     RUN_TEST(pipeline_x9d_static_writes_keep_constructor_binding);
     RUN_TEST(pipeline_x9d_side_effect_import);

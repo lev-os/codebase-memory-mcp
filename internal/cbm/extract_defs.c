@@ -15828,9 +15828,62 @@ static bool js_return_static_data(CBMExtractCtx *ctx, TSNode object, const char 
     return found;
 }
 
-/* Mutating a constructor or its prototype also invalidates instance proof.
- * The existing persisted class flag carries this uncertainty to importers. */
-static bool js_return_member_write(CBMExtractCtx *ctx, CBMHashTable *writes, TSNode target, bool value) {
+/* (class name, member) pairs that a write, a property helper or a decorator
+ * in this file can replace. One set feeds the constructor proof here and the
+ * method lookup of every importer; "*" is any member. */
+typedef struct {
+    const char **items; /* class, member, class, member, ... */
+    int count, cap;
+    bool failed;
+} JsMemberFacts;
+
+static bool js_member_fact(CBMExtractCtx *ctx, JsMemberFacts *f, const char *cls,
+                           const char *member) {
+    if (f->count + 2 > f->cap) {
+        int cap = f->cap ? f->cap * 2 : 16;
+        const char **items = (const char **)cbm_arena_alloc(ctx->arena, (size_t)cap * sizeof(*items));
+        if (!items)
+            return !(f->failed = true);
+        if (f->count)
+            memcpy(items, f->items, (size_t)f->count * sizeof(*items));
+        f->items = items;
+        f->cap = cap;
+    }
+    f->items[f->count++] = cls;
+    f->items[f->count++] = member && strcmp(member, "__proto__") != 0 ? member : "*";
+    return true;
+}
+
+/* The member name a key expression denotes, in definition-name spelling:
+ * an unescaped string or a plain decimal integer. NULL when unproved. */
+static const char *js_fact_literal(CBMExtractCtx *ctx, TSNode key) {
+    key = cbm_ts_unwrap_value(key);
+    if (!cbm_js_literal_key_node(key, ctx->language))
+        return NULL;
+    const char *raw = cbm_node_text(ctx->arena, key, ctx->source);
+    if (!raw || strchr(raw, '\\'))
+        return NULL;
+    if (strcmp(ts_node_type(key), "number") == 0 &&
+        (strspn(raw, "0123456789") != strlen(raw) || (raw[0] == '0' && raw[1])))
+        return NULL;
+    return cbm_js_literal_key_name(ctx->arena, key, ctx->source);
+}
+
+/* The key one member or subscript step writes or reads, else NULL. */
+static const char *js_fact_step(CBMExtractCtx *ctx, TSNode step) {
+    TSNode key = ts_node_child_by_field_name(step, "property", 8);
+    if (!ts_node_is_null(key))
+        return cbm_node_text(ctx->arena, key, ctx->source);
+    return js_fact_literal(ctx, ts_node_child_by_field_name(step, "index", 5));
+}
+
+/* A write through a class or its prototype replaces one member: the step
+ * after `prototype` names an instance member, any other first step a static
+ * one, and an unknown step any member. `value` marks a helper's object
+ * argument, which writes `helper_key` (NULL: unknown). A write through a
+ * factory's imported constructor still invalidates the factory. */
+static bool js_return_member_write(CBMExtractCtx *ctx, CBMHashTable *writes, JsMemberFacts *facts,
+                                   TSNode target, bool value, const char *helper_key) {
     target = cbm_ts_unwrap_value(target);
     if (ts_node_is_null(target))
         return true;
@@ -15853,9 +15906,14 @@ static bool js_return_member_write(CBMExtractCtx *ctx, CBMHashTable *writes, TSN
         }
     }
     bool member = false;
+    const char *first = value ? helper_key : NULL, *second = NULL;
+    int steps = value ? 1 : 0;
     while (strcmp(ts_node_type(target), "member_expression") == 0 ||
            strcmp(ts_node_type(target), "subscript_expression") == 0) {
         member = true;
+        second = first;
+        first = js_fact_step(ctx, target);
+        steps++;
         target = cbm_ts_unwrap_value(ts_node_child_by_field_name(target, "object", 6));
         if (ts_node_is_null(target))
             return false;
@@ -15865,12 +15923,14 @@ static bool js_return_member_write(CBMExtractCtx *ctx, CBMHashTable *writes, TSN
     const char *name = cbm_node_text(ctx->arena, target, ctx->source);
     if (!name)
         return false;
+    const char *replaced =
+        first && strcmp(first, "prototype") == 0 ? (steps > 1 ? second : NULL) : first;
     for (int i = 0; i < ctx->result->defs.count; i++) {
         const CBMDefinition *d = &ctx->result->defs.items[i];
         if (strcmp(d->label, "Class") == 0 && d->name && strcmp(d->name, name) == 0) {
             if (static_key && js_return_static_data(ctx, target, name, static_key))
                 return true;
-            return js_return_write_pattern(ctx, writes, target, 0);
+            return js_member_fact(ctx, facts, d->name, replaced);
         }
         const char *ctor = d->ts_return_constructor ? d->return_type : NULL;
         if (ctor && strncmp(ctor, "Promise<", 8) == 0)
@@ -15881,6 +15941,73 @@ static bool js_return_member_write(CBMExtractCtx *ctx, CBMHashTable *writes, TSN
     return true;
 }
 
+/* The members a property helper (cbm_ts_member_helper) writes on its first
+ * argument: the keys of plain object sources, or its key argument. */
+static bool js_helper_member_writes(CBMExtractCtx *ctx, CBMHashTable *writes, JsMemberFacts *facts,
+                                    TSNode args, int helper) {
+    uint32_t n = ts_node_named_child_count(args);
+    TSNode first = ts_node_named_child(args, 0);
+    if (helper == CBM_TS_HELPER_KEY_ARG || helper == CBM_TS_HELPER_PROTOTYPE)
+        return js_return_member_write(
+            ctx, writes, facts, first, true,
+            helper == CBM_TS_HELPER_KEY_ARG && n > 1
+                ? js_fact_literal(ctx, ts_node_named_child(args, 1)) : NULL);
+    if (helper == CBM_TS_HELPER_KEYS_ARG && n > 2)
+        n = 2;
+    bool ok = true;
+    for (uint32_t i = 1; ok && i < n; i++) {
+        TSNode source = cbm_ts_unwrap_value(ts_node_named_child(args, i));
+        if (!cbm_ts_plain_object(source)) {
+            ok = js_return_member_write(ctx, writes, facts, first, true, NULL);
+            continue;
+        }
+        for (uint32_t j = 0; ok && j < ts_node_named_child_count(source); j++) {
+            TSNode member = ts_node_named_child(source, j);
+            const char *mk = ts_node_type(member);
+            if (strcmp(mk, "comment") == 0)
+                continue;
+            TSNode key = strcmp(mk, "pair") == 0 ? ts_node_child_by_field_name(member, "key", 3)
+                         : strcmp(mk, "method_definition") == 0
+                             ? ts_node_child_by_field_name(member, "name", 4)
+                             : member;
+            const char *kk = ts_node_type(key);
+            const char *name = strcmp(kk, "property_identifier") == 0 ||
+                                       strcmp(kk, "shorthand_property_identifier") == 0
+                                   ? cbm_node_text(ctx->arena, key, ctx->source)
+                                   : js_fact_literal(ctx, key);
+            ok = js_return_member_write(ctx, writes, facts, first, true, name);
+        }
+    }
+    return ok;
+}
+
+/* The members of class `name` that the file's writes can replace. */
+static const char **js_class_facts(CBMExtractCtx *ctx, const JsMemberFacts *f, const char *name,
+                                   bool complete) {
+    int n = 0;
+    for (int i = 0; complete && name && i < f->count; i += 2)
+        n += strcmp(f->items[i], name) == 0;
+    if (complete && !n)
+        return NULL;
+    const char **out = (const char **)cbm_arena_calloc(
+        ctx->arena, ((size_t)(n ? n : 1) + 1) * sizeof(*out));
+    if (!out || !complete) {
+        static const char *any[] = {"*", NULL};
+        return out ? (out[0] = "*", out) : any;
+    }
+    int used = 0;
+    for (int i = 0; i < f->count; i += 2) {
+        if (strcmp(f->items[i], name) != 0)
+            continue;
+        bool seen = false;
+        for (int j = 0; j < used && !seen; j++)
+            seen = strcmp(out[j], f->items[i + 1]) == 0;
+        if (!seen)
+            out[used++] = f->items[i + 1];
+    }
+    return out;
+}
+
 static void js_invalidate_written_returns(CBMExtractCtx *ctx) {
     bool needed = false;
     for (int i = 0; i < ctx->result->defs.count; i++)
@@ -15889,6 +16016,7 @@ static void js_invalidate_written_returns(CBMExtractCtx *ctx) {
     if (!needed)
         return;
     CBMHashTable *writes = cbm_ht_create(32);
+    JsMemberFacts facts = {0};
     bool complete = writes != NULL;
     for (int i = 0; complete && i < ctx->result->defs.count; i++) {
         const CBMDefinition *d = &ctx->result->defs.items[i];
@@ -15913,21 +16041,16 @@ static void js_invalidate_written_returns(CBMExtractCtx *ctx) {
         else if (strcmp(kind, "update_expression") == 0)
             target = ts_node_named_child(node, 0);
         complete = js_return_write_pattern(ctx, writes, target, 0) &&
-                   js_return_member_write(ctx, writes, target, false);
-        if (complete && strcmp(kind, "call_expression") == 0) {
-            TSNode called = cbm_ts_unwrap_value(ts_node_child_by_field_name(node, "function", 8));
-            TSNode object = ts_node_child_by_field_name(called, "object", 6);
-            TSNode property = ts_node_child_by_field_name(called, "property", 8);
-            if (!ts_node_is_null(object) && !ts_node_is_null(property) &&
-                js_node_text_is(object, ctx->source, "Object") &&
-                (js_node_text_is(property, ctx->source, "assign") ||
-                 js_node_text_is(property, ctx->source, "defineProperty") ||
-                 js_node_text_is(property, ctx->source, "defineProperties"))) {
-                TSNode args = ts_node_child_by_field_name(node, "arguments", 9);
-                TSNode first = ts_node_named_child(args, 0);
-                complete = js_return_member_write(ctx, writes, first, true);
-            }
-        }
+                   js_return_member_write(ctx, writes, &facts, target, false, NULL);
+        if (complete && strcmp(kind, "unary_expression") == 0 &&
+            js_node_text_is(ts_node_child_by_field_name(node, "operator", 8), ctx->source, "delete"))
+            complete = js_return_member_write(
+                ctx, writes, &facts, ts_node_child_by_field_name(node, "argument", 8), false, NULL);
+        int helper = complete ? cbm_ts_member_helper(node, ctx->source) : 0;
+        if (helper)
+            complete = js_helper_member_writes(ctx, writes, &facts,
+                                               ts_node_child_by_field_name(node, "arguments", 9),
+                                               helper);
         if (strcmp(kind, "decorator") == 0) {
             TSNode parent = ts_node_parent(node);
             if (strcmp(ts_node_type(parent), "export_statement") == 0)
@@ -15949,11 +16072,14 @@ static void js_invalidate_written_returns(CBMExtractCtx *ctx) {
     }
 done:
     ts_tree_cursor_delete(&cursor);
+    complete = complete && !facts.failed;
     for (int i = 0; i < ctx->result->defs.count; i++) {
         CBMDefinition *def = &ctx->result->defs.items[i];
-        if (strcmp(def->label, "Class") == 0)
+        if (strcmp(def->label, "Class") == 0) {
             def->ts_value_binding_written =
                 !complete || (def->name && cbm_ht_has(writes, def->name));
+            def->ts_mutated_members = js_class_facts(ctx, &facts, def->name, complete);
+        }
         if (!def->ts_return_constructor || !def->return_type)
             continue;
         const char *name = def->return_type;

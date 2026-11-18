@@ -775,6 +775,7 @@ void cbm_registry_add_type(CBMTypeRegistry *reg, CBMRegisteredType type) {
         reg->types = new_items;
         reg->type_cap = new_cap;
     }
+    reg->ts_member_writes |= type.ts_mutated_members != NULL;
     reg->types[reg->type_count++] = type;
 }
 

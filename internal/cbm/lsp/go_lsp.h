@@ -117,6 +117,7 @@ typedef struct {
     bool ts_return_constructor;
     /* Alternating own member names and exact callable QNs, NULL terminated. */
     const char **js_object_members;
+    const char **ts_mutated_members; /* JS/TS Class: replaceable members; "*" is any. */
 } CBMLSPDef;
 
 // Parse source, build registry from defs + stdlib, run LSP.

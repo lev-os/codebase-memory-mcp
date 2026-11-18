@@ -74,6 +74,8 @@ typedef struct {
     // enclosing namespaces (#2120). NULL for nested types and unknown namespaces.
     const char *namespace_qn;
     bool ts_value_binding_written; // JS/TS runtime constructor binding is not stable.
+    // JS/TS: members a provider write or decorator can replace, NULL terminated; "*" is any.
+    const char **ts_mutated_members;
 } CBMRegisteredType;
 
 // Hash-table bucket entry. Chains collisions via next-index list for overload sets.
@@ -196,6 +198,8 @@ typedef struct CBMTypeRegistry {
     const char **export_keys;
     const char **export_targets;
     int export_count;
+    /* A type with ts_mutated_members was added: method lookups check them. */
+    bool ts_member_writes;
 } CBMTypeRegistry;
 
 // Initialize a registry.

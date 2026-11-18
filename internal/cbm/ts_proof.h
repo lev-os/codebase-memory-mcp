@@ -241,6 +241,54 @@ static inline bool cbm_ts_direct_eval(TSNode call, const char *source) {
     return !bound;
 }
 
+/* The text of a name, or the content of an unescaped quoted key, is `want`. */
+static inline bool cbm_ts_key_is(TSNode node, const char *source, const char *want) {
+    if (ts_node_is_null(node))
+        return false;
+    uint32_t lo = ts_node_start_byte(node), hi = ts_node_end_byte(node);
+    size_t len = strlen(want);
+    if (strcmp(ts_node_type(node), "string") == 0)
+        return hi - lo == len + 2 && memcmp(source + lo + 1, want, len) == 0;
+    return hi - lo == len && memcmp(source + lo, want, len) == 0;
+}
+
+/* A standard helper that writes properties of its first argument. */
+enum {
+    CBM_TS_HELPER_NONE,
+    CBM_TS_HELPER_SOURCES,   /* Object.assign: the keys of each later argument */
+    CBM_TS_HELPER_KEY_ARG,   /* Object/Reflect.defineProperty, Reflect.set/deleteProperty */
+    CBM_TS_HELPER_KEYS_ARG,  /* Object.defineProperties: the keys of the second argument */
+    CBM_TS_HELPER_PROTOTYPE, /* Object/Reflect.setPrototypeOf: any inherited member */
+};
+
+static inline int cbm_ts_member_helper(TSNode call, const char *source) {
+    if (strcmp(ts_node_type(call), "call_expression") != 0)
+        return CBM_TS_HELPER_NONE;
+    TSNode callee = cbm_ts_unwrap_value(ts_node_child_by_field_name(call, "function", 8));
+    if (ts_node_is_null(callee) || (strcmp(ts_node_type(callee), "member_expression") != 0 &&
+                                    strcmp(ts_node_type(callee), "subscript_expression") != 0))
+        return CBM_TS_HELPER_NONE;
+    TSNode object = cbm_ts_unwrap_value(ts_node_child_by_field_name(callee, "object", 6));
+    TSNode key = ts_node_child_by_field_name(callee, "property", 8);
+    if (ts_node_is_null(key))
+        key = cbm_ts_unwrap_value(ts_node_child_by_field_name(callee, "index", 5));
+    if (ts_node_is_null(object) || strcmp(ts_node_type(object), "identifier") != 0)
+        return CBM_TS_HELPER_NONE;
+    bool object_api = cbm_ts_key_is(object, source, "Object");
+    if (!object_api && !cbm_ts_key_is(object, source, "Reflect"))
+        return CBM_TS_HELPER_NONE;
+    if (object_api && cbm_ts_key_is(key, source, "assign"))
+        return CBM_TS_HELPER_SOURCES;
+    if (object_api && cbm_ts_key_is(key, source, "defineProperties"))
+        return CBM_TS_HELPER_KEYS_ARG;
+    if (cbm_ts_key_is(key, source, "defineProperty") ||
+        (!object_api && (cbm_ts_key_is(key, source, "set") ||
+                         cbm_ts_key_is(key, source, "deleteProperty"))))
+        return CBM_TS_HELPER_KEY_ARG;
+    return cbm_ts_key_is(key, source, "setPrototypeOf") ? CBM_TS_HELPER_PROTOTYPE
+                                                       : CBM_TS_HELPER_NONE;
+}
+
 static inline bool cbm_ts_plain_object(TSNode node) {
     if (ts_node_is_null(node) || strcmp(ts_node_type(node), "object") != 0)
         return false;

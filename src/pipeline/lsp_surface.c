@@ -407,6 +407,7 @@ static char *surface_file_to_json(const CBMFileResult *result, CBMLanguage langu
         yyjson_mut_obj_add_bool(doc, o, "bw", d->ts_value_binding_written);
         yyjson_mut_obj_add_bool(doc, o, "rc", d->ts_return_constructor);
         add_str_array_or_null(doc, o, "jm", d->js_object_members, -1);
+        add_str_array_or_null(doc, o, "mw", d->ts_mutated_members, -1);
         yyjson_mut_arr_add_val(lsp, o);
     }
     yyjson_mut_obj_add_val(doc, root, "lsp", lsp);
@@ -766,6 +767,9 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
             yyjson_doc_free(doc);
             return -1;
         }
+        int mutated_count = 0;
+        d->ts_mutated_members =
+            arena_str_array(arena, yyjson_obj_get(o, "mw"), true, &mutated_count);
         if (!d->qualified_name || !d->short_name || !d->label) {
             /* A def the writer could not have produced: qn/sn/label are
              * unconditionally present in build_lsp_def output. Corrupt row. */

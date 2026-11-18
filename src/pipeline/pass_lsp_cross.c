@@ -798,6 +798,17 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
                 members[i] = cbm_arena_strdup(arena, src->js_object_members[i]);
         dst->js_object_members = members;
     }
+    if (src->ts_mutated_members) {
+        static const char *any_member[] = {"*", NULL};
+        int n = 0;
+        while (src->ts_mutated_members[n])
+            n++;
+        const char **members = cbm_arena_calloc(arena, ((size_t)n + 1) * sizeof(*members));
+        for (int i = 0; members && i < n; i++)
+            if (!(members[i] = cbm_arena_strdup(arena, src->ts_mutated_members[i])))
+                members = NULL;
+        dst->ts_mutated_members = members ? members : any_member; /* a lost fact is any member */
+    }
     /* The return-type string. The Go registrar splits it on '|' (go_lsp.c
      * split_pipe_types), so a Go result LIST arrives split into its element
      * types: `(*T, error)` as `*T|error`, a named `(t *T)` as `*T`. The raw

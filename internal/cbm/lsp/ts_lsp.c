@@ -2721,6 +2721,28 @@ static bool ts_same_func(const CBMRegisteredFunc *a, const CBMRegisteredFunc *b)
                       strcmp(a->qualified_name, b->qualified_name) == 0);
 }
 
+/* A write, a helper call or a decorator in the provider can replace this
+ * member of the type or of the type it aliases: no method proof. Every
+ * method dispatch asks, so annotated receivers and bases are covered too. */
+static bool ts_member_replaced(TSLSPContext *ctx, const CBMRegisteredType *rt, const char *qn,
+                               const char *name) {
+    bool any = false;
+    for (const CBMTypeRegistry *r = ctx->registry; r && !any; r = r->fallback)
+        any = r->ts_member_writes;
+    if (!any || !name)
+        return false;
+    if (!rt && qn)
+        rt = cbm_registry_lookup_type(ctx->registry, qn);
+    for (int hop = 0; rt && hop < 16; hop++) {
+        for (int i = 0; rt->ts_mutated_members && rt->ts_mutated_members[i]; i++)
+            if (strcmp(rt->ts_mutated_members[i], "*") == 0 ||
+                strcmp(rt->ts_mutated_members[i], name) == 0)
+                return true;
+        rt = rt->alias_of ? cbm_registry_lookup_type(ctx->registry, rt->alias_of) : NULL;
+    }
+    return false;
+}
+
 static const CBMType *lookup_member_type_at(TSLSPContext *ctx, const CBMType *recv,
                                             const char *name, int depth, TSLookupState *state);
 
@@ -2777,7 +2799,7 @@ static const CBMType *lookup_member_type_at(TSLSPContext *ctx, const CBMType *re
                 }
             }
             // Method?
-            if (rt->method_qns && rt->method_names) {
+            if (rt->method_qns && rt->method_names && !ts_member_replaced(ctx, rt, NULL, name)) {
                 for (int i = 0; rt->method_names[i]; i++) {
                     if (strcmp(rt->method_names[i], name) == 0) {
                         const CBMRegisteredFunc *f =
@@ -2871,6 +2893,8 @@ static const CBMType *lookup_member_type_at(TSLSPContext *ctx, const CBMType *re
         }
     }
     // Method lookup → return the method's FUNC type.
+    if (ts_member_replaced(ctx, NULL, recv_qn, name))
+        return cbm_type_unknown();
     if (rt->method_qns && rt->method_names) {
         for (int i = 0; rt->method_names[i]; i++) {
             if (strcmp(rt->method_names[i], name) == 0) {
@@ -3029,7 +3053,7 @@ static const CBMRegisteredFunc *lookup_method_at(TSLSPContext *ctx, const CBMTyp
         /* There is no type proof for an unregistered generic receiver.
          * In a per-file registry, a speculative method lookup would also
          * scan every function for every unknown call. */
-        if (!rt)
+        if (!rt || ts_member_replaced(ctx, rt, NULL, method_name))
             return NULL;
         if (rt->method_qns && rt->method_names) {
             for (int i = 0; rt->method_names[i]; i++) {
@@ -3082,7 +3106,8 @@ static const CBMRegisteredFunc *lookup_method_at(TSLSPContext *ctx, const CBMTyp
     if (!recv_qn)
         return NULL;
 
-    if (!ts_lookup_visit_named(ctx->arena, state, recv_qn, depth))
+    if (!ts_lookup_visit_named(ctx->arena, state, recv_qn, depth) ||
+        ts_member_replaced(ctx, NULL, recv_qn, method_name))
         return NULL;
 
     const CBMRegisteredFunc *f =
@@ -3291,6 +3316,8 @@ static const CBMRegisteredFunc *ts_lookup_namespace_call(TSLSPContext *ctx, cons
             const CBMRegisteredType *constructor = cbm_registry_lookup_type(ctx->registry, qn);
             if (constructor && !constructor->is_interface && !constructor->alias_of &&
                 !constructor->ts_value_binding_written) {
+                if (ts_member_replaced(ctx, constructor, NULL, method_name))
+                    return NULL;
                 const CBMRegisteredFunc *method = ts_lookup_method_for_call(
                     ctx, cbm_type_named(ctx->arena, qn), method_name, args);
                 if (!method) {
@@ -6625,6 +6652,7 @@ static void register_file_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMFileRes
             rt.short_name = d->name;
             rt.is_interface = (strcmp(d->label, "Interface") == 0);
             rt.ts_value_binding_written = d->ts_value_binding_written;
+            rt.ts_mutated_members = d->ts_mutated_members;
             // base_classes → embedded_types (extends/implements).
             if (d->base_classes) {
                 int bc = 0;
@@ -8148,6 +8176,7 @@ static void ts_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
             rt.short_name = d->short_name;
             rt.is_interface = (strcmp(d->label, "Interface") == 0);
             rt.ts_value_binding_written = d->ts_value_binding_written;
+            rt.ts_mutated_members = d->ts_mutated_members;
             if (d->embedded_types && d->embedded_types[0]) {
                 int n = 1;
                 for (const char *s = d->embedded_types; *s; s++)
@@ -8484,6 +8513,7 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
             rt.short_name = d->short_name;
             rt.is_interface = (strcmp(d->label, "Interface") == 0);
             rt.ts_value_binding_written = d->ts_value_binding_written;
+            rt.ts_mutated_members = d->ts_mutated_members;
             // Embedded types (extends list) — pipe-separated.
             if (d->embedded_types && d->embedded_types[0]) {
                 int n = 1;

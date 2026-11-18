@@ -1735,7 +1735,8 @@ static bool surface_has_written_ts_class(const char *text) {
         yyjson_arr_foreach(yyjson_obj_get(root, "lsp"), idx, max, value) {
             const char *label = yyjson_get_str(yyjson_obj_get(value, "lb"));
             if (label && strcmp(label, "Class") == 0 &&
-                yyjson_get_bool(yyjson_obj_get(value, "bw"))) {
+                (yyjson_get_bool(yyjson_obj_get(value, "bw")) ||
+                 yyjson_arr_size(yyjson_obj_get(value, "mw")) > 0)) {
                 found = true;
                 break;
             }
