@@ -1836,7 +1836,9 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *     files rebuild to remove spelling-only recursion and repair literal keys. */
 /* 33: unknown member keys no longer invalidate lexical type proofs; member
  *     self calls require complete property-write evidence on unchanged files. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 33 };
+/* 34: narrowed member writes and script-global mutations change exact CALLS
+ *     proofs for unchanged files; rebuild stored graphs once. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 34 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

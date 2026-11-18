@@ -38785,6 +38785,72 @@ TEST(pipeline_js_twin_callables_scale) {
     PASS();
 }
 
+
+/* Each file isolates member mutation from the exact self-call proof. */
+TEST(pipeline_member_write_scope) {
+    const struct { const char *setup; const char *write; bool safe; } cases[] = {
+        {"const cache = [];", "cache[0] = 1; cache[1]++;", true},
+        {"", "Object.defineProperty(other, 'step', {value: 1});", true},
+        {"", "Reflect.set(other, 'step', 1);", true},
+        {"", "Object.defineProperties(other, {step: {value: 1}});", true},
+        {"", "Object.assign(other, {step: 1});", true},
+        {"const cache = {};", "cache[key] = 1;", true},
+        {"const cache = [];", "cache[key] = 1;", true},
+        {"const cache = new Map();", "cache[key] = 1;", true},
+        {"const cache = new Set();", "cache[key] = 1;", true},
+        {"const cache = new Array;", "cache[key] = 1;", true},
+        {"const cache = [];", "consume(cache); cache[key] = 1;", false},
+        {"const cache = []; function get() { return cache; }", "cache[key] = 1;", false},
+        {"const cache = []; const alias = cache;", "cache[key] = 1;", false},
+        {"const cache = []; const copy = [...cache];", "cache[key] = 1;", false},
+        {"const cache = []; const child = Object.create(cache);", "cache[key] = 1;", false},
+        {"const cache = []; export {cache};", "cache[key] = 1;", false},
+        {"const cache = []; function other(cache) { cache[key] = 1; }", "cache[key] = 1;", false},
+        {"let cache = [];", "cache[key] = 1;", false},
+        {"const cache = this;", "cache[key] = 1;", false},
+        {"", "Object.assign(other, {step: 1, ...source});", false},
+        {"", "Object.defineProperties(other, {[key]: {value: 1}});", false},
+        {"", "Reflect.set(other, key, 1);", false},
+        {"", "Object.assign(other, {walk: replacement});", false},
+        {"const cache = []; const holder = {cache};", "cache[key] = 1;", false},
+        {"const Map = replacement; const cache = new Map();", "cache[key] = 1;", false},
+        {"export const cache = [];", "cache[key] = 1;", false},
+        {"const cache = [];", "consume(c\\u0061che); cache[key] = 1;", false},
+        {"window.Map = replacement; const cache = new Map();", "cache[key] = 1;", false},
+    };
+    enum { N = sizeof(cases) / sizeof(cases[0]) };
+    const char *files[2 * N + 1] = {0};
+    char sources[N][1024], paths[N][32];
+    for (int i = 0; i < N; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "case%d.js", i);
+        snprintf(sources[i], sizeof(sources[i]),
+                 "%s\nfunction mutate(key, other, source, replacement) { %s }\n"
+                 "class C { walk() { this.walk(); } }\n"
+                 "function fib(n) { return n < 2 ? n : fib(n-1) + fib(n-2); }\n", cases[i].setup, cases[i].write);
+        files[2*i] = paths[i]; files[2*i+1] = sources[i];
+    }
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        js_exact_run_t run;
+        ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+        for (int i = 0; i < N; i++) {
+            int count = js_twin_count_calls(run.db, run.project, paths[i], "s.id = t.id AND s.name = 'walk'");
+            printf("  member scope mode=%d case=%d self=%d expected=%d\n", mode, i, count, cases[i].safe);
+            ok = count == cases[i].safe && ok;
+            if (cases[i].safe) {
+                int fib = js_twin_count_calls(run.db, run.project, paths[i], "s.id = t.id AND s.name = 'fib'");
+                printf("  confined receiver mode=%d case=%d fib=%d expected=1\n", mode, i, fib);
+                ok = fib == 1 && ok;
+            }
+        }
+        js_exact_done(&run);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+
+
 TEST(pipeline_unknown_member_write_preserves_local_types) {
     const char *writes[] = {
         "for (const k in o) this[k] = o[k];",
@@ -39194,6 +39260,7 @@ TEST(pipeline_x9c_named_class_static_members_are_values) {
 }
 
 SUITE(pipeline) {
+    RUN_TEST(pipeline_member_write_scope);
     RUN_TEST(pipeline_unknown_member_write_preserves_local_types);
     RUN_TEST(pipeline_member_self_calls_reject_indirect_writes);
     RUN_TEST(pipeline_js_self_edge_requires_unwritten_binding);

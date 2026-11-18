@@ -1628,7 +1628,10 @@ struct TsAssignSites {
     TsAssignSite **by_start; /* the same sites, sorted by start */
     int count;
     bool complete; /* false: a write may be missing, so every write is a closure write */
-    bool unknown_member_key; /* only member/global-property self proofs must fail closed */
+    bool unknown_member_key; /* a computed write may replace any member */
+    TsAssignSite *fresh; /* const receivers whose values never escape */
+    int fresh_count;
+    bool fresh_ready;
     /* Every name a `var` declares, by the function it hoists to, sorted by
      * (fn_start, fn_end, start). */
     TsAssignSite *hoisted;
@@ -1735,6 +1738,213 @@ static bool ts_write_key_is(TSLSPContext *ctx, TSNode node, const char *name) {
            memcmp(ctx->source + lo + 1, name, hi - lo - 2) == 0;
 }
 
+/* Keep the write-name vocabulary independent of the receiver: aliases and
+ * call/apply/bind can move an arbitrary receiver into a method. */
+static void ts_site_push_key(TSLSPContext *ctx, TsSiteVec *v, TSNode key,
+                             uint32_t fs, uint32_t fe, bool global) {
+    if (ts_node_is_null(key)) {
+        v->unknown_member_key = true;
+        return;
+    }
+    const char *kind = ts_node_type(key);
+    if (strcmp(kind, "property_identifier") != 0 && strcmp(kind, "identifier") != 0 &&
+        strcmp(kind, "shorthand_property_identifier") != 0 &&
+        strcmp(kind, "string") != 0 && strcmp(kind, "number") != 0) {
+        v->unknown_member_key = true;
+        return;
+    }
+    int before = v->count;
+    ts_site_push(ctx, v, key, fs, fe);
+    if (v->failed || v->count == before)
+        return;
+    const char *name = v->items[before].name;
+    if (node_kind_is(key, "string")) {
+        size_t len = strlen(name);
+        if (len < 2 || strchr(name, '\\')) {
+            v->count = before;
+            v->unknown_member_key = true;
+            return;
+        }
+        name = cbm_arena_strndup(ctx->arena, name + 1, len - 2);
+    }
+    const char *member = name ? cbm_arena_sprintf(ctx->arena, "this.%s", name) : NULL;
+    if (!member) {
+        v->failed = true;
+        return;
+    }
+    v->items[before].name = member;
+    v->items[before].value = (TSNode){0}; /* a property is not a lexical assignment */
+    if (global) {
+        const char *global_key = cbm_arena_sprintf(ctx->arena, "globalThis.%s", name);
+        if (!global_key) {
+            v->failed = true;
+            return;
+        }
+        before = v->count;
+        ts_site_push(ctx, v, key, fs, fe);
+        if (!v->failed && v->count > before) {
+            v->items[before].name = global_key;
+            v->items[before].value = (TSNode){0};
+        }
+    }
+}
+
+static int ts_site_name_cmp(const void *pa, const void *pb);
+static int ts_proof_first_name(const TsAssignSite *sites, int count, const char *name);
+
+/* Lazy, file-wide proof for a fresh const receiver. Two cursor walks and a
+ * sorted name table avoid a full-file scan for every write or binding. A
+ * duplicate spelling is rejected rather than requiring alias/scope analysis. */
+static bool ts_receiver_confined(TSLSPContext *ctx, TSNode object) {
+    struct TsAssignSites *s = ctx->assign_sites;
+    if (!s || !node_kind_is(object, "identifier"))
+        return false;
+    if (!s->fresh_ready) {
+        s->fresh_ready = true;
+        TsSiteVec fresh = {0};
+        TSTreeCursor cursor = ts_tree_cursor_new(s->root);
+        for (;;) {
+            TSNode node = ts_tree_cursor_current_node(&cursor);
+            TSNode parent = ts_node_parent(node);
+            if (node_kind_is(node, "variable_declarator") &&
+                node_kind_is(parent, "lexical_declaration") &&
+                node_kind_is(ts_node_child(parent, 0), "const") &&
+                !node_kind_is(ts_node_parent(parent), "export_statement")) {
+                TSNode name = ts_node_child_by_field_name(node, "name", 4);
+                TSNode value = ts_node_child_by_field_name(node, "value", 5);
+                while (ts_write_wrapper(value))
+                    value = ts_write_operand(value);
+                TSNode ctor = node_kind_is(value, "new_expression")
+                                  ? ts_node_child_by_field_name(value, "constructor", 11)
+                                  : (TSNode){0};
+                bool builtin = node_kind_is(ctor, "identifier") &&
+                               (ts_write_name_is(ctx, ctor, "Map") ||
+                                ts_write_name_is(ctx, ctor, "Set") ||
+                                ts_write_name_is(ctx, ctor, "Array"));
+                if (node_kind_is(name, "identifier") &&
+                    (node_kind_is(value, "object") || node_kind_is(value, "array") || builtin))
+                    ts_site_push(ctx, &fresh, name, 0, 0);
+            }
+            if (ts_tree_cursor_goto_first_child(&cursor))
+                continue;
+            while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+                if (!ts_tree_cursor_goto_parent(&cursor))
+                    goto collected_fresh;
+            }
+        }
+collected_fresh:
+        ts_tree_cursor_delete(&cursor);
+        if (fresh.failed || !fresh.count)
+            return false;
+        qsort(fresh.items, (size_t)fresh.count, sizeof(*fresh.items), ts_site_name_cmp);
+        bool *escaped = cbm_arena_alloc(ctx->arena, (size_t)fresh.count * sizeof(*escaped));
+        if (!escaped)
+            return false;
+        memset(escaped, 0, (size_t)fresh.count * sizeof(*escaped));
+        const char *constructors[] = {"Map", "Set", "Array"};
+        bool constructor_shadow[3] = {false};
+        cursor = ts_tree_cursor_new(s->root);
+        for (;;) {
+            TSNode node = ts_tree_cursor_current_node(&cursor);
+            const char *kind = ts_node_type(node);
+            if (node_kind_is(node, "property_identifier") || node_kind_is(node, "string")) {
+                for (int j = 0; j < 3; j++)
+                    constructor_shadow[j] |= ts_write_key_is(ctx, node, constructors[j]);
+            }
+            if (strcmp(kind, "identifier") == 0 ||
+                strcmp(kind, "shorthand_property_identifier") == 0 ||
+                strcmp(kind, "shorthand_property_identifier_pattern") == 0 ||
+                strcmp(kind, "type_identifier") == 0) {
+                const char *name = node_text(ctx, node);
+                /* Escaped identifier spellings can hide another use of a
+                 * candidate or constructor; decline this file's exemption. */
+                if (!name || strchr(name, '\\')) {
+                    fresh.failed = true;
+                    break;
+                }
+                TSNode parent = ts_node_parent(node), use = node;
+                for (int j = 0; j < 3; j++) {
+                    if (strcmp(name, constructors[j]) == 0 &&
+                        !(node_kind_is(parent, "new_expression") &&
+                          ts_node_eq(ts_node_child_by_field_name(parent, "constructor", 11), node)))
+                        constructor_shadow[j] = true;
+                }
+                int i = ts_proof_first_name(fresh.items, fresh.count, name);
+                if (i < fresh.count && strcmp(fresh.items[i].name, name) == 0) {
+                    while (ts_write_wrapper(parent)) {
+                        use = parent;
+                        parent = ts_node_parent(parent);
+                    }
+                    bool receiver = (node_kind_is(parent, "member_expression") ||
+                                     node_kind_is(parent, "subscript_expression")) &&
+                                    ts_node_eq(ts_node_child_by_field_name(parent, "object", 6), use);
+                    if (!receiver && ts_node_start_byte(node) != fresh.items[i].start)
+                        escaped[i] = true;
+                    if (i + 1 < fresh.count && strcmp(fresh.items[i + 1].name, name) == 0)
+                        escaped[i] = true;
+                }
+            }
+            if (ts_tree_cursor_goto_first_child(&cursor))
+                continue;
+            while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+                if (!ts_tree_cursor_goto_parent(&cursor))
+                    goto checked_fresh;
+            }
+        }
+checked_fresh:
+        ts_tree_cursor_delete(&cursor);
+        if (fresh.failed)
+            return false;
+        int kept = 0;
+        for (int i = 0; i < fresh.count; i++) {
+            if ((i && strcmp(fresh.items[i - 1].name, fresh.items[i].name) == 0) || escaped[i])
+                continue;
+            TSNode value = fresh.items[i].value;
+            while (ts_write_wrapper(value))
+                value = ts_write_operand(value);
+            TSNode ctor = ts_node_child_by_field_name(value, "constructor", 11);
+            bool shadowed = false;
+            for (int j = 0; j < 3; j++)
+                shadowed |= constructor_shadow[j] && ts_write_name_is(ctx, ctor, constructors[j]);
+            if (!shadowed)
+                fresh.items[kept++] = fresh.items[i];
+        }
+        s->fresh = fresh.items;
+        s->fresh_count = kept;
+    }
+    const char *name = node_text(ctx, object);
+    if (!name)
+        return false;
+    int i = ts_proof_first_name(s->fresh, s->fresh_count, name);
+    return i < s->fresh_count && strcmp(s->fresh[i].name, name) == 0;
+}
+
+/* Known helper sources contribute their own literal keys; a spread or
+ * computed key leaves the possible member set unbounded. */
+static void ts_site_helper_object(TSLSPContext *ctx, TsSiteVec *v, TSNode source,
+                                  uint32_t fs, uint32_t fe, bool global) {
+    while (ts_write_wrapper(source))
+        source = ts_write_operand(source);
+    if (!node_kind_is(source, "object")) {
+        v->unknown_member_key = true;
+        return;
+    }
+    for (uint32_t i = 0; i < ts_node_named_child_count(source); i++) {
+        TSNode entry = ts_node_named_child(source, i);
+        if (node_kind_is(entry, "comment"))
+            continue;
+        TSNode key = ts_node_child_by_field_name(entry, "key", 3);
+        if (node_kind_is(entry, "method_definition"))
+            key = ts_node_child_by_field_name(entry, "name", 4);
+        if (node_kind_is(entry, "shorthand_property_identifier"))
+            key = entry;
+        if (ts_node_is_null(key))
+            v->unknown_member_key = true;
+        else
+            ts_site_push_key(ctx, v, key, fs, fe, global);
+    }
+}
+
 static void ts_site_push_pattern(TSLSPContext *ctx, TsSiteVec *v, TSNode pattern, uint32_t fs,
                                  uint32_t fe, int depth) {
     while (ts_write_wrapper(pattern))
@@ -1759,48 +1969,17 @@ static void ts_site_push_pattern(TSLSPContext *ctx, TsSiteVec *v, TSNode pattern
             prop = ts_node_child_by_field_name(pattern, "index", 5);
         /* Any receiver can alias this, a class, or a namespace object. A
          * same-name write may conservatively withhold another class's self edge. */
-        const char *prefix = "this.";
         bool global = node_kind_is(object, "identifier") &&
                       (ts_write_name_is(ctx, object, "globalThis") ||
                        ts_write_name_is(ctx, object, "window") ||
                        ts_write_name_is(ctx, object, "self"));
-        if (prefix) {
-            if (node_kind_is(pattern, "subscript_expression") && !node_kind_is(prop, "string")) {
+        if (node_kind_is(pattern, "subscript_expression") &&
+            !node_kind_is(prop, "string") && !node_kind_is(prop, "number")) {
+            if (!ts_receiver_confined(ctx, object))
                 v->unknown_member_key = true;
-                return;
-            }
-            int before = v->count;
-            ts_site_push(ctx, v, prop, fs, fe);
-            if (v->failed || v->count == before)
-                return;
-            const char *name = v->items[before].name;
-            if (node_kind_is(prop, "string")) {
-                size_t len = strlen(name);
-                if (len < 2 || strchr(name, '\\')) {
-                    v->count = before;
-                    v->unknown_member_key = true;
-                    return;
-                }
-                name = cbm_arena_strndup(ctx->arena, name + 1, len - 2);
-            }
-            const char *key = name ? cbm_arena_sprintf(ctx->arena, "%s%s", prefix, name) : NULL;
-            if (!key) {
-                v->failed = true;
-                return;
-            }
-            v->items[before].name = key;
-            if (global) {
-                const char *global_key = cbm_arena_sprintf(ctx->arena, "globalThis.%s", name);
-                if (!global_key) {
-                    v->failed = true;
-                    return;
-                }
-                before = v->count;
-                ts_site_push(ctx, v, prop, fs, fe);
-                if (!v->failed && v->count > before)
-                    v->items[before].name = global_key;
-            }
+            return;
         }
+        ts_site_push_key(ctx, v, prop, fs, fe, global);
     } else if (strcmp(kind, "pair_pattern") == 0) {
         TSNode value = ts_node_child_by_field_name(pattern, "value", TS_LSP_FIELD_LEN("value"));
         ts_site_push_pattern(ctx, v, value, fs, fe, depth + 1);
@@ -1856,8 +2035,31 @@ static void ts_site_visit(TSLSPContext *ctx, TsSiteVec *v, TsSiteVec *hoist,
                                   ts_write_key_is(ctx, prop, "assign"));
             bool reflect_helper = ts_write_name_is(ctx, object, "Reflect") &&
                                   ts_write_key_is(ctx, prop, "set");
-            if (object_helper || reflect_helper)
-                v->unknown_member_key = true;
+            if (object_helper || reflect_helper) {
+                TSNode args = ts_node_child_by_field_name(node, "arguments", 9);
+                bool global = false;
+                int position = 0;
+                for (uint32_t i = 0; i < ts_node_named_child_count(args); i++) {
+                    TSNode arg = ts_node_named_child(args, i);
+                    if (node_kind_is(arg, "comment"))
+                        continue;
+                    while (ts_write_wrapper(arg))
+                        arg = ts_write_operand(arg);
+                    if (position++ == 0) {
+                        global = ts_write_name_is(ctx, arg, "globalThis") ||
+                                 ts_write_name_is(ctx, arg, "window") ||
+                                 ts_write_name_is(ctx, arg, "self");
+                    } else if (ts_write_key_is(ctx, prop, "assign") ||
+                               (position == 2 && ts_write_key_is(ctx, prop, "defineProperties"))) {
+                        ts_site_helper_object(ctx, v, arg, fs, fe, global);
+                    } else if (position == 2) {
+                        if (node_kind_is(arg, "string") || node_kind_is(arg, "number"))
+                            ts_site_push_key(ctx, v, arg, fs, fe, global);
+                        else
+                            v->unknown_member_key = true;
+                    }
+                }
+            }
         }
     }
     if (kind[0] == 'v' && strcmp(kind, "variable_declaration") == 0) {
