@@ -15974,6 +15974,32 @@ static int check_x11b_classifier_work(bool parallel) {
 }
 TEST(pipeline_x11b_classifier_work) { return check_x11b_classifier_work(false); }
 TEST(pipeline_x11b_classifier_work_parallel) { return check_x11b_classifier_work(true); }
+
+/* Ordinary reads in a wide body must use the walker's retained cursor path.
+ * A node-parent search restarts from the root and scans preceding siblings. */
+static int check_x11b_binding_cursor_work(bool parallel) {
+    enum { READS = 512 };
+    char source[8192];
+    int n = snprintf(source, sizeof(source), "export function use(value) {\n");
+    for (int i = 0; i < READS; i++)
+        n += snprintf(source + n, sizeof(source) - (size_t)n, "value;\n");
+    snprintf(source + n, sizeof(source) - (size_t)n, "}\n");
+    const ng_file_t files[] = {{"src/reads.js", source}};
+    const ng_pair_t pairs[] = {{"reads.use", "*", 0, "ordinary reads are not calls"}};
+    cbm_usage_field_lookup_test_reset();
+    int rc = ng_check(files, 1, pairs, 1, parallel);
+    uint64_t slow = cbm_usage_slow_parent_fallback_test_count();
+    uint64_t work = cbm_usage_field_lookup_test_work();
+    printf("  binding cursor work=%llu, slow parent searches=%llu\n",
+           (unsigned long long)work, (unsigned long long)slow);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(slow, 0);
+    ASSERT_GT(work, 0);
+    ASSERT_LTE(work, READS * 32);
+    PASS();
+}
+TEST(pipeline_x11b_binding_cursor_work) { return check_x11b_binding_cursor_work(false); }
+TEST(pipeline_x11b_binding_cursor_work_parallel) { return check_x11b_binding_cursor_work(true); }
 #endif
 
 /* A member call on a receiver the TS resolver typed as a built-in
@@ -39359,6 +39385,8 @@ SUITE(pipeline) {
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
     RUN_TEST(pipeline_x11b_classifier_work);
     RUN_TEST(pipeline_x11b_classifier_work_parallel);
+    RUN_TEST(pipeline_x11b_binding_cursor_work);
+    RUN_TEST(pipeline_x11b_binding_cursor_work_parallel);
 #endif
     RUN_TEST(pipeline_x11b_incremental_equals_full);
     RUN_TEST(pipeline_x11b_reassigned);

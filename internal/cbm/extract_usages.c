@@ -874,6 +874,34 @@ static bool cfml_argument_tag_name_binding(CBMExtractCtx *ctx, TSNode node) {
     return false;
 }
 
+/* Follow only the binding-pattern path. A read inside a body, initializer or
+ * computed key cannot become a declaration higher in the tree. The unified
+ * walker retains this path, so no root-to-node parent search is necessary. */
+static bool js_exact_binding(TSNode node, WalkState *state) {
+    TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
+    TSNode current = node;
+    for (int depth = 0; depth <= 32; depth++) {
+        TSNode parent;
+        const char *field;
+        if (!cursor) usage_slow_parent_fallback_test_note();
+        if (!occurrence_parent(cursor, current, &parent, &field)) return false;
+        const char *kind = ts_node_type(parent);
+        if (strcmp(kind, "variable_declarator") == 0)
+            return field && strcmp(field, "name") == 0;
+        if (strcmp(kind, "catch_clause") == 0)
+            return field && strcmp(field, "parameter") == 0;
+        if (strcmp(kind, "for_in_statement") == 0)
+            return field && strcmp(field, "left") == 0 &&
+                   !ts_node_is_null(ts_node_child_by_field_name(parent, TS_FIELD("kind")));
+        if (!cbm_js_pattern_container(kind)) {
+            TSNode child = cbm_js_pattern_child(parent);
+            if (ts_node_is_null(child) || !ts_node_eq(child, current)) return false;
+        }
+        current = parent;
+    }
+    return false;
+}
+
 static bool is_exact_language_binding(CBMExtractCtx *ctx, TSNode node, WalkState *state) {
     const char *kind = ts_node_type(node);
     switch (ctx->language) {
@@ -883,15 +911,7 @@ static bool is_exact_language_binding(CBMExtractCtx *ctx, TSNode node, WalkState
     case CBM_LANG_ARKTS:
         if (strcmp(kind, "identifier") != 0 &&
             strcmp(kind, "shorthand_property_identifier_pattern") != 0) return false;
-        if (!ts_node_is_null(cbm_js_header_binding(node))) return true;
-        for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
-             parent = ts_node_parent(parent)) {
-            const char *kind = ts_node_type(parent);
-            if (strcmp(kind, "variable_declarator") == 0)
-                return cbm_js_pattern_binds(ts_node_child_by_field_name(parent, TS_FIELD("name")), node, 0);
-            if (cbm_js_bodied_kind(kind)) break;
-        }
-        return false;
+        return js_exact_binding(node, state);
     case CBM_LANG_OCAML: {
         if (strcmp(kind, "value_pattern") != 0) {
             return false;
@@ -3453,7 +3473,7 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
     bool reference_node = is_reference_node(node, ctx->language);
     const CBMOccurrenceSpec *occurrence = &occurrence_specs[ctx->language];
     bool possible_binding_leaf =
-        ts_node_is_named(node) && ts_node_named_child_count(node) == 0 &&
+        !reference_node && ts_node_is_named(node) && ts_node_named_child_count(node) == 0 &&
         (state->inside_import || is_exact_language_binding(ctx, node, state) ||
          is_policy_binding(ctx, node, occurrence, state) || js_shorthand_binding_leaf(ctx, node));
     if (!reference_node && !possible_binding_leaf) {
