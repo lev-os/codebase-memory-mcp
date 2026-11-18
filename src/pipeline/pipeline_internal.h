@@ -1846,7 +1846,10 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *     Function declarations and expression names keep their real scopes.
  *     Registry guesses cannot invoke data variables. Rebuild unchanged
  *     JS/TS callers once to repair CALLS and HTTP_CALLS edges. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 34 };
+/* 35: runtime variables can hold callable factory values. Preserve those
+ *     binding targets and keep call-only presence facts out of ordinary
+ *     reference shadowing. Rebuild unchanged CALLS and USAGE edges once. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 35 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

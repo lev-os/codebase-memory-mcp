@@ -124,6 +124,8 @@ typedef struct {
     const char *js_import_member;
     const char *js_import_select;
     bool js_const;
+    /* Presence facts added for calls must not introduce value shadows. */
+    bool js_call_binding_only;
     uint8_t js_import_checked;
     uint8_t value_kind;    /* CBMBindingValueKind; JS/TS only, else VALUE */
     const char *ctor_name; /* CBM_BINDING_NEW_INSTANCE: the constructor's name */

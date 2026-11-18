@@ -2523,6 +2523,7 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
     uint32_t current_id = active_lexical_scope_id(state);
     uint32_t scope_id = 0;
     bool whole_scope = false;
+    bool call_binding_only = false;
     TSNode function_declaration = declared_function_name_owner(node, spec);
     TSNode class_declaration = declared_class_name_owner(node, spec);
 
@@ -2544,7 +2545,9 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
                                  strcmp(function_kind, "function") == 0 ||
                                  strcmp(function_kind, "generator_function") == 0);
         if (expression) {
-            /* A named function value binds its own name only inside itself. */
+            /* A named function value binds its own name only inside itself.
+             * Preserve the prior value-reference policy for module values. */
+            call_binding_only = lexical_ancestor_of_kind(state, parent_id, true, true) == 0;
             scope_id = function_id;
         } else if (ctx->language == CBM_LANG_PYTHON) {
             scope_id = python_nearest_namespace(state, parent_id);
@@ -2564,6 +2567,7 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
              strcmp(function_kind, "generator_function_declaration") == 0 ||
              strcmp(function_kind, "function_signature") == 0)) {
             scope_id = state->root_lexical_scope_id;
+            call_binding_only = true;
         }
         if (scope_id == 0) {
             return;
@@ -2638,6 +2642,7 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
      * signature/body languages extend the scope after parameters are seen. */
     binding->active_end = 0;
     binding->name = name;
+    binding->js_call_binding_only = call_binding_only;
     js_classify_binding(ctx, node, spec, parameter, function_declaration, class_declaration,
                         binding);
     js_record_import_origin(ctx, binding, node, parameter, import_binding);
@@ -2697,8 +2702,8 @@ static bool lexical_binding_active_at(const WalkState *state, uint32_t scope_id,
         if (binding->scope_id != scope_id || strcmp(binding->name, name) != 0) {
             break;
         }
-        if (binding->value_kind == CBM_BINDING_DESTRUCTURED) {
-            continue; /* the call classifier's alone */
+        if (binding->value_kind == CBM_BINDING_DESTRUCTURED || binding->js_call_binding_only) {
+            continue; /* call/global presence facts are not value-shadow barriers */
         }
         uint32_t active_end = binding->active_end ? binding->active_end : scope->end_byte;
         if (binding->active_start <= position && position < active_end) {

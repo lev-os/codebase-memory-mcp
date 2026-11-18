@@ -70,14 +70,13 @@ static inline bool cbm_pipeline_exact_self_call(CBMLanguage lang, const CBMCall 
     return false;
 }
 
-/* A registry name match onto a JS/TS type or data variable does not
- * prove a callable. Semantic targets keep their separate proof path. */
-static inline bool cbm_pipeline_js_non_callable_guess(CBMLanguage lang,
+/* A registry name match onto a JS/TS type alias does not prove a runtime
+ * callable. A runtime variable can hold a callable value. */
+static inline bool cbm_pipeline_js_type_only_target(CBMLanguage lang,
                                                     const cbm_gbuf_node_t *target) {
     bool js = lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
               lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS;
-    return js && target && target->label &&
-           (strcmp(target->label, "Type") == 0 || strcmp(target->label, "Variable") == 0);
+    return js && target && target->label && strcmp(target->label, "Type") == 0;
 }
 
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API

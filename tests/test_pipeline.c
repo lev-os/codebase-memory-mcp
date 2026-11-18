@@ -15670,7 +15670,7 @@ TEST(pipeline_tsjs_same_module_bound_receiver_not_bound_parallel) {
  * files, runs the sequential resolver or (padded past
  * MIN_FILES_FOR_PARALLEL, CBM_WORKERS pinned) the parallel one, and counts
  * the CALLS edges of each (caller tail, callee tail) pair. */
-enum { NG_MAX_PAIRS = 24, NG_PAD_FILES = 52 };
+enum { NG_MAX_PAIRS = 32, NG_PAD_FILES = 52 };
 
 typedef struct {
     const char *path;
@@ -15684,9 +15684,10 @@ typedef struct {
     const char *why;
 } ng_pair_t;
 
-static int ng_check_with_http(const ng_file_t *files, int nfiles, const ng_pair_t *pairs, int npairs,
-                    const ng_pair_t *http, int nhttp, bool parallel) {
-    int total = npairs + nhttp;
+static int ng_check_with_relations(const ng_file_t *files, int nfiles, const ng_pair_t *pairs, int npairs,
+                    const ng_pair_t *http, int nhttp, const ng_pair_t *usages, int nusages,
+                    bool parallel) {
+    int total = npairs + nhttp + nusages;
     ASSERT_TRUE(total <= NG_MAX_PAIRS);
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_ng_XXXXXX");
@@ -15725,8 +15726,9 @@ static int ng_check_with_http(const ng_file_t *files, int nfiles, const ng_pair_
     bool store_opened = s != NULL;
     int got[NG_MAX_PAIRS];
     for (int i = 0; i < total && i < NG_MAX_PAIRS; i++) {
-        const ng_pair_t *pair = i < npairs ? &pairs[i] : &http[i - npairs];
-        const char *relation = i < npairs ? "CALLS" : "HTTP_CALLS";
+        const ng_pair_t *pair = i < npairs ? &pairs[i] :
+            i < npairs + nhttp ? &http[i - npairs] : &usages[i - npairs - nhttp];
+        const char *relation = i < npairs ? "CALLS" : i < npairs + nhttp ? "HTTP_CALLS" : "USAGE";
         got[i] = s ? smr_relationships(s, cbm_pipeline_project_name(p), pair->caller, pair->callee,
                                        relation) : -1;
         if (s && strcmp(pair->callee, "*") == 0) {
@@ -15749,7 +15751,8 @@ static int ng_check_with_http(const ng_file_t *files, int nfiles, const ng_pair_
     }
     bool mismatch = false;
     for (int i = 0; i < total; i++) {
-        const ng_pair_t *pair = i < npairs ? &pairs[i] : &http[i - npairs];
+        const ng_pair_t *pair = i < npairs ? &pairs[i] :
+            i < npairs + nhttp ? &http[i - npairs] : &usages[i - npairs - nhttp];
         mismatch = mismatch || got[i] != pair->want;
     }
     if (s && mismatch) {
@@ -15787,16 +15790,22 @@ static int ng_check_with_http(const ng_file_t *files, int nfiles, const ng_pair_
     ASSERT_TRUE(store_opened);
     int bad = 0;
     for (int i = 0; i < total; i++) {
-        const ng_pair_t *pair = i < npairs ? &pairs[i] : &http[i - npairs];
+        const ng_pair_t *pair = i < npairs ? &pairs[i] :
+            i < npairs + nhttp ? &http[i - npairs] : &usages[i - npairs - nhttp];
         if (got[i] != pair->want) {
             printf("  %s %s -> %s: %d edge(s), want %d (%s)\n",
-                   i < npairs ? "CALLS" : "HTTP_CALLS", pair->caller, pair->callee,
+                   i < npairs ? "CALLS" : i < npairs + nhttp ? "HTTP_CALLS" : "USAGE", pair->caller, pair->callee,
                    got[i], pair->want, pair->why);
             bad++;
         }
     }
     ASSERT_EQ(bad, 0);
     PASS();
+}
+
+static int ng_check_with_http(const ng_file_t *files, int nfiles, const ng_pair_t *pairs,
+                              int npairs, const ng_pair_t *http, int nhttp, bool parallel) {
+    return ng_check_with_relations(files, nfiles, pairs, npairs, http, nhttp, NULL, 0, parallel);
 }
 
 static int ng_check(const ng_file_t *files, int nfiles, const ng_pair_t *pairs, int npairs,
@@ -15815,7 +15824,8 @@ static int check_x11b_bound_fetch(bool parallel) {
          "import { fetch } from 'external-client';\n"
          "export function imported() { return fetch('/api/items'); }\n"},
         {"src/fetch_root.js",
-         "export let fetch;\n"
+         "const holder = { fn: (value) => value };\n"
+         "export const fetch = Reflect.get(holder, 'fn');\n"
          "export function root() { return fetch('/api/items'); }\n"},
         {"src/fetch_self.js",
          "const hooks = { 'fetch': () => 0 };\n"
@@ -15826,6 +15836,13 @@ static int check_x11b_bound_fetch(bool parallel) {
         {"src/fetch_known.js",
          "import { fetch } from './fetch_owned';\n"
          "export function known() { return fetch('/api/items'); }\n"},
+        {"src/fetch_callable_import.js",
+         "import { fetch } from './fetch_root';\n"
+         "export function knownValue() { return fetch('/api/items'); }\n"},
+        {"src/fetch_refs.tsx",
+         "function handler() { return 1; }\n"
+         "export function View() { return <form action={handler} />; }\n"
+         "export function Shadow(handler) { return <form action={handler} />; }\n"},
         {"src/fetch_expression.js",
          "export const invoke = function fetch(replacement) {\n"
          "  fetch = replacement; return fetch('/api/inside');\n"
@@ -15837,7 +15854,12 @@ static int check_x11b_bound_fetch(bool parallel) {
         {"fetch_values.local", "*", 0, "unknown local is not a project callable"},
         {"fetch_values.free", "*", 0, "global fetch has no CALLS target"},
         {"fetch_import.imported", "*", 0, "external import has no project target"},
-        {"fetch_root.root", "*", 0, "unknown module value is not a project callable"},
+        {"fetch_root.root", "*", 1, "retain the callable variable binding"},
+        {"fetch_root.root", "fetch_root.fetch", 1, "exact module binding target"},
+        {"fetch_callable_import.knownValue", "*", 1, "retain imported callable values"},
+        {"fetch_callable_import.knownValue", "fetch_root.fetch", 1, "exact import binding"},
+        {"fetch_refs.View", "*", 0, "a JSX attribute reference does not invoke its value"},
+        {"fetch_refs.Shadow", "*", 0, "a parameter value reference does not invoke it"},
         {"fetch_self.fetch", "*", 0, "reassigned self target is rejected"},
         {"fetch_owned.fetch", "*", 1, "proven immutable self call is kept"},
         {"fetch_owned.fetch", "fetch_owned.fetch", 1, "exact self target"},
@@ -15852,14 +15874,21 @@ static int check_x11b_bound_fetch(bool parallel) {
         {"fetch_values.free", "*", 1, "unbound fetch stays HTTP beside a literal key"},
         {"fetch_import.imported", "*", 0, "unknown import is not global fetch"},
         {"fetch_root.root", "*", 0, "module binding is not global fetch"},
+        {"fetch_callable_import.knownValue", "*", 0, "callable import is not native fetch"},
+        {"fetch_refs.View", "*", 0, "a function reference is not HTTP"},
+        {"fetch_refs.Shadow", "*", 0, "a parameter reference is not HTTP"},
         {"fetch_self.fetch", "*", 0, "rejected self target must not fall back to HTTP"},
         {"fetch_owned.fetch", "*", 0, "proven self call is not HTTP"},
         {"fetch_known.known", "*", 0, "proven project import is not HTTP"},
         {"fetch_expression.fetch", "*", 0, "private expression name is not global fetch"},
         {"fetch_expression.outside", "*", 1, "outer unbound fetch stays HTTP"},
     };
-    int values_rc = ng_check_with_http(files, 7, calls, (int)(sizeof(calls) / sizeof(calls[0])),
-                                      http, (int)(sizeof(http) / sizeof(http[0])), parallel);
+    static const ng_pair_t usages[] = {
+        {"fetch_refs.View", "fetch_refs.handler", 1, "module function references stay visible"},
+        {"fetch_refs.Shadow", "fetch_refs.handler", 0, "the parameter still shadows the module function"},
+    };
+    int values_rc = ng_check_with_relations(files, 9, calls, (int)(sizeof(calls) / sizeof(calls[0])),
+        http, (int)(sizeof(http) / sizeof(http[0])), usages, 2, parallel);
     static const ng_file_t globals[] = {
         {"src/fetch_global_one.js", "function fetch(url) { return url; }\n"},
         {"src/fetch_global_use.js", "const hooks = { 'fetch': () => 0 };\n"

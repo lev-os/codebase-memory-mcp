@@ -3835,7 +3835,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
         atomic_fetch_add_explicit(&rc->time_ns_rc_target, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
-        if (!lsp_target && cbm_pipeline_js_non_callable_guess(lang, target_node)) {
+        if (!lsp_target && cbm_pipeline_js_type_only_target(lang, target_node)) {
             drop_plain_call = true;
         }
         /* A call that resolved onto a struct Field: refused across languages
