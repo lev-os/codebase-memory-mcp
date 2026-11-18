@@ -65,6 +65,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 7 };
 #include <time.h>
 #ifdef _WIN32
 #include <process.h>
+#include <io.h>
 #define cbm_pipeline_getpid _getpid
 #else
 #include <unistd.h>
@@ -75,6 +76,62 @@ static inline void *intptr_to_ptr(intptr_t v) {
     void *p;
     memcpy(&p, &v, sizeof(p));
     return p;
+}
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+static _Atomic uint64_t g_size_probe_bytes = 0;
+void cbm_pipeline_size_probe_test_reset(void) {
+    atomic_store_explicit(&g_size_probe_bytes, 0, memory_order_relaxed);
+}
+uint64_t cbm_pipeline_size_probe_test_bytes(void) {
+    return atomic_load_explicit(&g_size_probe_bytes, memory_order_relaxed);
+}
+static int64_t size_probe_position(FILE *file) {
+#ifdef _WIN32
+    return _telli64(cbm_fileno(file));
+#else
+    return (int64_t)lseek(cbm_fileno(file), 0, SEEK_CUR);
+#endif
+}
+#endif
+
+long cbm_pipeline_open_file_size(FILE *file) {
+    if (!file) {
+        return -1;
+    }
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    int64_t before = size_probe_position(file);
+#endif
+    /* fseek can read a stdio buffer on Darwin even for a size query.
+     * Stat the opened handle so admission does not prefetch source data or
+     * race a replacement of the path. Keep ftell's representable range. */
+    int64_t bytes;
+#ifdef _WIN32
+    struct _stat64 state;
+    if (_fstat64(cbm_fileno(file), &state) != 0 ||
+        (state.st_mode & _S_IFMT) != _S_IFREG) {
+        return -1;
+    }
+    bytes = (int64_t)state.st_size;
+#else
+    struct stat state;
+    if (fstat(cbm_fileno(file), &state) != 0 || !S_ISREG(state.st_mode)) {
+        return -1;
+    }
+    bytes = (int64_t)state.st_size;
+#endif
+    if (bytes < 0 || bytes > LONG_MAX) {
+        return -1;
+    }
+    long size = (long)bytes;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    int64_t after = size_probe_position(file);
+    if (before >= 0 && after > before) {
+        atomic_fetch_add_explicit(&g_size_probe_bytes, (uint64_t)(after - before),
+                                  memory_order_relaxed);
+    }
+#endif
+    return size;
 }
 
 /* ── Global index lock ─────────────────────────────────────────── */

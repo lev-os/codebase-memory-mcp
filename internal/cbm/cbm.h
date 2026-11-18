@@ -372,6 +372,8 @@ typedef struct {
  * function's locals (pipeline.h cbm_def_props_function_local). Value
  * "true". */
 #define CBM_PROP_FUNCTION_LOCAL "function_local"
+/* The identifier through which a script/ambient/explicit global is visible. */
+#define CBM_PROP_JS_GLOBAL_NAME "js_global_name"
 
 /* Argument captured from a call expression */
 typedef struct {
@@ -506,6 +508,12 @@ typedef struct {
     uint8_t trailing_closure_count;
     bool trailing_closure_truncated;
     const char **trailing_closure_labels;
+    const char *js_receiver_ctor; /* unbound constructor of a stable receiver */
+    /* A constant local's proven import provenance, scoped to this call site.
+     * root is the original import-map key, NULL for a direct require. */
+    const char *js_import_root;
+    const char *js_import_module;
+    const char *js_import_member;
 } CBMCall;
 
 // What an import statement names, when the syntax says so. Only PHP's
@@ -1460,6 +1468,9 @@ uint64_t cbm_kotlin_operator_dedup_test_comparisons(void);
 #endif
 
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
+// Test-only definition-name entries visited and constructor classifications.
+void cbm_js_classifier_test_reset(void);
+uint64_t cbm_js_classifier_test_work(void);
 // Test-build-only work counter for resolving a node's field role while
 // classifying value references. Production builds retain no instrumentation.
 void cbm_usage_field_lookup_test_reset(void);

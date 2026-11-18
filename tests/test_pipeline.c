@@ -15455,16 +15455,17 @@ static int count_nodes_named(cbm_store_t *s, const char *project, const char *na
  * resolver is the one exercised. */
 enum { SMR_LANGS = 8, SMR_PAD_FILES = 52 };
 
-/* CALLS edges whose source and target qualified names end in `.caller` and
+/* Edges whose source and target qualified names end in `.caller` and
  * `.callee`. */
-static int smr_calls(cbm_store_t *s, const char *project, const char *caller, const char *callee) {
+static int smr_relationships(cbm_store_t *s, const char *project, const char *caller,
+                              const char *callee, const char *relation) {
     char src_tail[128];
     char tgt_tail[128];
     snprintf(src_tail, sizeof(src_tail), ".%s", caller);
     snprintf(tgt_tail, sizeof(tgt_tail), ".%s", callee);
     cbm_edge_t *edges = NULL;
     int edge_count = 0;
-    if (cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &edge_count) != CBM_STORE_OK) {
+    if (cbm_store_find_edges_by_type(s, project, relation, &edges, &edge_count) != CBM_STORE_OK) {
         return -1;
     }
     int hits = 0;
@@ -15478,7 +15479,8 @@ static int smr_calls(cbm_store_t *s, const char *project, const char *caller, co
             size_t sl = strlen(src.qualified_name);
             size_t tl = strlen(tgt.qualified_name);
             if (sl >= cs && tl >= ts && strcmp(src.qualified_name + sl - cs, src_tail) == 0 &&
-                strcmp(tgt.qualified_name + tl - ts, tgt_tail) == 0) {
+                (strcmp(callee, "*") == 0 ||
+                 strcmp(tgt.qualified_name + tl - ts, tgt_tail) == 0)) {
                 hits++;
             }
         }
@@ -15489,6 +15491,10 @@ static int smr_calls(cbm_store_t *s, const char *project, const char *caller, co
         cbm_store_free_edges(edges, edge_count);
     }
     return hits;
+}
+
+static int smr_calls(cbm_store_t *s, const char *project, const char *caller, const char *callee) {
+    return smr_relationships(s, project, caller, callee, "CALLS");
 }
 
 static int check_same_module_bound_receiver(bool parallel) {
@@ -15664,7 +15670,7 @@ TEST(pipeline_tsjs_same_module_bound_receiver_not_bound_parallel) {
  * files, runs the sequential resolver or (padded past
  * MIN_FILES_FOR_PARALLEL, CBM_WORKERS pinned) the parallel one, and counts
  * the CALLS edges of each (caller tail, callee tail) pair. */
-enum { NG_MAX_PAIRS = 16, NG_PAD_FILES = 52 };
+enum { NG_MAX_PAIRS = 32, NG_PAD_FILES = 52 };
 
 typedef struct {
     const char *path;
@@ -15678,8 +15684,11 @@ typedef struct {
     const char *why;
 } ng_pair_t;
 
-static int ng_check(const ng_file_t *files, int nfiles, const ng_pair_t *pairs, int npairs,
+static int ng_check_with_relations(const ng_file_t *files, int nfiles, const ng_pair_t *pairs, int npairs,
+                    const ng_pair_t *http, int nhttp, const ng_pair_t *usages, int nusages,
                     bool parallel) {
+    int total = npairs + nhttp + nusages;
+    ASSERT_TRUE(total <= NG_MAX_PAIRS);
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_ng_XXXXXX");
     if (!cbm_mkdtemp(tmp)) {
@@ -15716,9 +15725,50 @@ static int ng_check(const ng_file_t *files, int nfiles, const ng_pair_t *pairs, 
     cbm_store_t *s = run_rc == 0 ? cbm_store_open_path(db_path) : NULL;
     bool store_opened = s != NULL;
     int got[NG_MAX_PAIRS];
-    for (int i = 0; i < npairs && i < NG_MAX_PAIRS; i++) {
-        got[i] = s ? smr_calls(s, cbm_pipeline_project_name(p), pairs[i].caller, pairs[i].callee)
-                   : -1;
+    for (int i = 0; i < total && i < NG_MAX_PAIRS; i++) {
+        const ng_pair_t *pair = i < npairs ? &pairs[i] :
+            i < npairs + nhttp ? &http[i - npairs] : &usages[i - npairs - nhttp];
+        const char *relation = i < npairs ? "CALLS" : i < npairs + nhttp ? "HTTP_CALLS" : "USAGE";
+        got[i] = s ? smr_relationships(s, cbm_pipeline_project_name(p), pair->caller, pair->callee,
+                                       relation) : -1;
+        if (s && strcmp(pair->callee, "*") == 0) {
+            const char *leaf = strrchr(pair->caller, '.');
+            cbm_node_t *nodes = NULL;
+            int count = 0;
+            bool found = false;
+            cbm_store_find_nodes_by_name(s, cbm_pipeline_project_name(p), leaf ? leaf + 1 : pair->caller,
+                                         &nodes, &count);
+            size_t len = strlen(pair->caller);
+            for (int j = 0; j < count; j++) {
+                size_t n = strlen(nodes[j].qualified_name);
+                if (n > len && nodes[j].qualified_name[n - len - 1] == '.' &&
+                    strcmp(nodes[j].qualified_name + n - len, pair->caller) == 0)
+                    found = true;
+            }
+            cbm_store_free_nodes(nodes, count);
+            if (!found) got[i] = -2;
+        }
+    }
+    bool mismatch = false;
+    for (int i = 0; i < total; i++) {
+        const ng_pair_t *pair = i < npairs ? &pairs[i] :
+            i < npairs + nhttp ? &http[i - npairs] : &usages[i - npairs - nhttp];
+        mismatch = mismatch || got[i] != pair->want;
+    }
+    if (s && mismatch) {
+        cbm_edge_t *edges = NULL;
+        int count = 0;
+        cbm_store_find_edges_by_type(s, cbm_pipeline_project_name(p), "CALLS", &edges, &count);
+        for (int i = 0; i < count; i++) {
+            cbm_node_t source = {0}, target = {0};
+            if (cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK &&
+                cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK)
+                printf("  actual %s -> %s (%s, %s)\n", source.qualified_name, target.qualified_name,
+                       target.label, edges[i].properties_json ? edges[i].properties_json : "{}");
+            cbm_node_free_fields(&source);
+            cbm_node_free_fields(&target);
+        }
+        cbm_store_free_edges(edges, count);
     }
     if (s) {
         cbm_store_close(s);
@@ -15738,18 +15788,378 @@ static int ng_check(const ng_file_t *files, int nfiles, const ng_pair_t *pairs, 
     ASSERT_EQ(restore_single_rc, 0);
     ASSERT_EQ(run_rc, 0);
     ASSERT_TRUE(store_opened);
-    ASSERT_TRUE(npairs <= NG_MAX_PAIRS);
     int bad = 0;
-    for (int i = 0; i < npairs; i++) {
-        if (got[i] != pairs[i].want) {
-            printf("  %s -> %s: %d edge(s), want %d (%s)\n", pairs[i].caller, pairs[i].callee,
-                   got[i], pairs[i].want, pairs[i].why);
+    for (int i = 0; i < total; i++) {
+        const ng_pair_t *pair = i < npairs ? &pairs[i] :
+            i < npairs + nhttp ? &http[i - npairs] : &usages[i - npairs - nhttp];
+        if (got[i] != pair->want) {
+            printf("  %s %s -> %s: %d edge(s), want %d (%s)\n",
+                   i < npairs ? "CALLS" : i < npairs + nhttp ? "HTTP_CALLS" : "USAGE", pair->caller, pair->callee,
+                   got[i], pair->want, pair->why);
             bad++;
         }
     }
     ASSERT_EQ(bad, 0);
     PASS();
 }
+
+static int ng_check_with_http(const ng_file_t *files, int nfiles, const ng_pair_t *pairs,
+                              int npairs, const ng_pair_t *http, int nhttp, bool parallel) {
+    return ng_check_with_relations(files, nfiles, pairs, npairs, http, nhttp, NULL, 0, parallel);
+}
+
+static int ng_check(const ng_file_t *files, int nfiles, const ng_pair_t *pairs, int npairs,
+                    bool parallel) {
+    return ng_check_with_http(files, nfiles, pairs, npairs, NULL, 0, parallel);
+}
+
+static int check_x11b_bound_fetch(bool parallel) {
+    static const ng_file_t files[] = {
+        {"src/fetch_values.js",
+         "const hooks = { 'fetch': () => 0 };\n"
+         "export function load(fetch) { return fetch('/api/items'); }\n"
+         "export function local(value) { const fetch = value; return fetch('/api/items'); }\n"
+         "export function free() { return fetch('/api/items'); }\n"},
+        {"src/fetch_import.js",
+         "import { fetch } from 'external-client';\n"
+         "export function imported() { return fetch('/api/items'); }\n"},
+        {"src/fetch_root.js",
+         "const holder = { fn: (value) => value };\n"
+         "export const fetch = Reflect.get(holder, 'fn');\n"
+         "export function root() { return fetch('/api/items'); }\n"},
+        {"src/fetch_self.js",
+         "const hooks = { 'fetch': () => 0 };\n"
+         "function replacement() {}\n"
+         "export function fetch() { fetch = replacement; fetch('/api/items'); }\n"},
+        {"src/fetch_owned.js",
+         "export function fetch() { return fetch('/api/items'); }\n"},
+        {"src/fetch_known.js",
+         "import { fetch } from './fetch_owned';\n"
+         "export function known() { return fetch('/api/items'); }\n"},
+        {"src/fetch_callable_import.js",
+         "import { fetch } from './fetch_root';\n"
+         "export function knownValue() { return fetch('/api/items'); }\n"},
+        {"src/fetch_refs.tsx",
+         "function handler() { return 1; }\n"
+         "export function View() { return <form action={handler} />; }\n"
+         "export function Shadow(handler) { return <form action={handler} />; }\n"},
+        {"src/fetch_expression.js",
+         "export const invoke = function fetch(replacement) {\n"
+         "  fetch = replacement; return fetch('/api/inside');\n"
+         "};\n"
+         "export function outside() { return fetch('/api/outside'); }\n"},
+    };
+    static const ng_pair_t calls[] = {
+        {"fetch_values.load", "*", 0, "unknown parameter is not a project callable"},
+        {"fetch_values.local", "*", 0, "unknown local is not a project callable"},
+        {"fetch_values.free", "*", 0, "global fetch has no CALLS target"},
+        {"fetch_import.imported", "*", 0, "external import has no project target"},
+        {"fetch_root.root", "*", 1, "retain the callable variable binding"},
+        {"fetch_root.root", "fetch_root.fetch", 1, "exact module binding target"},
+        {"fetch_callable_import.knownValue", "*", 1, "retain imported callable values"},
+        {"fetch_callable_import.knownValue", "fetch_root.fetch", 1, "exact import binding"},
+        {"fetch_refs.View", "*", 0, "a JSX attribute reference does not invoke its value"},
+        {"fetch_refs.Shadow", "*", 0, "a parameter value reference does not invoke it"},
+        {"fetch_self.fetch", "*", 0, "reassigned self target is rejected"},
+        {"fetch_owned.fetch", "*", 1, "proven immutable self call is kept"},
+        {"fetch_owned.fetch", "fetch_owned.fetch", 1, "exact self target"},
+        {"fetch_known.known", "*", 1, "proven import is kept"},
+        {"fetch_known.known", "fetch_owned.fetch", 1, "exact imported target"},
+        {"fetch_expression.fetch", "*", 0, "private expression name has an unknown written value"},
+        {"fetch_expression.outside", "*", 0, "private expression name does not bind the module"},
+    };
+    static const ng_pair_t http[] = {
+        {"fetch_values.load", "*", 0, "parameter spelling is not global fetch"},
+        {"fetch_values.local", "*", 0, "local spelling is not global fetch"},
+        {"fetch_values.free", "*", 1, "unbound fetch stays HTTP beside a literal key"},
+        {"fetch_import.imported", "*", 0, "unknown import is not global fetch"},
+        {"fetch_root.root", "*", 0, "module binding is not global fetch"},
+        {"fetch_callable_import.knownValue", "*", 0, "callable import is not native fetch"},
+        {"fetch_refs.View", "*", 0, "a function reference is not HTTP"},
+        {"fetch_refs.Shadow", "*", 0, "a parameter reference is not HTTP"},
+        {"fetch_self.fetch", "*", 0, "rejected self target must not fall back to HTTP"},
+        {"fetch_owned.fetch", "*", 0, "proven self call is not HTTP"},
+        {"fetch_known.known", "*", 0, "proven project import is not HTTP"},
+        {"fetch_expression.fetch", "*", 0, "private expression name is not global fetch"},
+        {"fetch_expression.outside", "*", 1, "outer unbound fetch stays HTTP"},
+    };
+    static const ng_pair_t usages[] = {
+        {"fetch_refs.View", "fetch_refs.handler", 1, "module function references stay visible"},
+        {"fetch_refs.Shadow", "fetch_refs.handler", 0, "the parameter still shadows the module function"},
+    };
+    int values_rc = ng_check_with_relations(files, 9, calls, (int)(sizeof(calls) / sizeof(calls[0])),
+        http, (int)(sizeof(http) / sizeof(http[0])), usages, 2, parallel);
+    static const ng_file_t globals[] = {
+        {"src/fetch_global_one.js", "function fetch(url) { return url; }\n"},
+        {"src/fetch_global_use.js", "const hooks = { 'fetch': () => 0 };\n"
+         "export function load() { return fetch('/api/global'); }\n"},
+        {"src/fetch_global_two.js", "function fetch(url) { return url; }\n"},
+    };
+    static const ng_pair_t global_calls[] = {
+        {"fetch_global_use.load", "fetch_global_one.fetch", 1, "source-proven project global"},
+        {"fetch_global_use.load", "*", 1, "complete outgoing set"},
+    };
+    static const ng_pair_t ambiguous_calls[] = {
+        {"fetch_global_use.load", "*", 0, "two project globals have no unique target"},
+    };
+    static const ng_pair_t global_http[] = {
+        {"fetch_global_use.load", "*", 0, "project global binding is not the native API"},
+    };
+    int global_rc = ng_check_with_http(globals, 2, global_calls, 2, global_http, 1, parallel);
+    int ambiguous_rc = ng_check_with_http(globals, 3, ambiguous_calls, 1, global_http, 1, parallel);
+    static const ng_file_t arkts[] = {
+        {"src/fetch_arkts.ets", "export function load() { return fetch('/api/native'); }\n"},
+    };
+    static const ng_pair_t arkts_calls[] = {{"fetch_arkts.load", "*", 0, "no project target"}};
+    static const ng_pair_t arkts_http[] = {
+        {"fetch_arkts.load", "*", 1, "retain native behavior without JS lexical facts"},
+    };
+    int arkts_rc = ng_check_with_http(arkts, 1, arkts_calls, 1, arkts_http, 1, parallel);
+    ASSERT_EQ(values_rc + global_rc + ambiguous_rc + arkts_rc, 0);
+    PASS();
+}
+TEST(pipeline_x11b_bound_fetch) { return check_x11b_bound_fetch(false); }
+TEST(pipeline_x11b_bound_fetch_parallel) { return check_x11b_bound_fetch(true); }
+
+/* The wildcard counts every outgoing CALLS edge; named pairs and that count
+ * together assert the complete target set, including constructor calls. */
+static int check_x11b_reassigned(bool parallel) {
+    static const ng_file_t files[] = {
+        {"src/reassigned.js", "class Sink { push(v) { return v; } }\n"
+         "export function use() { let rows = []; rows = new Sink(); return rows.push(1); }\n"},
+    };
+    static const ng_pair_t pairs[] = {
+        {"reassigned.use", "reassigned.Sink", 1, "constructor"},
+        {"reassigned.use", "reassigned.Sink.push", 1, "type-proven reassigned receiver"},
+        {"reassigned.use", "*", 2, "complete outgoing set"},
+    };
+    CBMFileResult *result = cbm_extract_file(files[0].content, (int)strlen(files[0].content),
+                                            CBM_LANG_JAVASCRIPT, "x11b", "src/reassigned.js", 0, NULL, NULL);
+    ASSERT_NOT_NULL(result);
+    int found = 0;
+    bool stale = false;
+    for (int i = 0; i < result->calls.count; i++) {
+        if (strcmp(result->calls.items[i].callee_name, "rows.push") == 0) {
+            found++;
+            stale = result->calls.items[i].receiver_requires_lsp;
+        }
+    }
+    cbm_free_result(result);
+    ASSERT_EQ(found, 1);
+    ASSERT_FALSE(stale);
+    return ng_check(files, 1, pairs, 3, parallel);
+}
+TEST(pipeline_x11b_reassigned) { return check_x11b_reassigned(false); }
+TEST(pipeline_x11b_reassigned_parallel) { return check_x11b_reassigned(true); }
+
+static int check_x11b_default_scope(bool parallel) {
+    static const ng_file_t files[] = {
+        {"src/defaults.js", "function run() { return 1; }\n"
+         "export function use(value = run()) { var run = 0; return value; }\n"},
+    };
+    static const ng_pair_t pairs[] = {
+        {"defaults.use", "defaults.run", 1, "body var is invisible in defaults"},
+        {"defaults.use", "*", 1, "complete outgoing set"},
+    };
+    return ng_check(files, 1, pairs, 2, parallel);
+}
+TEST(pipeline_x11b_default_scope) { return check_x11b_default_scope(false); }
+TEST(pipeline_x11b_default_scope_parallel) { return check_x11b_default_scope(true); }
+
+static int check_x11b_import_values(bool parallel) {
+    static const ng_file_t files[] = {
+        {"src/value_lib.js", "export function run() { return 1; }\n"},
+        {"src/values.js", "const hooks = { 'run': () => 0 };\n"
+         "import * as ops from './value_lib';\n"
+         "import { run as imported } from './value_lib';\n"
+         "export function unpack() { const { run } = ops; return run(); }\n"
+         "export function alias() { const run = imported; return run(); }\n"
+         "export function chain() { const first = imported; const run = first; return run(); }\n"
+         "export function renamed() { const { run: local } = ops; return local(); }\n"
+         "export function unknown(ops) { const { run } = ops; return run(); }\n"
+         "export function parameter(run) { return run(); }\n"},
+        {"src/required.js", "const hooks = { 'run': () => 0 };\n"
+         "export function unpack() { const { run } = require('./value_lib'); return run(); }\n"
+         "export function alias() { const ops = require('./value_lib'); const run = ops.run; return run(); }\n"},
+    };
+    static const ng_pair_t pairs[] = {
+        {"values.unpack", "value_lib.run", 1, "import namespace destructuring"},
+        {"values.unpack", "*", 1, "complete outgoing set"},
+        {"values.alias", "value_lib.run", 1, "imported name alias"},
+        {"values.alias", "*", 1, "complete outgoing set"},
+        {"values.chain", "value_lib.run", 1, "constant alias chain"},
+        {"values.chain", "*", 1, "complete outgoing set"},
+        {"values.renamed", "value_lib.run", 1, "renamed destructuring"},
+        {"values.renamed", "*", 1, "complete outgoing set"},
+        {"values.unknown", "*", 0, "unknown namespace stays unresolved"},
+        {"values.parameter", "*", 0, "parameter stays unresolved"},
+        {"required.unpack", "value_lib.run", 1, "require destructuring"},
+        {"required.unpack", "*", 1, "complete outgoing set"},
+        {"required.alias", "value_lib.run", 1, "require namespace alias"},
+        {"required.alias", "*", 1, "complete outgoing set"},
+    };
+    return ng_check(files, 3, pairs, 14, parallel);
+}
+TEST(pipeline_x11b_import_values) { return check_x11b_import_values(false); }
+TEST(pipeline_x11b_import_values_parallel) { return check_x11b_import_values(true); }
+
+static int check_x11b_project_globals(bool parallel) {
+    static const ng_file_t files[] = {
+        {"src/classic.js", "function appReady() { return 1; }\n"
+         "class ScriptBox { poke() { return 2; } }\n"},
+        {"src/ambient.d.ts", "declare function ambientReady(): number;\n"},
+        {"src/install.js", "export {};\n"
+         "globalThis.globalReady = function globalReady() { return 3; };\n"
+         "window.windowReady = function windowReady() { return 4; };\n"
+         "export function scoped(window) { window.shadowReady = function shadowReady() { return 0; }; }\n"
+         "const object = { objectReady() { return 0; } };\n"},
+        {"src/decoy.js", "export function appReady() { return 0; }\n"
+         "export function exportedOnly() { return 0; }\n"
+         "export class ScriptBox { poke() { return 0; } }\n"},
+        {"src/commonjs.js", "function commonReady() { return 0; }\n"
+         "module.exports = { commonReady };\n"},
+        {"src/globals.js", "export function use() { return appReady(); }\n"
+         "export function ambient() { return ambientReady(); }\n"
+         "export function installed() { return globalReady() + windowReady(); }\n"
+         "export function create() { const box = new ScriptBox(); return box.poke(); }\n"
+         "export function hidden() { exportedOnly(); shadowReady(); objectReady(); commonReady(); }\n"},
+    };
+    static const ng_pair_t pairs[] = {
+        {"globals.use", "classic.appReady", 1, "script global beats module homonym"},
+        {"globals.use", "*", 1, "complete outgoing set"},
+        {"globals.ambient", "ambient.d.ambientReady", 1, "ambient project declaration"},
+        {"globals.ambient", "*", 1, "complete outgoing set"},
+        {"globals.installed", "install.globalReady", 1, "explicit globalThis assignment"},
+        {"globals.installed", "install.windowReady", 1, "explicit window assignment"},
+        {"globals.installed", "*", 2, "complete outgoing set"},
+        {"globals.create", "classic.ScriptBox", 1, "global constructor"},
+        {"globals.create", "classic.ScriptBox.poke", 1, "global instance method"},
+        {"globals.create", "*", 2, "complete outgoing set"},
+        {"globals.hidden", "*", 0, "another module export is invisible"},
+    };
+    return ng_check(files, 6, pairs, 11, parallel);
+}
+TEST(pipeline_x11b_project_globals) { return check_x11b_project_globals(false); }
+TEST(pipeline_x11b_project_globals_parallel) { return check_x11b_project_globals(true); }
+
+static int check_x11b_binding_scopes(bool parallel) {
+    static const ng_file_t files[] = {
+        {"src/bindings.js", "function run() { return 'decoy'; }\n"
+         "export function caught(cb) { try { throw cb; } catch (run) { run(); } }\n"
+         "export function caughtPattern(cb) { try { throw cb; } catch ({ run }) { run(); } }\n"
+         "export function each(cbs) { for (const run of cbs) run(); }\n"
+         "export function keys(cbs) { for (let run in cbs) run(); }\n"
+         "export function loop(cb) { for (let run = cb; run; ) { run(); break; } }\n"
+         "export function after(cbs) { for (const run of cbs) run(); return run(); }\n"},
+    };
+    static const ng_pair_t pairs[] = {
+        {"bindings.caught", "*", 0, "catch binding"},
+        {"bindings.caughtPattern", "*", 0, "catch pattern binding"},
+        {"bindings.each", "*", 0, "for-of binding"},
+        {"bindings.keys", "*", 0, "for-in binding"},
+        {"bindings.loop", "*", 0, "for header binding"},
+        {"bindings.after", "bindings.run", 1, "loop binding does not escape"},
+        {"bindings.after", "*", 1, "complete outgoing set"},
+    };
+    return ng_check(files, 1, pairs, 7, parallel);
+}
+TEST(pipeline_x11b_binding_scopes) { return check_x11b_binding_scopes(false); }
+TEST(pipeline_x11b_binding_scopes_parallel) { return check_x11b_binding_scopes(true); }
+
+static int check_x11b_script_visibility(bool parallel) {
+    static const ng_file_t files[] = {
+        {"src/hidden.js", "export function eq() { return 0; }\n"
+         "export function ready() { return 0; }\n"},
+        {"src/visible.js", "function ready() { return 1; }\n"},
+        {"src/script.js", "function callsFromScript() { eq(); ready(); }\n"},
+        {"src/module.js", "export function callsFromModule() { return ready(); }\n"},
+    };
+    static const ng_pair_t pairs[] = {
+        {"script.callsFromScript", "visible.ready", 1, "classic script global"},
+        {"script.callsFromScript", "*", 1, "module export eq is invisible"},
+        {"module.callsFromModule", "visible.ready", 1, "global beats module decoy"},
+        {"module.callsFromModule", "*", 1, "complete outgoing set"},
+    };
+    return ng_check(files, 4, pairs, 4, parallel);
+}
+TEST(pipeline_x11b_script_visibility) { return check_x11b_script_visibility(false); }
+TEST(pipeline_x11b_script_visibility_parallel) { return check_x11b_script_visibility(true); }
+
+#if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
+static int check_x11b_classifier_work(bool parallel) {
+    char source[32768];
+    int n = 0;
+    for (int i = 0; i < 128; i++) {
+        n += snprintf(source + n, sizeof(source) - (size_t)n,
+                      "export function padding%d() { return %d; }\n", i, i);
+    }
+    n += snprintf(source + n, sizeof(source) - (size_t)n, "export function use() {\n");
+    for (int i = 0; i < 64; i++) {
+        n += snprintf(source + n, sizeof(source) - (size_t)n,
+                      "const cache%d = new Map(); cache%d.get(0); cache%d.get(1);\n", i, i, i);
+    }
+    snprintf(source + n, sizeof(source) - (size_t)n, "}\n");
+    const ng_file_t files[] = {{"src/work.js", source}};
+    const ng_pair_t pairs[] = {{"work.use", "*", 0, "runtime object has no project target"}};
+    cbm_js_classifier_test_reset();
+    int rc = ng_check(files, 1, pairs, 1, parallel);
+    uint64_t work = cbm_js_classifier_test_work();
+    printf("  classifier work=%llu, bound=196\n", (unsigned long long)work);
+    ASSERT_EQ(rc, 0);
+    ASSERT_GT(work, 0);
+    ASSERT_LTE(work, 196);
+    PASS();
+}
+TEST(pipeline_x11b_classifier_work) { return check_x11b_classifier_work(false); }
+TEST(pipeline_x11b_classifier_work_parallel) { return check_x11b_classifier_work(true); }
+
+/* Ordinary reads in a wide body must use the walker's retained cursor path.
+ * A node-parent search restarts from the root and scans preceding siblings. */
+static int check_x11b_binding_cursor_work(bool parallel) {
+    enum { READS = 512 };
+    char source[8192];
+    int n = snprintf(source, sizeof(source), "export function use(value) {\n");
+    for (int i = 0; i < READS; i++)
+        n += snprintf(source + n, sizeof(source) - (size_t)n, "value;\n");
+    snprintf(source + n, sizeof(source) - (size_t)n, "}\n");
+    const ng_file_t files[] = {{"src/reads.js", source}};
+    const ng_pair_t pairs[] = {{"reads.use", "*", 0, "ordinary reads are not calls"}};
+    cbm_usage_field_lookup_test_reset();
+    int rc = ng_check(files, 1, pairs, 1, parallel);
+    uint64_t slow = cbm_usage_slow_parent_fallback_test_count();
+    uint64_t work = cbm_usage_field_lookup_test_work();
+    printf("  binding cursor work=%llu, slow parent searches=%llu\n",
+           (unsigned long long)work, (unsigned long long)slow);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(slow, 0);
+    ASSERT_GT(work, 0);
+    ASSERT_LTE(work, READS * 32);
+    PASS();
+}
+TEST(pipeline_x11b_binding_cursor_work) { return check_x11b_binding_cursor_work(false); }
+TEST(pipeline_x11b_binding_cursor_work_parallel) { return check_x11b_binding_cursor_work(true); }
+#endif
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* A length-only probe must not prefetch source bytes. The descriptor offset
+ * observes Darwin stdio's hidden read-ahead without a wall-clock assertion. */
+static int check_x11b_size_probe_work(bool parallel) {
+    static const ng_file_t files[] = {
+        {"src/size.js", "export function use() { return 1; }\n"},
+        {"README.md", "# Example\n\nA short document.\n"},
+    };
+    static const ng_pair_t pairs[] = {{"size.use", "*", 0, "source contents remain intact"}};
+    cbm_pipeline_size_probe_test_reset();
+    int rc = ng_check(files, 2, pairs, 1, parallel);
+    uint64_t bytes = cbm_pipeline_size_probe_test_bytes();
+    printf("  metadata probe descriptor advance=%llu bytes, expected=0\n", (unsigned long long)bytes);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(bytes, 0);
+    PASS();
+}
+TEST(pipeline_x11b_size_probe_work) { return check_x11b_size_probe_work(false); }
+TEST(pipeline_x11b_size_probe_work_parallel) { return check_x11b_size_probe_work(true); }
+#endif
 
 /* A member call on a receiver the TS resolver typed as a built-in
  * (`const rows: number[] = []; rows.push(1)`, a `Map`, an array parameter)
@@ -16039,6 +16449,7 @@ static void write_external_import_shadow_fixture(const char *dir, int pad_files)
                     "export function sql(chunk: string): string {\n"
                     "  return chunk.replace(/\\s+/g, ' ');\n"
                     "}\n"
+                    "export function globalReady(): boolean { return false; }\n"
                     "export function normalize(s: string): string {\n"
                     "  return s.trim().toLowerCase();\n"
                     "}\n");
@@ -16052,16 +16463,17 @@ static void write_external_import_shadow_fixture(const char *dir, int pad_files)
                     "export function buildQuery(id: string): unknown {\n"
                     "  return [eq({ id }, id), sql('select 1'), normalize(id)];\n"
                     "}\n");
-    /* No import of `eq` at all. In a module (the file exports) an unimported
-     * bare name can only be a global, so it binds no project `eq`; a script
-     * shares top-level names with the other scripts of a page, so its guess
-     * keeps its edge. */
+    /* A script and a module can both call a real script global. Neither
+     * can reach an unrelated module export by a bare name. */
     write_temp_file(dir, "src/no-import.ts",
                     "export function callsWithoutImport(a: string, b: string): boolean {\n"
                     "  return eq(a, b);\n"
                     "}\n");
+    write_temp_file(dir, "src/classic-global.ts",
+                    "function globalReady(): boolean { return true; }\n");
     write_temp_file(dir, "src/no-import-script.ts",
                     "function callsFromScript(a: string, b: string): boolean {\n"
+                    "  globalReady();\n"
                     "  return eq(a, b);\n"
                     "}\n");
     for (int i = 0; i < pad_files; i++) {
@@ -16105,13 +16517,18 @@ static int assert_external_import_shadow_contract(const char *dir, const char *d
     if (rc == 0 && !cross_file_call_exists(s, project, "buildQuery", "normalize")) {
         rc = 6;
     }
-    /* (3) a bare call a module never imports is a global: no project edge;
-     * the same call in a script keeps its pre-existing edge. */
+    /* (3) module exports remain invisible to bare callers in both kinds
+     * of file. A classic-script global is the positive control. */
     if (rc == 0 && cross_file_call_exists(s, project, "callsWithoutImport", "eq")) {
         rc = 7;
     }
-    if (rc == 0 && !cross_file_call_exists(s, project, "callsFromScript", "eq")) {
+    if (rc == 0 && cross_file_call_exists(s, project, "callsFromScript", "eq")) {
         rc = 8;
+    }
+    if (rc == 0 && (smr_calls(s, project, "no-import-script.callsFromScript",
+                              "classic-global.globalReady") != 1 ||
+                    smr_calls(s, project, "no-import-script.callsFromScript", "*") != 1)) {
+        rc = 9;
     }
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -36534,6 +36951,78 @@ TEST(pipeline_ts_incremental_code_edit_equals_fresh_full) {
     PASS();
 }
 
+TEST(pipeline_x11b_incremental_equals_full) {
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        char tmp[256] = "/tmp/cbm_x11b_incr_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        write_temp_file(tmp, "classic.js", "function appReady() { return 1; }\n");
+        write_temp_file(tmp, "lib.js", "export function run() { return 2; }\n");
+        write_temp_file(tmp, "keep.js", "export function keep() { return appReady(); }\n");
+        write_temp_file(tmp, "use.js", "export function use(cb) { return cb(); }\n");
+        for (int i = 0; mode && i < NG_PAD_FILES; i++) {
+            char name[64];
+            snprintf(name, sizeof(name), "pad%d.ts", i);
+            write_temp_file(tmp, name, "export {};\n");
+        }
+        XlangEnvSave saved = xlang_env_select(mode != 0);
+        char db[512], project[256];
+        snprintf(db, sizeof(db), "%s/graph.db", tmp);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(p);
+        ASSERT_EQ(cbm_pipeline_run(p), 0);
+        snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+        cbm_pipeline_free(p);
+        for (int phase = 0; phase < 3; phase++) {
+            const char *file = phase ? "classic.js" : "use.js";
+            if (phase == 0) {
+                write_temp_file(tmp, file,
+                                "import * as ops from './lib';\n"
+                                "class Sink { push(v) { return v; } }\n"
+                                "export function use() { const { run } = ops; let rows = []; rows = new Sink(); return run() + rows.push(1); }\n");
+            } else {
+                write_temp_file(tmp, file, phase == 1
+                    ? "export function appReady() { return 1; }\n"
+                    : "function appReady() { return 1; }\n");
+            }
+            char path[512], fresh[512];
+            snprintf(path, sizeof(path), "%s/%s", tmp, file);
+            snprintf(fresh, sizeof(fresh), "%s/fresh%d.db", tmp, phase);
+            ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000 + phase, 0), 0);
+            p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+            ASSERT_NOT_NULL(p);
+            ASSERT_EQ(cbm_pipeline_run(p), 0);
+            cbm_pipeline_free(p);
+            p = cbm_pipeline_new(tmp, fresh, CBM_MODE_FULL);
+            ASSERT_NOT_NULL(p);
+            ASSERT_EQ(cbm_pipeline_run(p), 0);
+            cbm_pipeline_free(p);
+            int ni = 0, nf = 0;
+            char *a = ts_calls_fingerprint(db, project, &ni);
+            char *b = ts_calls_fingerprint(fresh, project, &nf);
+            cbm_store_t *store = cbm_store_open_path(db);
+            int global_edges = phase == 1 ? 0 : 1;
+            bool targets = store && smr_calls(store, project, "use.use", "lib.run") == 1 &&
+                           smr_calls(store, project, "use.use", "use.Sink") == 1 &&
+                           smr_calls(store, project, "use.use", "use.Sink.push") == 1 &&
+                           smr_calls(store, project, "use.use", "*") == 3 &&
+                           smr_calls(store, project, "keep.keep", "classic.appReady") == global_edges &&
+                           smr_calls(store, project, "keep.keep", "*") == global_edges;
+            bool same = a && b && strcmp(a, b) == 0 && ni == nf;
+            printf("  incremental mode=%d phase=%d same=%d targets=%d\n", mode, phase, same, targets);
+            if (!same) printf("  incremental:\n%s  full:\n%s", a ? a : "(null)\n", b ? b : "(null)\n");
+            ok = ok && same && targets;
+            if (store) cbm_store_close(store);
+            free(a);
+            free(b);
+        }
+        xlang_env_restore(&saved);
+        th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 /* A call is recorded under the nearest named callable that holds it: an
  * object-literal method or arrow property, a class field arrow, a const
  * arrow inside a method, a nested function. Two callables of one file that
@@ -39053,6 +39542,14 @@ TEST(pipeline_unknown_member_write_preserves_local_types) {
                              i, i, i, i);
                 if (j == 2 && i != 2)
                     snprintf(want, sizeof(want), "case%d.useFactory -> case%d.make", i, i);
+                if (i == 2) {
+                    /* This computed key has no proven runtime identity. A write
+                     * to Foo.prototype can replace bar, so both writers retain
+                     * the constructor/factory call but withhold Foo.bar. The
+                     * unrelated writes in cases 0, 1 and 3 keep lexical types. */
+                    snprintf(want, sizeof(want), "case%d.%s -> case%d.%s", i, users[j], i,
+                             j == 2 ? "make" : "Foo");
+                }
                 js_twin_calls_at(run.db, run.project, paths[i], lines[j], got, sizeof(got));
                 ok = js_twin_expect(what, got, want) && ok;
             }
@@ -39424,12 +39921,229 @@ TEST(pipeline_x9c_named_class_static_members_are_values) {
     PASS();
 }
 
+/* Each fixture checks the complete caller edge set through both writers. */
+static bool x9d_calls(const char *provider, const char *call, const char *want) {
+    bool ok = true;
+    for (int parallel = 0; parallel < 2; parallel++) {
+        char tmp[256] = "/tmp/cbm_x9d_calls_XXXXXX", db[512], main[2048], got[4096];
+        if (!cbm_mkdtemp(tmp)) return false;
+        XlangEnvSave env = xlang_env_select(parallel != 0);
+        if (parallel) x9c_parallel_fixture(tmp);
+        write_temp_file(tmp, "lib.ts", provider);
+        write_temp_file(tmp, "x.ts", "export const loaded = true;\n");
+        write_temp_file(tmp, "other.ts", "export class Other {}\n");
+        snprintf(main, sizeof(main), "%s\nexport async function use() { %s }\n",
+                 "import api, { make, Builder, api2, Port } from './lib';", call);
+        write_temp_file(tmp, "main.ts", main);
+        snprintf(db, sizeof(db), "%s/g.db", tmp);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        int rc = p ? x9c_parallel_run(p, parallel != 0) : -1;
+        if (rc == 0) {
+            js_twin_calls_at(db, cbm_pipeline_project_name(p), "main.ts", 2, got, sizeof(got));
+            ok = js_twin_expect(parallel ? "parallel exact CALLS" : "sequential exact CALLS",
+                                got, want) && ok;
+        } else ok = false;
+        cbm_pipeline_free(p);
+        xlang_env_restore(&env);
+        th_rmtree(tmp);
+    }
+    return ok;
+}
+
+TEST(pipeline_x9d_default_export_binding) {
+    const char *sources[] = {
+        "function run() {}\nfunction outer() { function run() {} }\nexport default run;\n",
+        "function run() {} function outer() { function run() {} } export default run;\n",
+        "export default function run() {} function outer() { function run() {} }\n",
+        "const run = () => {}; function outer() { const run = () => {}; } export default run;\n",
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        ok = x9d_calls(sources[i], "api();", "main.use -> lib.run") && ok;
+    ok = x9d_calls("export default class Port { static run() {} } function outer() { class Port {} }",
+                    "api.run();", "main.use -> lib.Port.run") && ok;
+    ok = x9d_calls("class Port { send() {} } const value = new Port(); export default value;",
+                    "api.send();", "main.use -> lib.Port.send") && ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_x9d_generator_returns) {
+    const char *sources[] = {
+        "class Port { send() {} } export class Builder { static *make() { return new Port(); } }",
+        "class Port { send() {} } export class Builder { static async *make() { return new Port(); } }",
+        "class Port { send() {} } export const Builder = { *make() { return new Port(); } };",
+        "class Port { send() {} } export const Builder = { async *make() { return new Port(); } };",
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        ok = x9d_calls(sources[i], "(await Builder.make()).send();",
+                        i < 2 ? "main.use -> lib.Builder.make" : "main.use -> lib.make") && ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_x9d_await_adoption) {
+    bool ok = x9d_calls("export class Port { then() {} send() {} } export function make() { return new Port(); }",
+                         "(await make()).send();", "main.use -> lib.make");
+    ok = x9d_calls("export class Port { send() {} } export function make(): Promise<Port> | Port { return null; }",
+                    "(await make()).send();", "main.use -> lib.Port.send; main.use -> lib.make") && ok;
+    ok = x9d_calls("export class Port { send() {} } class Other { send() {} } export function make(): Promise<Port> | Other { return null; }",
+                    "(await make()).send();", "main.use -> lib.make") && ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_x9d_eval_binding) {
+    const char *sources[] = {
+        "export class Port { send() {} } export function make() { return new Port(); } (eval)('Port = Other');",
+        "export class Port { send() {} } export function make() { return new Port(); } function local(eval) { eval('text'); }",
+        "export class Port { send() {} } export function make() { return new Port(); } const eval = (x) => x; (eval)('text');",
+        "export class Port { send() {} } export function make() { return new Port(); } function local(eval) {} (eval)('Port = Other');",
+        "export class Port { send() {} } export function make() { return new Port(); } var eval = (x) => x; var eval; eval('text');",
+        "export class Port { send() {} } export function make() { return new Port(); } function local(value = eval('Port = Other')) { var eval; }",
+        "export class Port { send() {} } export function make() { return new Port(); } class Other { static { var eval; } } (eval)('Port = Other');",
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        ok = x9d_calls(sources[i], "make().send();", i == 1 || i == 2 || i == 4
+                        ? "main.use -> lib.Port.send; main.use -> lib.make"
+                        : "main.use -> lib.make") && ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_x9d_mutated_members) {
+    const char *sources[] = {
+        "export class Port { send() {} } Object.assign(Port.prototype, { send: replacement }); export function make() { return new Port(); }",
+        "export class Port { send() {} } Port.prototype.send = replacement; export function make() { return new Port(); }",
+        "@decorate export class Port { send() {} } export function make() { return new Port(); }",
+        "export class Port { send() {} } (Object . assign)(Port.prototype, { send: replacement }); export function make() { return new Port(); }",
+        "export class Port { send() {} } Port['prototype'].send = replacement; export function make() { return new Port(); }",
+        "export class Port { send() {} } Port[key].send = replacement; export function make() { return new Port(); }",
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        ok = x9d_calls(sources[i], "make().send();", "main.use -> lib.make") && ok;
+    ok = x9d_calls("export class Port { send() {} } export function make() { return new Port(); } make.cache = 1;",
+                    "make().send();", "main.use -> lib.Port.send; main.use -> lib.make") && ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_x9d_member_edit_incremental) {
+    char tmp[256] = "/tmp/cbm_x9d_edit_XXXXXX", db[512], body[2048], got[2048];
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    XlangEnvSave env = xlang_env_select(true);
+    x9c_parallel_fixture(tmp);
+    write_temp_file(tmp, "main.ts", "import { make } from './lib';\nexport function use() { make().send(); }\n");
+    const char *tails[] = {"", "Object.assign(Port.prototype, { send: replacement });",
+                           "Port.prototype.send = replacement;", ""};
+    bool ok = true;
+    snprintf(db, sizeof(db), "%s/g.db", tmp);
+    for (int phase = 0; phase < 4; phase++) {
+        snprintf(body, sizeof(body), "%sexport class Port { send() {} } export function make() { return new Port(); } %s\n",
+                 phase == 3 ? "@decorate " : "", tails[phase]);
+        write_temp_file(tmp, "lib.ts", body);
+        char path[512];
+        snprintf(path, sizeof(path), "%s/lib.ts", tmp);
+        ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000 + phase * 100, 0), 0);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(p);
+        ASSERT_EQ(x9c_parallel_run(p, phase == 0), 0);
+        if (phase) ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+        const char *project = cbm_pipeline_project_name(p);
+        js_twin_calls_at(db, project, "main.ts", 2, got, sizeof(got));
+        ok = js_twin_expect("member edit", got, phase ? "main.use -> lib.make"
+                            : "main.use -> lib.Port.send; main.use -> lib.make") && ok;
+        if (phase) ok = x9c_fresh_calls_equal(tmp, db, project, phase) && ok;
+        cbm_pipeline_free(p);
+    }
+    xlang_env_restore(&env);
+    th_rmtree(tmp);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_x9d_literal_members) {
+    const char *sources[] = {
+        "export const api2 = { 'run'() {} };",
+        "export const api2 = { 7() {} };",
+        "function run() {} export const api2 = { run };",
+        "const run = () => {}; export const api2 = { run };",
+        "let run = () => {}; run = replacement; export const api2 = { run };",
+        "function outer() { function run() {} } export const api2 = { run };",
+        "function run() {} run = replacement; export const api2 = { run };",
+        "function run() {} export const api2 = { 'run'() {} };",
+        "function run() {} run! = replacement; export const api2 = { run };",
+    };
+    const char *calls[] = {"api2.run();", "api2[7]();", "api2.run();",
+                           "api2.run();", "api2.run();", "api2.run();", "api2.run();", "api2.run();", "api2.run();"};
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        ok = x9d_calls(sources[i], calls[i], i < 4
+                        ? (i == 1 ? "main.use -> lib.7" : "main.use -> lib.run")
+                        : (i == 7 ? "main.use -> lib.api2.run" : "")) && ok;
+    ok = x9d_calls(sources[0], "api2['run']();", "main.use -> lib.run") && ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_x9d_side_effect_import) {
+    ASSERT_TRUE(x9d_calls("import './x'; import { Other } from './other'; export class Port { send() {} } export function make() { return new Port(); }",
+                           "make().send();", "main.use -> lib.Port.send; main.use -> lib.make"));
+    PASS();
+}
+
+TEST(pipeline_x9d_finally_returns) {
+    ASSERT_TRUE(x9d_calls("export class Port { send() {} } export function make() { try { return new Port(); } finally { cleanup(); } }",
+                           "make().send();", "main.use -> lib.Port.send; main.use -> lib.make"));
+    ASSERT_TRUE(x9d_calls("export class Port { send() {} } export function make() { try { return new Port(); } finally { return outside; } }",
+                           "make().send();", "main.use -> lib.make"));
+    PASS();
+}
+
+TEST(pipeline_x9d_static_writes_keep_constructor_binding) {
+    const char *provider = "export class Port { static count = 0; static build() {} send() {} } "
+                           "Port.count++; export function make() { return new Port(); }";
+    bool ok = x9d_calls(provider, "make().send();", "main.use -> lib.Port.send; main.use -> lib.make");
+    ok = x9d_calls(provider, "new Port().send();", "main.use -> lib.Port; main.use -> lib.Port.send") && ok;
+    ok = x9d_calls(provider, "Port.build();", "main.use -> lib.Port.build") && ok;
+    ok = x9d_calls("export class Port { static slot; send() {} } Port.slot = new Port(); export function make() { return new Port(); }",
+                    "make().send();", "main.use -> lib.Port.send; main.use -> lib.make") && ok;
+    ok = x9d_calls("export class Port { static build() {} } Port.build = replacement;",
+                    "Port.build();", "") && ok;
+    ok = x9d_calls("export class Port { static build() {} } Object.assign(Port, { build: replacement });",
+                    "Port.build();", "") && ok;
+    ok = x9d_calls("export class Port { static key = 0; static build() {} } Port[key] = replacement;",
+                    "Port.build();", "") && ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
     RUN_TEST(pipeline_private_member_writes_keep_unrelated_self);
     RUN_TEST(pipeline_script_self_rejects_aliased_literal_writes);
     RUN_TEST(pipeline_member_write_scope);
     RUN_TEST(pipeline_script_global_write_scope);
     RUN_TEST(pipeline_prototype_helpers_reject_self);
+    RUN_TEST(pipeline_x9d_static_writes_keep_constructor_binding);
+    RUN_TEST(pipeline_x9d_side_effect_import);
+    RUN_TEST(pipeline_x9d_finally_returns);
+
+    RUN_TEST(pipeline_x9d_literal_members);
+
+    RUN_TEST(pipeline_x9d_mutated_members);
+    RUN_TEST(pipeline_x9d_member_edit_incremental);
+
+    RUN_TEST(pipeline_x9d_eval_binding);
+
+    RUN_TEST(pipeline_x9d_await_adoption);
+
+    RUN_TEST(pipeline_x9d_generator_returns);
+
+    RUN_TEST(pipeline_x9d_default_export_binding);
+
     RUN_TEST(pipeline_unknown_member_write_preserves_local_types);
     RUN_TEST(pipeline_member_self_calls_reject_indirect_writes);
     RUN_TEST(pipeline_js_self_edge_requires_unwritten_binding);
@@ -39484,6 +40198,31 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_module_callers_parallel);
     RUN_TEST(pipeline_tsjs_same_module_bound_receiver_not_bound);
     RUN_TEST(pipeline_tsjs_same_module_bound_receiver_not_bound_parallel);
+    RUN_TEST(pipeline_x11b_bound_fetch);
+    RUN_TEST(pipeline_x11b_bound_fetch_parallel);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(pipeline_x11b_size_probe_work);
+    RUN_TEST(pipeline_x11b_size_probe_work_parallel);
+#endif
+    RUN_TEST(pipeline_x11b_default_scope);
+    RUN_TEST(pipeline_x11b_default_scope_parallel);
+    RUN_TEST(pipeline_x11b_import_values);
+    RUN_TEST(pipeline_x11b_import_values_parallel);
+    RUN_TEST(pipeline_x11b_project_globals);
+    RUN_TEST(pipeline_x11b_project_globals_parallel);
+    RUN_TEST(pipeline_x11b_binding_scopes);
+    RUN_TEST(pipeline_x11b_binding_scopes_parallel);
+    RUN_TEST(pipeline_x11b_script_visibility);
+    RUN_TEST(pipeline_x11b_script_visibility_parallel);
+#if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
+    RUN_TEST(pipeline_x11b_classifier_work);
+    RUN_TEST(pipeline_x11b_classifier_work_parallel);
+    RUN_TEST(pipeline_x11b_binding_cursor_work);
+    RUN_TEST(pipeline_x11b_binding_cursor_work_parallel);
+#endif
+    RUN_TEST(pipeline_x11b_incremental_equals_full);
+    RUN_TEST(pipeline_x11b_reassigned);
+    RUN_TEST(pipeline_x11b_reassigned_parallel);
     RUN_TEST(pipeline_tsjs_builtin_receiver_not_bound);
     RUN_TEST(pipeline_tsjs_builtin_receiver_not_bound_parallel);
     RUN_TEST(pipeline_tsjs_local_callee_not_bound);

@@ -2965,6 +2965,25 @@ static char *extract_callee_name(CBMExtractCtx *ctx, CBMArena *a, TSNode node, c
         }
     }
 
+    /* Literal JS/TS bracket calls need an occurrence carrier too. The
+     * semantic resolver must prove their target before either writer emits. */
+    if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
+        TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
+        if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "subscript_expression") == 0) {
+            TSNode object = ts_node_child_by_field_name(fn, TS_FIELD("object"));
+            TSNode index = ts_node_child_by_field_name(fn, TS_FIELD("index"));
+            if (!ts_node_is_null(object) && !ts_node_is_null(index) &&
+                cbm_js_literal_key_node(index, lang)) {
+                const char *raw = cbm_node_text(a, index, source);
+                const char *key = raw && !strchr(raw, '\\')
+                                      ? cbm_func_name_node_text(a, index, source, lang) : NULL;
+                const char *receiver = cbm_node_text(a, object, source);
+                return key && receiver ? cbm_arena_sprintf(a, "%s.%s", receiver, key) : NULL;
+            }
+            return NULL;
+        }
+    }
+
     // Try common field-based resolution first
     char *name = extract_callee_from_fields(a, node, source);
     if (name) {
@@ -5479,6 +5498,12 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
         if (primary_callee_name_is_allowed(ctx, &callee)) {
             CBMCall call = {0};
             call.requires_lsp_resolution = js_keyword_call_candidate(ctx, &callee);
+            if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
+                ctx->language == CBM_LANG_TSX) {
+                TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
+                if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "subscript_expression") == 0)
+                    call.requires_lsp_resolution = true;
+            }
             call.callee_name = callee.name;
             call.enclosing_func_qn = state->enclosing_func_qn;
             call.loop_depth = state->loop_depth;     // enclosing loop nesting at this call
