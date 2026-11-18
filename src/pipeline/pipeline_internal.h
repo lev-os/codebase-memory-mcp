@@ -1826,7 +1826,8 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
 /* 27: JS/TS literal callable keys share unquoted names and keep numeric keys. */
 /* 28: JS/TS generator expressions own their definitions and call scopes. */
 /* 29: JS/TS keyword calls require binding; name guesses cannot call type aliases. */
-/* 30: a self CALLS edge needs a JS/TS callable that no assignment rebinds. */
+/* 30: a self CALLS edge needs a JS/TS callable that no assignment rebinds; a
+ *     JS/TS call that needs a binding keeps its HTTP/route/config edges. */
 enum { CBM_SEMANTIC_INDEX_VERSION = 30 };
 
 typedef struct {

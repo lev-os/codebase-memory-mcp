@@ -3547,7 +3547,11 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         /* A synthetic semantic candidate is an invocation only when the LSP
          * resolved it to a concrete graph node. Never let registry, field-name,
          * route, or service heuristics manufacture a target for it. */
-        if (call->requires_lsp_resolution && !lsp_target) {
+        /* JS/TS keeps the service, route and configuration classification
+         * below: the registry skipped the call, so res stays empty and no
+         * plain CALLS target exists. MUST match pass_calls.c. */
+        if (call->requires_lsp_resolution && !lsp_target && lang != CBM_LANG_JAVASCRIPT &&
+            lang != CBM_LANG_TYPESCRIPT && lang != CBM_LANG_TSX && lang != CBM_LANG_ARKTS) {
             continue;
         }
 

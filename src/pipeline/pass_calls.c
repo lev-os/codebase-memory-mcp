@@ -1480,7 +1480,13 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
      * invocation target. Textual registry/service fallbacks would bind an
      * unresolved primitive expression such as `int + int` to an unrelated
      * project `operator+`, fabricating a CALLS edge. */
-    if (call->requires_lsp_resolution) {
+    /* JS/TS: a call that needs a binding (a literal-key or keyword name) gets
+     * no name-guess target, but the service, route and configuration
+     * classification below still runs: `fetch('/x')` beside a `'fetch'` key
+     * is the global HTTP call. MUST match pass_parallel.c. */
+    bool js_family = lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
+                     lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS;
+    if (call->requires_lsp_resolution && !js_family) {
         return 0;
     }
 
@@ -1573,7 +1579,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
                 cbm_pipeline_ts_builtin_target(lang, lsp->strategy, lsp->callee_qn,
                                                ctx->project_name));
     cbm_resolution_t res = {0};
-    if (swift_candidates >= 0) {
+    if (swift_candidates >= 0 && !call->requires_lsp_resolution) {
         res = calls_registry_resolution(ctx, call, module_qn, imp_keys, imp_vals, imp_count, lang,
                                         rust_external, php_vendor_call, java_external,
                                         cbm_pipeline_caller_is_test(source_node, rel, lang));

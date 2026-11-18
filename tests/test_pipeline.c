@@ -37214,6 +37214,52 @@ TEST(pipeline_py_import_alias_self_call_has_no_self_edge) {
     PASS();
 }
 
+/* A quoted key named like a global binds no bare call. With no proven target
+ * the call gets no CALLS edge, and the global fetch() keeps its HTTP_CALLS
+ * edge to its route. */
+TEST(pipeline_js_quoted_key_keeps_global_fetch_http_call) {
+    static const char *const files[] = {"main.js",
+                                        "const hooks = { 'fetch': () => 0 };\n"
+                                        "export function load() { return fetch('/api/items'); }\n",
+                                        "plain.js",
+                                        "export function loadPlain() { return fetch('/api/items'); }\n",
+                                        NULL};
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        js_exact_run_t run;
+        ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+        char got[1024];
+        char what[64];
+        snprintf(what, sizeof(what), "fetch HTTP_CALLS mode=%d", mode);
+        js_twin_rows(run.db, run.project,
+                     "SELECT s.qualified_name, t.label || ' ' || t.qualified_name || ' ' || "
+                     "json_extract(e.properties, '$.url_path') FROM edges e "
+                     "JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id "
+                     "WHERE e.project = ?1 AND e.type = 'HTTP_CALLS' AND s.name = ?4 "
+                     "AND ?2 = ?2 AND ?3 = ?3 ORDER BY 1, 2",
+                     0, "", "load", true, got, sizeof(got));
+        ok = js_twin_expect(what, got, "main.load -> Route __route__ANY__/api/items /api/items") &&
+             ok;
+        /* The same call in a file with no quoted key: the same route. */
+        js_twin_rows(run.db, run.project,
+                     "SELECT s.qualified_name, t.label || ' ' || t.qualified_name || ' ' || "
+                     "json_extract(e.properties, '$.url_path') FROM edges e "
+                     "JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id "
+                     "WHERE e.project = ?1 AND e.type = 'HTTP_CALLS' AND s.name = ?4 "
+                     "AND ?2 = ?2 AND ?3 = ?3 ORDER BY 1, 2",
+                     0, "", "loadPlain", true, got, sizeof(got));
+        ok = js_twin_expect(what, got,
+                            "plain.loadPlain -> Route __route__ANY__/api/items /api/items") &&
+             ok;
+        snprintf(what, sizeof(what), "fetch CALLS mode=%d", mode);
+        js_twin_calls_at(run.db, run.project, "main.js", 2, got, sizeof(got));
+        ok = js_twin_expect(what, got, "") && ok;
+        js_exact_done(&run);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 TEST(pipeline_js_generator_expressions) {
     static const char *const exts[] = {"js", "ts", "tsx"};
     bool ok = true;
@@ -38481,6 +38527,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_quoted_key_keeps_lexical_binding);
     RUN_TEST(pipeline_js_reassigned_callable_has_no_self_edge);
     RUN_TEST(pipeline_py_import_alias_self_call_has_no_self_edge);
+    RUN_TEST(pipeline_js_quoted_key_keeps_global_fetch_http_call);
     RUN_TEST(pipeline_js_generator_expressions);
     RUN_TEST(pipeline_js_constructor_does_not_guess_type_alias);
     RUN_TEST(pipeline_js_keyword_named_local_call);
