@@ -16140,6 +16140,27 @@ TEST(pipeline_x11b_binding_cursor_work) { return check_x11b_binding_cursor_work(
 TEST(pipeline_x11b_binding_cursor_work_parallel) { return check_x11b_binding_cursor_work(true); }
 #endif
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* A length-only probe must not prefetch source bytes. The descriptor offset
+ * observes Darwin stdio's hidden read-ahead without a wall-clock assertion. */
+static int check_x11b_size_probe_work(bool parallel) {
+    static const ng_file_t files[] = {
+        {"src/size.js", "export function use() { return 1; }\n"},
+        {"README.md", "# Example\n\nA short document.\n"},
+    };
+    static const ng_pair_t pairs[] = {{"size.use", "*", 0, "source contents remain intact"}};
+    cbm_pipeline_size_probe_test_reset();
+    int rc = ng_check(files, 2, pairs, 1, parallel);
+    uint64_t bytes = cbm_pipeline_size_probe_test_bytes();
+    printf("  metadata probe descriptor advance=%llu bytes, expected=0\n", (unsigned long long)bytes);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(bytes, 0);
+    PASS();
+}
+TEST(pipeline_x11b_size_probe_work) { return check_x11b_size_probe_work(false); }
+TEST(pipeline_x11b_size_probe_work_parallel) { return check_x11b_size_probe_work(true); }
+#endif
+
 /* A member call on a receiver the TS resolver typed as a built-in
  * (`const rows: number[] = []; rows.push(1)`, a `Map`, an array parameter)
  * names the built-in's method. Before, the resolver's Array.push had no graph
@@ -39512,6 +39533,10 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_tsjs_same_module_bound_receiver_not_bound_parallel);
     RUN_TEST(pipeline_x11b_bound_fetch);
     RUN_TEST(pipeline_x11b_bound_fetch_parallel);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(pipeline_x11b_size_probe_work);
+    RUN_TEST(pipeline_x11b_size_probe_work_parallel);
+#endif
     RUN_TEST(pipeline_x11b_default_scope);
     RUN_TEST(pipeline_x11b_default_scope_parallel);
     RUN_TEST(pipeline_x11b_import_values);

@@ -22,8 +22,18 @@
 #include "cbm.h"
 #include "lsp/php_lsp.h"
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
+#include <stdio.h>
 #include <stdatomic.h>
 #include <string.h>
+
+/* Length of the opened regular source, without moving or reading the stream.
+ * Returns -1 on metadata failure or when the size cannot fit in long. */
+long cbm_pipeline_open_file_size(FILE *file);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Descriptor advancement caused by size probes, not by content reads. */
+void cbm_pipeline_size_probe_test_reset(void);
+uint64_t cbm_pipeline_size_probe_test_bytes(void);
+#endif
 
 typedef struct cbm_pipeline_frozen cbm_pipeline_frozen_t;
 

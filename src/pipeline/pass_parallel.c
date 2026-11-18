@@ -258,9 +258,7 @@ static char *read_file(const char *path, int *out_len, long *out_size,
         }
         return NULL;
     }
-    (void)fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    (void)fseek(f, 0, SEEK_SET);
+    long size = cbm_pipeline_open_file_size(f);
     if (out_size) {
         *out_size = size;
     }
