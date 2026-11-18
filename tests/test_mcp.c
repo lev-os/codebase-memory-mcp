@@ -8442,6 +8442,23 @@ TEST(tool_trace_path_stored_self_edge_is_bounded) {
     ASSERT_GT(cbm_store_insert_edge(st, &edge), 0);
     ASSERT_GT(cbm_store_insert_edge(st, &edge), 0);
     ASSERT_EQ(cbm_store_count_edges_by_type(st, "self-edge", "CALLS"), 1);
+    /* Beside it: `used` calls itself and has a real caller, an entry point. */
+    cbm_node_t used = {.project = "self-edge", .label = "Function", .name = "used",
+        .qualified_name = "self-edge.used", .file_path = "walk.js",
+        .properties_json = "{\"self_recursive\":true,\"recursive\":true}"};
+    cbm_node_t caller = {.project = "self-edge", .label = "Function", .name = "caller",
+        .qualified_name = "self-edge.caller", .file_path = "walk.js",
+        .properties_json = "{}"};
+    int64_t used_id = cbm_store_upsert_node(st, &used);
+    int64_t caller_id = cbm_store_upsert_node(st, &caller);
+    ASSERT_GT(used_id, 0);
+    ASSERT_GT(caller_id, 0);
+    cbm_edge_t used_self = {.project = "self-edge", .source_id = used_id, .target_id = used_id,
+        .type = "CALLS"};
+    cbm_edge_t used_call = {.project = "self-edge", .source_id = caller_id, .target_id = used_id,
+        .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &used_self), 0);
+    ASSERT_GT(cbm_store_insert_edge(st, &used_call), 0);
     for (int inbound = 0; inbound < 2; inbound++) {
         char args[256];
         snprintf(args, sizeof(args),
@@ -8481,9 +8498,40 @@ TEST(tool_trace_path_stored_self_edge_is_bounded) {
     inner = extract_text_content(response);
     ASSERT_NOT_NULL(inner);
     ASSERT_NULL(strstr(response, "\"isError\":true"));
-    ASSERT_NULL(strstr(inner, "walk"));
+    /* A self call is no caller: `walk` is still unused, `used` is not. */
+    ASSERT_NOT_NULL(strstr(inner, "\"walk\""));
+    ASSERT_NULL(strstr(inner, "\"used\""));
     free(inner);
     free(response);
+    /* The documented dead-code search agrees: `walk` has degree 0 and is no
+     * entry point; `used` has a caller; `caller` is an entry point. */
+    static const struct {
+        const char *name;
+        int total;
+    } dead[] = {{"walk", 1}, {"used", 0}, {"caller", 0}};
+    for (size_t i = 0; i < sizeof(dead) / sizeof(dead[0]); i++) {
+        char args[256];
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"self-edge\",\"label\":\"Function\",\"name_pattern\":\"^%s$\","
+                 "\"max_degree\":0,\"exclude_entry_points\":true,\"format\":\"json\"}",
+                 dead[i].name);
+        response = cbm_mcp_handle_tool(srv, "search_graph", args);
+        inner = extract_text_content(response);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NULL(strstr(response, "\"isError\":true"));
+        yyjson_doc *found = yyjson_read(inner, strlen(inner), 0);
+        ASSERT_NOT_NULL(found);
+        yyjson_val *total = yyjson_obj_get(yyjson_doc_get_root(found), "total");
+        if (!yyjson_is_int(total) || yyjson_get_int(total) != dead[i].total) {
+            fprintf(stderr, "  dead-code search %s: want total %d, got [%s]\n", dead[i].name,
+                    dead[i].total, inner);
+        }
+        ASSERT_TRUE(yyjson_is_int(total));
+        ASSERT_EQ((int)yyjson_get_int(total), dead[i].total);
+        yyjson_doc_free(found);
+        free(inner);
+        free(response);
+    }
     cbm_mcp_server_free(srv);
     PASS();
 }

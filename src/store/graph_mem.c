@@ -592,10 +592,12 @@ int cbm_graph_mem_degree(const cbm_graph_mem_t *g, int64_t id, bool inbound,
         return 0;
     }
     const uint32_t *off = inbound ? g->in_off : g->out_off;
+    const uint32_t *nbr = inbound ? g->in_nbr : g->out_nbr;
     const uint8_t *type = inbound ? g->in_type : g->out_type;
     int n = 0;
     for (uint32_t e = off[id]; e < off[id + 1]; e++) {
-        n += (int)((mask >> type[e]) & 1U);
+        /* A self-loop is not use; matches the SQL degree in store.c. */
+        n += nbr[e] != (uint32_t)id && ((mask >> type[e]) & 1U);
     }
     return n;
 }

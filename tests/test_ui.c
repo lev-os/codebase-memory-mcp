@@ -1595,6 +1595,72 @@ TEST(atlas_flows_walk_and_rank) {
     PASS();
 }
 
+/* A self call is no use. `walk` calls only itself: dead in the Atlas totals
+ * and in the galaxy. `used` calls itself and has one real caller. */
+TEST(atlas_self_call_is_not_use) {
+    cbm_layout_regions_cache_clear();
+    cbm_atlas_metrics_cache_clear();
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "self-use", "/tmp/self-use"), CBM_STORE_OK);
+    cbm_node_t walk = {.project = "self-use",
+                       .label = "Function",
+                       .name = "walk",
+                       .qualified_name = "self-use::walk",
+                       .file_path = "src/w.c",
+                       .properties_json = "{}"};
+    cbm_node_t used = {.project = "self-use",
+                       .label = "Function",
+                       .name = "used",
+                       .qualified_name = "self-use::used",
+                       .file_path = "src/w.c",
+                       .properties_json = "{}"};
+    cbm_node_t caller = {.project = "self-use",
+                         .label = "Function",
+                         .name = "caller",
+                         .qualified_name = "self-use::caller",
+                         .file_path = "src/w.c",
+                         .properties_json = "{\"is_entry_point\":true}"};
+    int64_t walk_id = cbm_store_upsert_node(store, &walk);
+    int64_t used_id = cbm_store_upsert_node(store, &used);
+    int64_t caller_id = cbm_store_upsert_node(store, &caller);
+    ASSERT_GT(walk_id, 0);
+    ASSERT_GT(used_id, 0);
+    ASSERT_GT(caller_id, 0);
+    cbm_edge_t edges[] = {
+        {.project = "self-use", .source_id = walk_id, .target_id = walk_id, .type = "CALLS"},
+        {.project = "self-use", .source_id = used_id, .target_id = used_id, .type = "CALLS"},
+        {.project = "self-use", .source_id = caller_id, .target_id = used_id, .type = "CALLS"}};
+    for (size_t i = 0; i < sizeof(edges) / sizeof(edges[0]); i++) {
+        ASSERT_GT(cbm_store_insert_edge(store, &edges[i]), 0);
+    }
+
+    char *json = cbm_atlas_metrics_json(store, "self-use");
+    ASSERT_NOT_NULL(json);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *totals = yyjson_obj_get(yyjson_doc_get_root(doc), "totals");
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(totals, "dead")), 1);
+    yyjson_doc_free(doc);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
+
+    cbm_layout_result_t *r =
+        cbm_layout_compute(store, "self-use", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
+    ASSERT_NOT_NULL(r);
+    const cbm_layout_node_t *ln = find_layout_node(r, "walk");
+    ASSERT_NOT_NULL(ln);
+    ASSERT_STR_EQ(ln->status, "dead");
+    ASSERT_EQ(ln->in_calls, 0);
+    ln = find_layout_node(r, "used");
+    ASSERT_NOT_NULL(ln);
+    ASSERT_STR_EQ(ln->status, "single");
+    ASSERT_EQ(ln->in_calls, 1);
+    cbm_layout_free(r);
+    cbm_store_close(store);
+    cbm_atlas_metrics_cache_clear();
+    PASS();
+}
+
 TEST(atlas_metrics_totals_and_certainty) {
     cbm_layout_regions_cache_clear();
     cbm_atlas_metrics_cache_clear();
@@ -2999,6 +3065,7 @@ SUITE(ui) {
     RUN_TEST(atlas_tree_aggregates_children);
     RUN_TEST(atlas_symbol_bundle_totals_and_sections);
     RUN_TEST(atlas_flows_walk_and_rank);
+    RUN_TEST(atlas_self_call_is_not_use);
     RUN_TEST(atlas_metrics_totals_and_certainty);
     RUN_TEST(atlas_response_memory_cache_and_passthrough);
     RUN_TEST(atlas_trace_reachability_calls_and_data);
