@@ -447,7 +447,10 @@ static inline bool cbm_pipeline_invocation_reason_join_strategy(const char *stra
             strcmp(strategy, "php_method_dynamic") == 0 ||
             /* JS/TS call bound by scope to a same-name callable whose QN
              * leaf can be `name#n` (cbm_js_twin_bind_local_callees). */
-            strcmp(strategy, "lsp_ts_local_scope") == 0);
+            strcmp(strategy, "lsp_ts_local_scope") == 0 ||
+            /* JS/TS literal subscript whose key spells its member another
+             * way (`api[1]` for `0x1() {}`); reason is the call's spelling. */
+            strcmp(strategy, "lsp_ts_method") == 0 || strcmp(strategy, "lsp_ts_namespace") == 0);
 }
 
 static inline bool cbm_pipeline_invocation_leaf_matches(const CBMResolvedCall *resolved,

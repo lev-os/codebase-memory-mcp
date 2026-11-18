@@ -39513,7 +39513,32 @@ TEST(pipeline_x9e_member_decorators) {
     PASS();
 }
 
+TEST(pipeline_x9e_literal_key_identity) {
+    struct {
+        const char *api, *call, *want;
+    } cases[] = {
+        /* `0x0` is property "0": it replaces the first member. */
+        {"{ 0() {}, 0x0() {} }", "api2[0]();", ""},
+        {"{ 1() {}, 1.0() {} }", "api2[1]();", ""},
+        {"{ 0x1() {} }", "api2[1]();", "main.use -> lib.0x1"},
+        {"{ 2() {} }", "api2[0b10]();", "main.use -> lib.2"},
+        /* The empty key is not the key spelled `""`. */
+        {"{ ''() {} }", "api2['\"\"']();", ""},
+        {"{ ''() {} }", "api2[\"\"]();", "main.use -> lib.\"\""},
+        {"{ '\"\"'() {}, send() {} }", "api2.send();", "main.use -> lib.send"},
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char provider[512];
+        snprintf(provider, sizeof(provider), "export const api2 = %s;", cases[i].api);
+        ok = x9e_calls(provider, cases[i].call, cases[i].want) && ok;
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_x9e_literal_key_identity);
     RUN_TEST(pipeline_x9e_member_decorators);
     RUN_TEST(pipeline_x9e_member_stability);
     RUN_TEST(pipeline_x9e_nullable_await);

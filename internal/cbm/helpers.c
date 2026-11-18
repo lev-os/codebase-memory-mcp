@@ -1222,6 +1222,95 @@ char *cbm_js_literal_key_name(CBMArena *a, TSNode name_node, const char *source)
     return text;
 }
 
+/* ToString of a numeric literal, for the spellings that need no float
+ * formatting: integers below 2^53 and short plain decimals. */
+static char *js_number_runtime_key(CBMArena *a, const char *raw) {
+    char text[64];
+    size_t n = 0;
+    for (const char *p = raw; *p; p++) {
+        if (*p == '_') {
+            continue;
+        }
+        if (n + 1 >= sizeof(text)) {
+            return NULL;
+        }
+        text[n++] = *p;
+    }
+    text[n] = '\0';
+    int base = 10;
+    const char *d = text;
+    if (text[0] == '0' && text[1] && strchr("xXoObB", text[1])) {
+        base = (text[1] == 'x' || text[1] == 'X') ? 16 : (text[1] == 'o' || text[1] == 'O') ? 8 : 2;
+        d += 2;
+    }
+    if (base != 10) {
+        uint64_t v = 0;
+        if (!*d) {
+            return NULL;
+        }
+        for (; *d; d++) {
+            int c = *d >= '0' && *d <= '9'   ? *d - '0'
+                    : *d >= 'a' && *d <= 'f' ? *d - 'a' + 10
+                    : *d >= 'A' && *d <= 'F' ? *d - 'A' + 10
+                                             : 99;
+            if (c >= base || (v = v * (uint64_t)base + (uint64_t)c) >= ((uint64_t)1 << 53)) {
+                return NULL;
+            }
+        }
+        return cbm_arena_sprintf(a, "%llu", (unsigned long long)v);
+    }
+    const char *dot = strchr(d, '.');
+    size_t int_len = dot ? (size_t)(dot - d) : strlen(d);
+    const char *frac = dot ? dot + 1 : "";
+    size_t frac_len = strlen(frac);
+    /* A leading zero is a legacy octal or a syntax error: unproved. */
+    if (strspn(d, "0123456789") != int_len || strspn(frac, "0123456789") != frac_len ||
+        (int_len == 0 && frac_len == 0) || (int_len > 1 && d[0] == '0')) {
+        return NULL;
+    }
+    while (frac_len && frac[frac_len - 1] == '0') {
+        frac_len--;
+    }
+    bool zero = int_len == 0 || (int_len == 1 && d[0] == '0');
+    size_t lead = 0;
+    while (zero && lead < frac_len && frac[lead] == '0') {
+        lead++;
+    }
+    /* Fifteen significant digits round-trip; below 1e-6 JS prints an exponent. */
+    if ((zero ? frac_len - lead : int_len + frac_len) > 15 || (zero && frac_len && lead > 5)) {
+        return NULL;
+    }
+    return cbm_arena_sprintf(a, "%.*s%s%.*s", zero ? 1 : (int)int_len, zero ? "0" : d,
+                             frac_len ? "." : "", (int)frac_len, frac);
+}
+
+char *cbm_js_runtime_key(CBMArena *a, TSNode key_node, const char *source) {
+    if (ts_node_is_null(key_node)) {
+        return NULL;
+    }
+    char *text = cbm_node_text(a, key_node, source);
+    if (!text || strchr(text, '\\')) {
+        return NULL;
+    }
+    if (strcmp(ts_node_type(key_node), "number") == 0) {
+        return js_number_runtime_key(a, text);
+    }
+    size_t len = strlen(text);
+    if (strcmp(ts_node_type(key_node), "string") != 0 || len < 2 ||
+        (text[0] != '\'' && text[0] != '"') || text[len - 1] != text[0]) {
+        return NULL;
+    }
+    text[len - 1] = '\0';
+    return text + 1;
+}
+
+char *cbm_js_runtime_member_name(CBMArena *a, const char *key) {
+    if (!key || strcmp(key, "\"\"") == 0) {
+        return NULL;
+    }
+    return cbm_arena_strdup(a, key[0] ? key : "\"\"");
+}
+
 /* One QN segment per key: '%', '.' and a key's own '"' are percent-escaped,
  * so `'a.b'` is not `a: { b }`, and no key is spelled like the empty `""`. */
 static char *js_literal_key_segment(CBMArena *a, char *key) {

@@ -126,6 +126,14 @@ char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source,
 // cbm_func_name_node_text gives its escaped QN segment.
 bool cbm_js_literal_key_node(TSNode name_node, CBMLanguage lang);
 char *cbm_js_literal_key_name(CBMArena *a, TSNode name_node, const char *source);
+// The runtime property key a JS/TS string or number key node denotes: the text
+// of an unescaped string, or the decimal form of a number (an integer below
+// 2^53 in any radix, or a plain decimal of at most 15 significant digits).
+// NULL when this is not proved. It is not the QN segment.
+char *cbm_js_runtime_key(CBMArena *a, TSNode key_node, const char *source);
+// The member name definitions use for a runtime key: the empty key is `""`, so
+// a key spelled `""` has no member name (NULL).
+char *cbm_js_runtime_member_name(CBMArena *a, const char *key);
 
 // ── Nix attrpath helpers ──
 // A Nix binding's name is a PATH (`a.b.c = …`) whose segments may be quoted or

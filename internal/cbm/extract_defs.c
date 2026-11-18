@@ -15861,13 +15861,8 @@ static const char *js_fact_literal(CBMExtractCtx *ctx, TSNode key) {
     key = cbm_ts_unwrap_value(key);
     if (!cbm_js_literal_key_node(key, ctx->language))
         return NULL;
-    const char *raw = cbm_node_text(ctx->arena, key, ctx->source);
-    if (!raw || strchr(raw, '\\'))
-        return NULL;
-    if (strcmp(ts_node_type(key), "number") == 0 &&
-        (strspn(raw, "0123456789") != strlen(raw) || (raw[0] == '0' && raw[1])))
-        return NULL;
-    return cbm_js_literal_key_name(ctx->arena, key, ctx->source);
+    return cbm_js_runtime_member_name(ctx->arena,
+                                      cbm_js_runtime_key(ctx->arena, key, ctx->source));
 }
 
 /* The key one member or subscript step writes or reads, else NULL. */
@@ -16237,18 +16232,19 @@ static const char **js_object_members(CBMExtractCtx *ctx, TSNode object, CBMDefi
         } else if (strcmp(kind, "method_definition") != 0) {
             continue;
         }
+        /* Members compare by runtime key: `0` and `0x0` are one property, and
+         * the empty key is not the member spelled `""`. */
         const char *key = NULL;
         if (!ts_node_is_null(name)) {
             const char *nk = ts_node_type(name);
             if (strcmp(nk, "property_identifier") == 0 || strcmp(nk, "identifier") == 0 ||
                 strcmp(nk, "shorthand_property_identifier") == 0) {
                 key = cbm_node_text(ctx->arena, name, ctx->source);
-            } else if (strcmp(nk, "string") == 0) {
-                const char *raw = cbm_node_text(ctx->arena, name, ctx->source);
-                if (raw && !strchr(raw, '\\'))
-                    key = cbm_js_literal_key_name(ctx->arena, name, ctx->source);
-            } else if (strcmp(nk, "number") == 0) {
-                key = cbm_js_literal_key_name(ctx->arena, name, ctx->source);
+            } else if (strcmp(nk, "string") == 0 || strcmp(nk, "number") == 0) {
+                const char *runtime = cbm_js_runtime_key(ctx->arena, name, ctx->source);
+                key = cbm_js_runtime_member_name(ctx->arena, runtime);
+                if (runtime && !key)
+                    continue; /* no call site spells this key */
             }
         }
         /* A computed key can replace any earlier member. Every property,

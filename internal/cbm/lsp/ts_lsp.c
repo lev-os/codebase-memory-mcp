@@ -3397,13 +3397,10 @@ static char *ts_member_key(TSLSPContext *ctx, TSNode member) {
     TSNode index = ts_node_child_by_field_name(member, "index", 5);
     if (!node_kind_is(index, "string") && !node_kind_is(index, "number"))
         return NULL;
-    const char *raw = node_text(ctx, index);
-    if (!raw || strchr(raw, '\\'))
-        return NULL;
-    if (node_kind_is(index, "number") &&
-        (strspn(raw, "0123456789") != strlen(raw) || (raw[0] == '0' && raw[1])))
-        return NULL;
-    return cbm_js_literal_key_name(ctx->arena, index, ctx->source);
+    /* The runtime key, so `api[0x0]` is `api[0]` and `api['""']` is not the
+     * empty key. */
+    return cbm_js_runtime_member_name(ctx->arena,
+                                      cbm_js_runtime_key(ctx->arena, index, ctx->source));
 }
 
 static const CBMType *ts_signature_for_call(TSLSPContext *ctx, TSNode function, TSNode args) {
@@ -4657,6 +4654,14 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
         if (!ts_node_is_null(obj)) {
             char *mname = ts_member_key(ctx, fn);
             if (mname) {
+                /* A literal key can spell its member another way (`api[1]` for
+                 * `0x1() {}`): the row joins its call by the call's spelling. */
+                const char *spelled =
+                    strcmp(fk, "subscript_expression") == 0
+                        ? cbm_func_name_node_text(ctx->arena,
+                                                  ts_node_child_by_field_name(fn, "index", 5),
+                                                  ctx->source, CBM_LANG_TYPESCRIPT)
+                        : NULL;
                 // Identifier as namespace import: `name.fn()` or `mod.fn()`.
                 if (node_kind_is(obj, "identifier")) {
                     char *on = node_text(ctx, obj);
@@ -4666,8 +4671,9 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
                         const CBMRegisteredFunc *f =
                             ts_lookup_namespace_call(ctx, on, mname, args, &is_import);
                         if (f) {
-                            ts_emit_resolved_call_at(ctx, f->qualified_name, "lsp_ts_namespace",
-                                                     0.95f, call_node);
+                            ts_emit_resolved_call_reason_at(ctx, f->qualified_name,
+                                                            "lsp_ts_namespace", 0.95f, spelled,
+                                                            call_node);
                             return;
                         }
                         if (is_import) {
@@ -4686,8 +4692,8 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
                 const CBMRegisteredFunc *f = ts_lookup_method_for_call(ctx, recv, mname, args);
 
                 if (f) {
-                    ts_emit_resolved_call_at(ctx, f->qualified_name, "lsp_ts_method", 0.95f,
-                                             call_node);
+                    ts_emit_resolved_call_reason_at(ctx, f->qualified_name, "lsp_ts_method",
+                                                    0.95f, spelled, call_node);
                     return;
                 }
                 const char *object_name =
