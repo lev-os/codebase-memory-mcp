@@ -15838,7 +15838,7 @@ static const char **js_object_members(CBMExtractCtx *ctx, TSNode object, CBMDefi
         if (strcmp(kind, "pair") == 0) {
             name = ts_node_child_by_field_name(member, "key", 3);
             fn = cbm_ts_unwrap_value(ts_node_child_by_field_name(member, "value", 5));
-            if (ts_node_is_null(fn) || !js_twin_bodied_kind(ts_node_type(fn)))
+            if (ts_node_is_null(fn) || !cbm_js_bodied_kind(ts_node_type(fn)))
                 fn = (TSNode){0};
         } else if (strcmp(kind, "shorthand_property_identifier") == 0) {
             name = member;
@@ -15910,12 +15910,16 @@ static void js_record_object_members(CBMExtractCtx *ctx, int mod_idx) {
         needed |= ctx->result->defs.items[i].js_object_literal ||
                   (ctx->result->defs.items[i].label &&
                    strcmp(ctx->result->defs.items[i].label, "Class") == 0);
-    for (uint32_t i = 0; !needed && i < ts_node_named_child_count(ctx->root); i++) {
-        TSNode node = ts_node_named_child(ctx->root, i);
-        if (strcmp(ts_node_type(node), "export_statement") == 0)
-            for (uint32_t j = 0; j < ts_node_child_count(node); j++)
-                needed |= strcmp(ts_node_type(ts_node_child(node, j)), "default") == 0;
+    TSTreeCursor roots = ts_tree_cursor_new(ctx->root);
+    if (!needed && ts_tree_cursor_goto_first_child(&roots)) {
+        do {
+            TSNode node = ts_tree_cursor_current_node(&roots);
+            if (strcmp(ts_node_type(node), "export_statement") == 0)
+                for (uint32_t j = 0; j < ts_node_child_count(node); j++)
+                    needed |= strcmp(ts_node_type(ts_node_child(node, j)), "default") == 0;
+        } while (!needed && ts_tree_cursor_goto_next_sibling(&roots));
     }
+    ts_tree_cursor_delete(&roots);
     if (!needed)
         return;
     int count = ctx->result->defs.count;
@@ -15936,7 +15940,7 @@ static void js_record_object_members(CBMExtractCtx *ctx, int mod_idx) {
             TSNode callable =
                 method ? node : cbm_ts_unwrap_value(ts_node_child_by_field_name(node, "value", 5));
             if (!method && !ts_node_is_null(callable) &&
-                !js_twin_bodied_kind(ts_node_type(callable)))
+                !cbm_js_bodied_kind(ts_node_type(callable)))
                 callable = (TSNode){0};
             bool is_static = false;
             for (uint32_t i = 0; i < ts_node_child_count(node); i++)
@@ -15981,55 +15985,58 @@ static void js_record_object_members(CBMExtractCtx *ctx, int mod_idx) {
     }
 defaults:
     ts_tree_cursor_delete(&cursor);
-    uint32_t n = ts_node_named_child_count(ctx->root);
-    for (uint32_t i = 0; i < n; i++) {
-        TSNode stmt = ts_node_named_child(ctx->root, i);
-        if (strcmp(ts_node_type(stmt), "export_statement") != 0)
-            continue;
-        bool is_default = false;
-        for (uint32_t j = 0; j < ts_node_child_count(stmt); j++)
-            is_default |= strcmp(ts_node_type(ts_node_child(stmt, j)), "default") == 0;
-        TSNode value = cbm_ts_unwrap_value(ts_node_child_by_field_name(stmt, "value", 5));
-        if (!is_default)
-            continue;
-        TSNode declaration = ts_node_child_by_field_name(stmt, "declaration", 11);
-        if (!ts_node_is_null(declaration)) {
-            TSNode name = ts_node_child_by_field_name(declaration, "name", 4);
-            const char *text =
-                ts_node_is_null(name) ? NULL : cbm_node_text(ctx->arena, name, ctx->source);
-            for (int j = 0; text && j < count; j++) {
-                CBMDefinition *d = &ctx->result->defs.items[j];
-                if (d->name && strcmp(d->name, text) == 0 && !d->parent_class &&
-                    d->start_line == ts_node_start_point(declaration).row + 1 &&
-                    (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Class") == 0))
-                    mod->alias_target = d->qualified_name;
-            }
-        }
-        if (ts_node_is_null(value))
-            continue;
-        mod->return_type = "unknown";
-        if (cbm_ts_plain_object(value)) {
-            mod->js_object_literal = true;
-            mod->js_object_members = js_object_members(ctx, value, defs, count);
-        } else if (strcmp(ts_node_type(value), "identifier") == 0) {
-            const char *name = cbm_node_text(ctx->arena, value, ctx->source);
-            for (int j = 0; j < count; j++) {
-                CBMDefinition *d = &ctx->result->defs.items[j];
-                if (!d->name || !name || strcmp(d->name, name) != 0)
-                    continue;
-                if (strcmp(d->label, "Variable") == 0) {
-                    mod->return_type = d->return_type ? d->return_type : "unknown";
-                    mod->ts_return_scope_safe = d->ts_return_scope_safe;
-                    mod->ts_return_constructor = d->ts_return_constructor;
-                    mod->js_object_literal = d->js_object_literal;
-                    mod->js_object_members = d->js_object_members;
-                } else if (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Class") == 0) {
-                    mod->return_type = NULL;
-                    mod->alias_target = d->qualified_name;
+    cursor = ts_tree_cursor_new(ctx->root);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode stmt = ts_tree_cursor_current_node(&cursor);
+            if (strcmp(ts_node_type(stmt), "export_statement") != 0)
+                continue;
+            bool is_default = false;
+            for (uint32_t j = 0; j < ts_node_child_count(stmt); j++)
+                is_default |= strcmp(ts_node_type(ts_node_child(stmt, j)), "default") == 0;
+            TSNode value = cbm_ts_unwrap_value(ts_node_child_by_field_name(stmt, "value", 5));
+            if (!is_default)
+                continue;
+            TSNode declaration = ts_node_child_by_field_name(stmt, "declaration", 11);
+            if (!ts_node_is_null(declaration)) {
+                TSNode name = ts_node_child_by_field_name(declaration, "name", 4);
+                const char *text =
+                    ts_node_is_null(name) ? NULL : cbm_node_text(ctx->arena, name, ctx->source);
+                for (int j = 0; text && j < count; j++) {
+                    CBMDefinition *d = &ctx->result->defs.items[j];
+                    if (d->name && strcmp(d->name, text) == 0 && !d->parent_class &&
+                        d->start_line == ts_node_start_point(declaration).row + 1 &&
+                        (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Class") == 0))
+                        mod->alias_target = d->qualified_name;
                 }
             }
-        }
+            if (ts_node_is_null(value))
+                continue;
+            mod->return_type = "unknown";
+            if (cbm_ts_plain_object(value)) {
+                mod->js_object_literal = true;
+                mod->js_object_members = js_object_members(ctx, value, defs, count);
+            } else if (strcmp(ts_node_type(value), "identifier") == 0) {
+                const char *name = cbm_node_text(ctx->arena, value, ctx->source);
+                for (int j = 0; j < count; j++) {
+                    CBMDefinition *d = &ctx->result->defs.items[j];
+                    if (!d->name || !name || strcmp(d->name, name) != 0)
+                        continue;
+                    if (strcmp(d->label, "Variable") == 0) {
+                        mod->return_type = d->return_type ? d->return_type : "unknown";
+                        mod->ts_return_scope_safe = d->ts_return_scope_safe;
+                        mod->ts_return_constructor = d->ts_return_constructor;
+                        mod->js_object_literal = d->js_object_literal;
+                        mod->js_object_members = d->js_object_members;
+                    } else if (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Class") == 0) {
+                        mod->return_type = NULL;
+                        mod->alias_target = d->qualified_name;
+                    }
+                }
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
     }
+    ts_tree_cursor_delete(&cursor);
     free(defs);
 }
 
