@@ -37203,6 +37203,14 @@ TEST(pipeline_py_import_alias_self_call_has_no_self_edge) {
             char got[1024];
             js_twin_calls_at(run.db, run.project, sites[i].file, sites[i].line, got, sizeof(got));
             printf("  python alias mode=%d %s:%d [%s]\n", mode, sites[i].file, sites[i].line, got);
+            if (strcmp(sites[i].file, "pkg/rebind.py") == 0)
+                ok = js_twin_expect("local rebound alias target", got,
+                                    "pkg.rebind.walk -> pkg.rebind.other") &&
+                     ok;
+            if (strcmp(sites[i].file, "pkg/rebound.py") == 0)
+                ok = js_twin_expect("module rebound alias target", got,
+                                    "pkg.rebound.walk -> pkg.rebound.other") &&
+                     ok;
             if (strstr(got, sites[i].self)) {
                 fprintf(stderr, "  python alias kept a self edge: [%s]\n", got);
                 ok = false;
@@ -38724,6 +38732,7 @@ TEST(pipeline_js_empty_and_quote_keys_are_distinct) {
 SUITE(pipeline) {
     RUN_TEST(pipeline_js_self_edge_requires_unwritten_binding);
     RUN_TEST(pipeline_js_empty_and_quote_keys_are_distinct);
+
     RUN_TEST(pipeline_js_quoted_callable_names);
     RUN_TEST(pipeline_js_quoted_key_keeps_lexical_binding);
     RUN_TEST(pipeline_js_reassigned_callable_has_no_self_edge);

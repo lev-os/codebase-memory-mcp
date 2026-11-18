@@ -8472,7 +8472,7 @@ TEST(tool_trace_path_stored_self_edge_is_bounded) {
         yyjson_val *root = yyjson_doc_get_root(doc);
         yyjson_val *total = yyjson_obj_get(root, inbound ? "callers_total" : "callees_total");
         ASSERT_TRUE(yyjson_is_int(total));
-        ASSERT_TRUE(yyjson_get_int(total) >= 0 && yyjson_get_int(total) <= 1);
+        ASSERT_EQ(yyjson_get_int(total), inbound ? 0 : 1);
         ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "self_recursive")));
         ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "self_call_policy")),
                       "exact_bindings_only");
