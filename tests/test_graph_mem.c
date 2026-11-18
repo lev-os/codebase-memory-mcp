@@ -256,7 +256,7 @@ typedef struct {
     int shapes;
     int diverged;
     uint64_t builds;
-    bool start_back; /* the cycle 0->1->2->0 returns node 0 at hop 3 */
+    bool start_back; /* a cycle must not list its root as a caller or callee */
 } gmt_bfs_run_t;
 
 static void gmt_bfs_all_shapes(const gmt_fixture_t *f, cbm_store_t *sql, cbm_store_t *mem,
@@ -283,7 +283,7 @@ static void gmt_bfs_all_shapes(const gmt_fixture_t *f, cbm_store_t *sql, cbm_sto
     if (cbm_store_bfs(mem, f->ids[0], "outbound", NULL, 0, 3, 100, &tr) == CBM_STORE_OK) {
         for (int i = 0; i < tr.visited_count; i++) {
             if (tr.visited[i].node.id == f->ids[0]) {
-                run->start_back = tr.visited[i].hop == 3;
+                run->start_back = true;
             }
         }
     }
@@ -311,7 +311,7 @@ TEST(graph_mem_bfs_matches_sql_on_every_shape) {
     ASSERT_EQ(run.diverged, 0);
     /* The layer really answered: one build, for the store under test only. */
     ASSERT_EQ(run.builds, 1);
-    ASSERT_TRUE(run.start_back);
+    ASSERT_FALSE(run.start_back);
     PASS();
 }
 
@@ -725,7 +725,76 @@ TEST(graph_mem_next_request_evicts_expired_layers) {
     PASS();
 }
 
+TEST(graph_mem_recursive_caller_counts_are_exact) {
+    char *tmp = th_mktempdir("cbm_recursive_degrees");
+    ASSERT_NOT_NULL(tmp);
+    char db[512];
+    snprintf(db, sizeof(db), "%s/g.db", tmp);
+    cbm_store_t *sql = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(sql);
+    ASSERT_EQ(cbm_store_upsert_project(sql, "p", "/p"), CBM_STORE_OK);
+    int64_t ids[4];
+    for (int i = 0; i < 4; i++)
+        ids[i] = gmt_node(sql, "p", i, "fn");
+    gmt_edge(sql, ids[0], ids[0], "CALLS", NULL);
+    gmt_edge(sql, ids[1], ids[1], "CALLS", NULL);
+    gmt_edge(sql, ids[3], ids[1], "CALLS", NULL);
+    gmt_edge(sql, ids[3], ids[2], "CALLS", NULL);
+    ASSERT_EQ(cbm_store_generation_advance(sql), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_prepare_for_publish(sql), CBM_STORE_OK);
+    cbm_store_close(sql);
+    size_t saved = gmt_budget_pin(gmt_budget_roomy());
+    uint64_t builds = cbm_graph_mem_build_count();
+    cbm_store_t *mem = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(mem);
+    cbm_search_params_t p = {.project = "p", .min_degree = 0, .max_degree = -1};
+    cbm_search_output_t out = {0};
+    int rc = cbm_store_search(mem, &p, &out);
+    bool ok = rc == CBM_STORE_OK && out.count == 4;
+    for (int i = 0; i < out.count; i++) {
+        for (int j = 0; j < 3; j++)
+            if (out.results[i].node.id == ids[j]) {
+                int expected = j == 0 ? 0 : 1;
+                printf("  graph_mem case=%d callers=%d expected=%d\n", j, out.results[i].in_degree,
+                       expected);
+                ok = out.results[i].in_degree == expected && ok;
+            }
+    }
+    cbm_store_search_free(&out);
+    sql = cbm_store_open_path(db);
+    if (!sql)
+        ok = false;
+    for (int mode = 0; sql && mode < 2; mode++) {
+        cbm_store_t *store = mode ? mem : sql;
+        for (int i = 0; i < 4; i++) {
+            for (int inbound = 0; inbound < 2; inbound++) {
+                cbm_traverse_result_t tr = {0};
+                int expected = inbound ? (i == 1 || i == 2) : (i == 3 ? 2 : 0);
+                int rc = cbm_store_bfs(store, ids[i], inbound ? "inbound" : "outbound",
+                                      NULL, 0, 3, 100, &tr);
+                printf("  recursive BFS mode=%d case=%d inbound=%d rows=%d expected=%d\n",
+                       mode, i, inbound, tr.visited_count, expected);
+                ok = rc == CBM_STORE_OK && tr.visited_count == expected && ok;
+                for (int j = 0; j < tr.visited_count; j++)
+                    ok = tr.visited[j].node.id != ids[i] && ok;
+                cbm_store_traverse_free(&tr);
+            }
+        }
+    }
+    cbm_store_close(sql);
+    bool built = cbm_graph_mem_build_count() == builds + 1;
+    cbm_store_close(mem);
+    cbm_mem_set_budget_for_tests(saved);
+    cbm_graph_mem_drop_idle();
+    th_rmtree(tmp);
+    ASSERT_TRUE(built);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(graph_mem) {
+    RUN_TEST(graph_mem_recursive_caller_counts_are_exact);
+
     RUN_TEST(graph_mem_bfs_matches_sql_on_every_shape);
     RUN_TEST(graph_mem_degree_search_matches_sql);
     RUN_TEST(graph_mem_generation_change_invalidates);

@@ -451,6 +451,7 @@ typedef struct {
     int count;
     int pos;
     int depth; /* current recursive-descent depth; see CYPHER_MAX_PARSE_DEPTH */
+    const cbm_query_t *query; /* node aliases currently in scope */
     char error[CBM_SZ_512];
 } parser_t;
 
@@ -793,6 +794,9 @@ static void expr_free(cbm_expr_t *e) {
             safe_str_free(&cur->cond.coalesce_default);
             safe_str_free(&cur->cond.rhs_variable);
             safe_str_free(&cur->cond.rhs_property);
+            safe_str_free(&cur->cond.exists_anchor_label);
+            safe_str_free(&cur->cond.exists_far_label);
+            safe_str_free(&cur->cond.exists_far_variable);
             for (int i = 0; i < cur->cond.in_value_count; i++) {
                 safe_str_free(&cur->cond.in_values[i]);
             }
@@ -1045,12 +1049,40 @@ static void free_one_rel_pattern(cbm_rel_pattern_t *r) {
     memset(r, 0, sizeof(*r));
 }
 
+/* EXISTS may start at either endpoint, but at least one must be a node
+ * from MATCH (or a node carried through WITH). Local pattern names do not bind it. */
+static bool exists_node_is_bound(const cbm_query_t *q, const char *name) {
+    if (!q || !name)
+        return false;
+    const char *original = name;
+    if (q->with_clause && !q->with_clause->star) {
+        original = NULL;
+        for (int i = 0; i < q->with_clause->count; i++) {
+            const cbm_return_item_t *item = &q->with_clause->items[i];
+            const char *alias = item->alias ? item->alias : item->variable;
+            if (alias && strcmp(alias, name) == 0 && !item->func && !item->property &&
+                !item->kase) {
+                original = item->variable;
+                break;
+            }
+        }
+        if (!original)
+            return false;
+    }
+    for (int i = 0; i < q->pattern_count; i++)
+        for (int j = 0; j < q->patterns[i].node_count; j++) {
+            const char *var = q->patterns[i].nodes[j].variable;
+            if (var && strcmp(var, original) == 0)
+                return true;
+        }
+    return false;
+}
+
 /* Parse a bounded EXISTS predicate: EXISTS { (anchor)-[:TYPE]->() } — a
  * single-hop, edge-type-specific existence check anchored on a bound variable
- * (e.g. WHERE NOT EXISTS { (f)<-[:CALLS]-() } finds functions with no callers).
- * A self-loop never satisfies it: a function that only calls itself has no
- * caller (eval_exists_condition).
- * Multi-hop / nested-WHERE EXISTS is intentionally unsupported. */
+ * An optional WHERE other <> anchor excludes self relationships explicitly,
+ * for caller summaries. All other nested predicates and multi-hop patterns
+ * remain unsupported; plain EXISTS retains every stored relationship. */
 static cbm_expr_t *parse_exists_predicate(parser_t *p, bool negated) {
     advance(p); /* EXISTS */
     if (!match(p, TOK_LBRACE)) {
@@ -1069,9 +1101,59 @@ static cbm_expr_t *parse_exists_predicate(parser_t *p, bool negated) {
                  "'(var)-[:TYPE]->()' is supported");
         return NULL;
     }
-    expect(p, TOK_RBRACE);
+    bool anchor_bound = exists_node_is_bound(p->query, anchor.variable);
+    bool far_bound = exists_node_is_bound(p->query, far_node.variable);
+    if (!anchor_bound && !far_bound) {
+        free_one_node_pattern(&anchor);
+        free_one_rel_pattern(&rel);
+        free_one_node_pattern(&far_node);
+        snprintf(p->error, sizeof(p->error),
+                 "EXISTS requires a bound node endpoint from MATCH or WITH");
+        return NULL;
+    }
+    if (anchor.prop_count || far_node.prop_count || rel.type_count > 1 ||
+        rel.min_hops != 1 || rel.max_hops != 1) {
+        free_one_node_pattern(&anchor);
+        free_one_rel_pattern(&rel);
+        free_one_node_pattern(&far_node);
+        snprintf(p->error, sizeof(p->error),
+                 "EXISTS supports one hop and one edge type, without node properties");
+        return NULL;
+    }
+    bool exclude_self = false;
+    if (match(p, TOK_WHERE)) {
+        const cbm_token_t *lhs = expect(p, TOK_IDENT);
+        const cbm_token_t *op = expect(p, TOK_NEQ);
+        const cbm_token_t *rhs = expect(p, TOK_IDENT);
+        if (!lhs || !op || !rhs || !anchor.variable || !far_node.variable ||
+            strcmp(anchor.variable, far_node.variable) == 0 ||
+            !((strcmp(lhs->text, far_node.variable) == 0 &&
+               strcmp(rhs->text, anchor.variable) == 0) ||
+              (strcmp(lhs->text, anchor.variable) == 0 &&
+               strcmp(rhs->text, far_node.variable) == 0))) {
+            free_one_node_pattern(&anchor);
+            free_one_rel_pattern(&rel);
+            free_one_node_pattern(&far_node);
+            snprintf(p->error, sizeof(p->error), "EXISTS only supports WHERE other <> anchor");
+            return NULL;
+        }
+        exclude_self = true;
+    }
+    if (!expect(p, TOK_RBRACE)) {
+        free_one_node_pattern(&anchor);
+        free_one_rel_pattern(&rel);
+        free_one_node_pattern(&far_node);
+        return NULL;
+    }
+    bool swapped = !anchor_bound;
+    if (swapped) {
+        cbm_node_pattern_t tmp = anchor;
+        anchor = far_node;
+        far_node = tmp;
+    }
 
     cbm_condition_t c = {0};
+    c.exists_exclude_self = exclude_self;
     c.negated = negated;
     c.op = heap_strdup("EXISTS");
     c.variable = heap_strdup(anchor.variable ? anchor.variable : "");
@@ -1079,6 +1161,11 @@ static cbm_expr_t *parse_exists_predicate(parser_t *p, bool negated) {
     c.exists_dir = (rel.direction && strcmp(rel.direction, "inbound") == 0) ? 1
                    : (rel.direction && strcmp(rel.direction, "any") == 0)   ? 2
                                                                             : 0;
+    if (swapped && c.exists_dir != 2)
+        c.exists_dir = 1 - c.exists_dir;
+    c.exists_anchor_label = anchor.label ? heap_strdup(anchor.label) : NULL;
+    c.exists_far_label = far_node.label ? heap_strdup(far_node.label) : NULL;
+    c.exists_far_variable = anchor_bound && far_bound ? heap_strdup(far_node.variable) : NULL;
     free_one_node_pattern(&anchor);
     free_one_rel_pattern(&rel);
     free_one_node_pattern(&far_node);
@@ -2101,6 +2188,7 @@ static int parse_query_block(parser_t *p, cbm_query_t **out) {
     }
 
     cbm_query_t *q = calloc(CBM_ALLOC_ONE, sizeof(cbm_query_t));
+    p->query = q;
 
     if (check(p, TOK_UNWIND)) {
         parse_unwind_clause(p, q);
@@ -2268,6 +2356,9 @@ static void free_where(cbm_where_clause_t *w) {
         func_args_free(w->conditions[i].args, w->conditions[i].arg_count);
         safe_str_free(&w->conditions[i].rhs_variable);
         safe_str_free(&w->conditions[i].rhs_property);
+        safe_str_free(&w->conditions[i].exists_anchor_label);
+        safe_str_free(&w->conditions[i].exists_far_label);
+        safe_str_free(&w->conditions[i].exists_far_variable);
     }
     free(w->conditions);
     safe_str_free(&w->op);
@@ -2775,23 +2866,36 @@ static bool eval_comparison_op(const char *op, const char *actual, const char *e
 
 enum { EXISTS_DIR_OUT = 0, EXISTS_DIR_IN = 1 };
 
-/* A self-loop is no caller and no callee: recursion is not use. */
-static bool exists_edge_to_other(const cbm_edge_t *edges, int cnt) {
+/* Generic EXISTS is structural; only an explicit inequality omits self edges. */
+static bool exists_edge_matches(const cbm_condition_t *c, binding_t *b,
+                                 const cbm_edge_t *edges, int cnt, bool inbound) {
+    const cbm_node_t *bound = c->exists_far_variable ? binding_get(b, c->exists_far_variable) : NULL;
     for (int i = 0; i < cnt; i++) {
-        if (edges[i].source_id != edges[i].target_id) {
-            return true;
+        if (c->exists_exclude_self && edges[i].source_id == edges[i].target_id)
+            continue;
+        int64_t far_id = inbound ? edges[i].source_id : edges[i].target_id;
+        if (c->exists_far_variable && (!bound || bound->id != far_id))
+            continue;
+        if (c->exists_far_label) {
+            cbm_node_t far = {0};
+            bool matches = cbm_store_find_node_by_id(b->store, far_id, &far) == CBM_STORE_OK &&
+                           far.label && strcmp(far.label, c->exists_far_label) == 0;
+            cbm_node_free_fields(&far);
+            if (!matches)
+                continue;
         }
+        return true;
     }
     return false;
 }
 
 /* EXISTS { (var)-[:TYPE]->() }: does the bound node have any edge of the
- * given type in the requested direction to another node? A self-loop does
- * not count. (dir 0=out, 1=in, 2=any) */
+ * given type in the requested direction? (dir 0=out, 1=in, 2=any) */
 static bool eval_exists_condition(const cbm_condition_t *c, binding_t *b) {
     cbm_node_t *n = binding_get(b, c->variable);
     bool result = false;
-    if (n && b->store) {
+    if (n && b->store && (!c->exists_anchor_label ||
+                           (n->label && strcmp(n->label, c->exists_anchor_label) == 0))) {
         cbm_edge_t *edges = NULL;
         int cnt = 0;
         if (c->exists_dir != EXISTS_DIR_IN) { /* outbound or any */
@@ -2800,7 +2904,7 @@ static bool eval_exists_condition(const cbm_condition_t *c, binding_t *b) {
             } else {
                 cbm_store_find_edges_by_source(b->store, n->id, &edges, &cnt);
             }
-            result = exists_edge_to_other(edges, cnt);
+            result = exists_edge_matches(c, b, edges, cnt, false);
             cbm_store_free_edges(edges, cnt);
         }
         if (!result && c->exists_dir != EXISTS_DIR_OUT) { /* inbound or any */
@@ -2811,7 +2915,7 @@ static bool eval_exists_condition(const cbm_condition_t *c, binding_t *b) {
             } else {
                 cbm_store_find_edges_by_target(b->store, n->id, &edges, &cnt);
             }
-            result = exists_edge_to_other(edges, cnt);
+            result = exists_edge_matches(c, b, edges, cnt, true);
             cbm_store_free_edges(edges, cnt);
         }
     }
@@ -2823,6 +2927,19 @@ static bool eval_exists_condition(const cbm_condition_t *c, binding_t *b) {
  * on either side is NULL and the comparison is false, so two nodes that both
  * lack a property do not compare equal. */
 static bool eval_property_comparison(const cbm_condition_t *c, const char *actual, binding_t *b) {
+    /* Real node aliases compare identity. WITH scalars are virtual nodes
+     * with id 0 and retain value comparison. A property/function also stays scalar. */
+    if (!c->property && !c->rhs_property && !c->func && !c->coalesce_default &&
+        (strcmp(c->op, "=") == 0 || strcmp(c->op, "<>") == 0)) {
+        const cbm_node_t *lhs_node = binding_get(b, c->variable);
+        const cbm_node_t *rhs_node = binding_get(b, c->rhs_variable);
+        if (lhs_node && rhs_node && lhs_node->id > 0 && rhs_node->id > 0) {
+            bool result = lhs_node->id == rhs_node->id;
+            if (strcmp(c->op, "<>") == 0)
+                result = !result;
+            return c->negated ? !result : result;
+        }
+    }
     cbm_condition_t rhs = {0};
     rhs.variable = c->rhs_variable;
     rhs.property = c->rhs_property;
@@ -2989,7 +3106,8 @@ static bool partial_alias_unbound(binding_t *b, const char *alias) {
  * alias, so the b in coalesce(a.x, b.name) is only seen here. A literal-only
  * LHS has nothing to wait for. */
 static cyp_partial_t eval_condition_partial(const cbm_condition_t *c, binding_t *b) {
-    if (partial_alias_unbound(b, c->variable) || partial_alias_unbound(b, c->rhs_variable)) {
+    if (partial_alias_unbound(b, c->variable) || partial_alias_unbound(b, c->rhs_variable) ||
+        partial_alias_unbound(b, c->exists_far_variable)) {
         return CYP_PARTIAL_UNKNOWN;
     }
     for (int i = 0; i < c->arg_count; i++) {

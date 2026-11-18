@@ -9819,12 +9819,18 @@ static int node_hop_cmp_hop_id(const void *pa, const void *pb) {
  * nodes and silently truncated by tracing only one (#546). visited hops are
  * deduped by node id. Edge properties are skipped for lean traces or merged
  * under an explicit edge_limit for data-flow/evidence output. Ownership of all
- * heap fields transfers into *out, freed by cbm_store_traverse_free. */
+ * heap fields transfers into *out, freed by cbm_store_traverse_free.
+ * caller_total optionally counts visible other-node visits per seed, before
+ * merging loses the distinction between own recursion and a real caller. */
 static int bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int node_count,
                                const char *direction, const char **edge_types, int edge_type_count,
-                               int depth, int limit, int edge_limit, cbm_traverse_result_t *out) {
+                               int depth, int limit, int edge_limit, cbm_traverse_result_t *out,
+                               int *caller_total, bool include_tests) {
     memset(out, 0, sizeof(*out));
     int vcap = 0, ecap = 0;
+    bool *counted = NULL;
+    if (caller_total)
+        *caller_total = 0;
     for (int k = 0; k < node_count; k++) {
         cbm_traverse_result_t tr = {0};
         int bfs_rc = cbm_store_bfs_with_edge_limit(store, nodes[k].id, direction, edge_types,
@@ -9832,11 +9838,16 @@ static int bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int 
         if (bfs_rc != CBM_STORE_OK) {
             cbm_store_traverse_free(&tr);
             cbm_store_traverse_free(out);
+            free(counted);
             return bfs_rc;
         }
         out->truncated = out->truncated || tr.truncated;
         out->edges_truncated = out->edges_truncated || tr.edges_truncated;
         for (int i = 0; i < tr.visited_count; i++) {
+            /* Exclude only this seed's own recursion. A different seed may
+             * be a real caller, so a global root-ID filter would lose it. */
+            bool other = caller_total && tr.visited[i].node.id != nodes[k].id &&
+                         (include_tests || !is_test_file(tr.visited[i].node.file_path));
             bool dup = false;
             for (int j = 0; j < out->visited_count; j++) {
                 if (out->visited[j].node.id == tr.visited[i].node.id) {
@@ -9846,6 +9857,10 @@ static int bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int 
                      * single-BFS MIN(hop) semantics (#797). */
                     if (tr.visited[i].hop < out->visited[j].hop) {
                         out->visited[j].hop = tr.visited[i].hop;
+                    }
+                    if (other && !counted[j]) {
+                        counted[j] = true;
+                        (*caller_total)++;
                     }
                     dup = true;
                     break;
@@ -9861,6 +9876,12 @@ static int bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int 
             if (out->visited_count >= vcap) {
                 vcap = vcap ? vcap * 2 : 8;
                 out->visited = safe_realloc(out->visited, vcap * sizeof(cbm_node_hop_t));
+                if (caller_total)
+                    counted = safe_realloc(counted, (size_t)vcap * sizeof(*counted));
+            }
+            if (caller_total) {
+                counted[out->visited_count] = other;
+                *caller_total += other;
             }
             out->visited[out->visited_count++] = tr.visited[i];
             memset(&tr.visited[i], 0, sizeof(tr.visited[i])); /* ownership moved */
@@ -9893,6 +9914,7 @@ static int bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int 
         }
         cbm_store_traverse_free(&tr); /* frees only the un-moved (root + dup) fields */
     }
+    free(counted);
     /* Canonical (hop, id) order — a pure function of the graph, independent of
      * seed iteration order; required for deterministic output and watermarks. */
     if (out->visited_count > 1) {
@@ -11141,15 +11163,16 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
      * and gives exact totals plus the rows every later page needs. The page
      * size (trace_limit) only bounds what THIS response emits. */
     int traversal_rc = CBM_STORE_OK;
+    int in_total = 0;
     if (do_outbound) {
-        traversal_rc =
-            bfs_union_same_name(store, nodes, node_count, "outbound", edge_types, edge_type_count,
-                                depth, MCP_BFS_LIMIT_MAX, edge_data_limit, &tr_out);
+        traversal_rc = bfs_union_same_name(store, nodes, node_count, "outbound", edge_types,
+                                           edge_type_count, depth, MCP_BFS_LIMIT_MAX,
+                                           edge_data_limit, &tr_out, NULL, include_tests);
     }
     if (traversal_rc == CBM_STORE_OK && do_inbound) {
-        traversal_rc =
-            bfs_union_same_name(store, nodes, node_count, "inbound", edge_types, edge_type_count,
-                                depth, MCP_BFS_LIMIT_MAX, edge_data_limit, &tr_in);
+        traversal_rc = bfs_union_same_name(store, nodes, node_count, "inbound", edge_types,
+                                           edge_type_count, depth, MCP_BFS_LIMIT_MAX,
+                                           edge_data_limit, &tr_in, &in_total, include_tests);
     }
     if (traversal_rc != CBM_STORE_OK) {
         cbm_store_traverse_free(&tr_out);
@@ -11321,19 +11344,16 @@ render_trace_output:;
      * include_tests=false the tables hide test-file rows, so raw
      * visited_count overstated the reachable set (a field-eval agent read
      * callers_total=175 against a handful of visible rows and distrusted
-     * the tool). Count with the same filter the emitters apply. */
+     * the tool). Apply the emitters' test-file filter; inbound summaries also
+     * exclude each seed's own recursion, as counted before the union above. */
     int out_total = 0;
     for (int i = 0; i < tr_out.visited_count; i++) {
         if (include_tests || !is_test_file(tr_out.visited[i].node.file_path)) {
             out_total++;
         }
     }
-    int in_total = 0;
-    for (int i = 0; i < tr_in.visited_count; i++) {
-        if (include_tests || !is_test_file(tr_in.visited[i].node.file_path)) {
-            in_total++;
-        }
-    }
+    /* in_total was counted per seed: the seed itself is never a row,
+     * while another same-name function remains a real caller. */
 
     free(json);
     json = NULL;
@@ -15001,6 +15021,10 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     cbm_store_node_degree(store, node->id, &in_deg, &out_deg);
     yyjson_mut_obj_add_int(doc, root_obj, "callers", in_deg);
     yyjson_mut_obj_add_int(doc, root_obj, "callees", out_deg);
+    if (trace_label_is_callable(node->label)) {
+        trace_recursion_t recursion = trace_recursion_metadata(node, 1);
+        trace_recursion_json(doc, root_obj, &recursion, true);
+    }
 
     add_snippet_coverage_note(doc, root_obj, store, node);
 

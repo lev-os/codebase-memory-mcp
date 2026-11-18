@@ -5868,6 +5868,34 @@ TEST(tslsp_captured_receiver_requires_all_writes_to_agree) {
     PASS();
 }
 
+TEST(tslsp_incomplete_var_collection_cannot_prove_unwritten) {
+    char source[1024];
+    size_t n = 0;
+    n += (size_t)snprintf(source + n, sizeof(source) - n, "var ");
+    for (int i = 0; i < 70; i++)
+        source[n++] = '[';
+    n += (size_t)snprintf(source + n, sizeof(source) - n, "hidden");
+    for (int i = 0; i < 70; i++)
+        source[n++] = ']';
+    /* No initializer: only the hoist collection visits this deep pattern. */
+    snprintf(source + n, sizeof(source) - n, ";\nfunction walk() { walk(); }\n");
+    CBMFileResult *r = extract_js(source);
+    ASSERT_NOT_NULL(r);
+    int calls = 0;
+    bool certified = false;
+    for (int i = 0; i < r->calls.count; i++) {
+        if (strcmp(r->calls.items[i].callee_name, "walk") == 0) {
+            calls++;
+            certified |= r->calls.items[i].callee_never_written;
+        }
+    }
+    cbm_free_result(r);
+    printf("  deep var calls=%d certified_unwritten=%d\n", calls, certified);
+    ASSERT_EQ(calls, 1);
+    ASSERT_FALSE(certified);
+    PASS();
+}
+
 static bool x9c_factory_fact(const char *source, bool want) {
     CBMFileResult *r = extract_ts(source);
     if (!r) return false;
@@ -6167,6 +6195,7 @@ SUITE(ts_lsp) {
 
     RUN_TEST(tslsp_x9d_repeated_declaration_work);
 
+    RUN_TEST(tslsp_incomplete_var_collection_cannot_prove_unwritten);
     RUN_TEST(tslsp_x9c_uniform_write_work_is_linear);
 
     RUN_TEST(tslsp_x9c_repeated_var_initializers_are_writes);

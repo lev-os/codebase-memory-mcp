@@ -1608,13 +1608,13 @@ TEST(atlas_self_call_is_not_use) {
                        .name = "walk",
                        .qualified_name = "self-use::walk",
                        .file_path = "src/w.c",
-                       .properties_json = "{}"};
+                       .properties_json = "{\"self_recursive\":true,\"recursive\":true}"};
     cbm_node_t used = {.project = "self-use",
                        .label = "Function",
                        .name = "used",
                        .qualified_name = "self-use::used",
                        .file_path = "src/w.c",
-                       .properties_json = "{}"};
+                       .properties_json = "{\"self_recursive\":true,\"recursive\":true}"};
     cbm_node_t caller = {.project = "self-use",
                          .label = "Function",
                          .name = "caller",
@@ -1656,8 +1656,54 @@ TEST(atlas_self_call_is_not_use) {
     ASSERT_STR_EQ(ln->status, "single");
     ASSERT_EQ(ln->in_calls, 1);
     cbm_layout_free(r);
+    bool ok = true;
+    const int64_t ids[] = {walk_id, used_id, caller_id};
+    for (int i = 0; i < 3; i++) {
+        json = cbm_atlas_symbol_json(store, "self-use", ids[i], NULL, 10, 0);
+        ASSERT_NOT_NULL(json);
+        doc = yyjson_read(json, strlen(json), 0);
+        ASSERT_NOT_NULL(doc);
+        if (i < 2) {
+            yyjson_val *node = yyjson_obj_get(yyjson_doc_get_root(doc), "node");
+            ok = yyjson_get_bool(yyjson_obj_get(node, "self_recursive")) &&
+                 yyjson_get_bool(yyjson_obj_get(node, "recursive")) && ok;
+        }
+        for (int inbound = 0; inbound < 2; inbound++) {
+            yyjson_val *section = yyjson_obj_get(yyjson_doc_get_root(doc),
+                                                inbound ? "callers" : "callees");
+            yyjson_val *items = yyjson_obj_get(section, "items");
+            int expected = inbound ? i == 1 : i == 2;
+            int rows = (int)yyjson_arr_size(items);
+            int total = (int)yyjson_get_int(yyjson_obj_get(section, "total"));
+            printf("  symbol case=%d inbound=%d rows=%d total=%d expected=%d\n",
+                   i, inbound, rows, total, expected);
+            ok = rows == total && rows == expected && ok;
+            for (size_t j = 0; j < yyjson_arr_size(items); j++)
+                ok = yyjson_get_int(yyjson_obj_get(yyjson_arr_get(items, j), "id")) != ids[i] && ok;
+            char *why = cbm_atlas_why_json(store, "self-use", ids[i], NULL, inbound != 0);
+            ASSERT_NOT_NULL(why);
+            yyjson_doc *wd = yyjson_read(why, strlen(why), 0);
+            ASSERT_NOT_NULL(wd);
+            yyjson_val *wr = yyjson_doc_get_root(wd);
+            if (i < 2) {
+                yyjson_val *symbol = yyjson_obj_get(wr, "symbol");
+                ok = yyjson_get_bool(yyjson_obj_get(symbol, "self_recursive")) &&
+                     yyjson_get_bool(yyjson_obj_get(symbol, "recursive")) && ok;
+            }
+            rows = (int)yyjson_arr_size(yyjson_obj_get(wr, "entries"));
+            total = (int)yyjson_get_int(yyjson_obj_get(wr, "total"));
+            printf("  why case=%d inbound=%d rows=%d total=%d expected=%d\n",
+                   i, inbound, rows, total, expected);
+            ok = rows == total && rows == expected && ok;
+            yyjson_doc_free(wd);
+            cbm_free(CBM_MEM_CLASS_OTHER, why);
+        }
+        yyjson_doc_free(doc);
+        cbm_free(CBM_MEM_CLASS_OTHER, json);
+    }
     cbm_store_close(store);
     cbm_atlas_metrics_cache_clear();
+    ASSERT_TRUE(ok);
     PASS();
 }
 

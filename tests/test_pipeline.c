@@ -37208,6 +37208,14 @@ TEST(pipeline_py_import_alias_self_call_has_no_self_edge) {
             char got[1024];
             js_twin_calls_at(run.db, run.project, sites[i].file, sites[i].line, got, sizeof(got));
             printf("  python alias mode=%d %s:%d [%s]\n", mode, sites[i].file, sites[i].line, got);
+            if (strcmp(sites[i].file, "pkg/rebind.py") == 0)
+                ok = js_twin_expect("local rebound alias target", got,
+                                    "pkg.rebind.walk -> pkg.rebind.other") &&
+                     ok;
+            if (strcmp(sites[i].file, "pkg/rebound.py") == 0)
+                ok = js_twin_expect("module rebound alias target", got,
+                                    "pkg.rebound.walk -> pkg.rebound.other") &&
+                     ok;
             if (strstr(got, sites[i].self)) {
                 fprintf(stderr, "  python alias kept a self edge: [%s]\n", got);
                 ok = false;
@@ -38777,6 +38785,159 @@ TEST(pipeline_js_twin_callables_scale) {
     PASS();
 }
 
+TEST(pipeline_unknown_member_write_preserves_local_types) {
+    const char *writes[] = {
+        "for (const k in o) this[k] = o[k];",
+        "window[name] = replacement;",
+        "Foo.prototype[Symbol.iterator] = replacement;",
+        "this['w\\\\alk'] = replacement;",
+    };
+    const char *files[9] = {0};
+    char sources[4][1024], paths[4][32];
+    for (int i = 0; i < 4; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "case%d.js", i);
+        snprintf(sources[i], sizeof(sources[i]),
+                 "class Foo { bar() {} walk() { this.walk(); } }\n"
+                 "function mutate(o, name, replacement) { %s }\n"
+                 "function useConst() { const x = new Foo(); x.bar(); }\n"
+                 "function useLet() { let y = new Foo(); y.bar(); }\n"
+                 "function make() { return new Foo(); }\n"
+                 "function useFactory() { make().bar(); }\n", writes[i]);
+        files[2 * i] = paths[i];
+        files[2 * i + 1] = sources[i];
+    }
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        js_exact_run_t run;
+        ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+        for (int i = 0; i < 4; i++) {
+            const char *users[] = {"useConst", "useLet", "useFactory"};
+            const int lines[] = {3, 4, 6};
+            for (int j = 0; j < 3; j++) {
+                char got[1024], want[256], what[128];
+                snprintf(what, sizeof(what), "unknown key mode=%d case=%d %s", mode, i, users[j]);
+                snprintf(want, sizeof(want), "case%d.%s -> case%d.Foo; case%d.%s -> case%d.Foo.bar",
+                         i, users[j], i, i, users[j], i);
+                if (j == 2)
+                    snprintf(want, sizeof(want),
+                             "case%d.useFactory -> case%d.Foo.bar; case%d.useFactory -> case%d.make",
+                             i, i, i, i);
+                js_twin_calls_at(run.db, run.project, paths[i], lines[j], got, sizeof(got));
+                ok = js_twin_expect(what, got, want) && ok;
+            }
+            char got[1024];
+            js_twin_calls_at(run.db, run.project, paths[i], 1, got, sizeof(got));
+            ok = js_twin_expect("unknown key cannot certify member self call", got, "") && ok;
+        }
+        js_exact_done(&run);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_member_self_calls_reject_indirect_writes) {
+    const char *sources[] = {
+        "class C { walk() { Object.defineProperty(this, 'walk', {value: replacement}); this.walk(); } }\n",
+        "class C { walk() { Object.defineProperties(this, {walk: {value: replacement}}); this.walk(); } }\n",
+        "class C { walk() { Object.assign(this, {walk: replacement}); this.walk(); } }\n",
+        "class C { walk() { Object.assign(C.prototype, {walk: replacement}); this.walk(); } }\n",
+        "class C { walk() { Reflect.set(this, 'walk', replacement); this.walk(); } }\n",
+        "class C { walk() { const that = this; that.walk = replacement; this.walk(); } }\n",
+        "class C { walk() { const self = this; self.walk = replacement; this.walk(); } }\n",
+        "class C { static walk() { C.walk = replacement; C.walk(); } }\n",
+        "class C { static walk() { C.walk = replacement; this.walk(); } }\n",
+        "const api = { walk() { api.walk = replacement; api.walk(); } };\n",
+        "class C { walk() { other.walk = replacement; this.walk(); } }\n",
+        "class C { walk() { other.step = replacement; this.walk(); } }\n",
+    };
+    const char *files[25] = {0};
+    char paths[12][32];
+    for (int i = 0; i < 12; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "case%d.js", i);
+        files[2 * i] = paths[i];
+        files[2 * i + 1] = sources[i];
+    }
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        js_exact_run_t run;
+        ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+        for (int i = 0; i < 12; i++) {
+            char got[1024], what[128];
+            snprintf(what, sizeof(what), "indirect write mode=%d case=%d", mode, i);
+            js_twin_calls_at(run.db, run.project, paths[i], 1, got, sizeof(got));
+            ok = js_twin_expect(what, got,
+                                i == 11 ? "case11.C.walk -> case11.C.walk" : "") && ok;
+        }
+        js_exact_done(&run);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_js_self_edge_requires_unwritten_binding) {
+    static const char *const files[] = {
+        "member.js",
+        "function replacement() {}\n"
+        "class C { walk() { this.walk = replacement; this.walk(); } }\n"
+        "class D { step() { this.step(); } }\n"
+        "D.prototype.step = replacement;\n"
+        "class Stable { run() { this.other = replacement; this.run(); } }\n"
+        "class Wrapped { turn() { (this).turn = replacement; this.turn(); } }\n"
+        "class Bracket { spin() { this.spin(); } }\n"
+        "Bracket['prototype'].spin = replacement;\n"
+        "class Grouped { next() { this.next(); } }\n"
+        "(Grouped.prototype).next = replacement;\n",
+        "script.js",
+        "function replacement() {}\n"
+        "function walk() { globalThis.walk = replacement; walk(); }\n"
+        "function step() { window.step = replacement; step(); }\n"
+        "function run() { self.run = replacement; run(); }\n"
+        "function stable() { stable(); }\n"
+        "function wrapped() { (globalThis).wrapped = replacement; wrapped(); }\n",
+        "self.js",
+        "import { walk as again } from './self';\n"
+        "function replacement() {}\n"
+        "export function walk() { again(); }\n"
+        "walk = replacement;\n",
+        "clean.js",
+        "import { walk as again } from './clean';\n"
+        "export function walk() { again(); }\n",
+        NULL};
+    static const struct {
+        const char *file;
+        int line;
+        const char *want;
+    } cases[] = {{"member.js", 2, ""},
+                 {"member.js", 3, ""},
+                 {"member.js", 5, "member.Stable.run -> member.Stable.run"},
+                 {"member.js", 6, ""},
+                 {"member.js", 7, ""},
+                 {"member.js", 9, ""},
+                 {"script.js", 2, ""},
+                 {"script.js", 3, ""},
+                 {"script.js", 4, ""},
+                 {"script.js", 5, "script.stable -> script.stable"},
+                 {"script.js", 6, ""},
+                 {"self.js", 3, ""},
+                 {"clean.js", 2, "clean.walk -> clean.walk"}};
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        js_exact_run_t run;
+        ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            char got[1024], what[128];
+            snprintf(what, sizeof(what), "binding mode=%d %s:%d", mode, cases[i].file,
+                     cases[i].line);
+            js_twin_calls_at(run.db, run.project, cases[i].file, cases[i].line, got, sizeof(got));
+            printf("  %s [%s]\n", what, got);
+            ok = js_twin_expect(what, got, cases[i].want) && ok;
+        }
+        js_exact_done(&run);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 TEST(pipeline_x9c_imported_class_write_withholds_factory) {
     char tmp[256] = "/tmp/cbm_x9c_class_write_XXXXXX", db[512], lib[512], got[1024];
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
@@ -38858,6 +39019,47 @@ TEST(pipeline_x9c_transparent_object_literals) {
         ok = js_twin_expect("literal cannot borrow free member", got, "") && ok;
         cbm_pipeline_free(p);
         th_rmtree(tmp);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pipeline_js_empty_and_quote_keys_are_distinct) {
+    static const char *const files[] = {"main.js",
+                                        "function work() {} function halt() {}\n"
+                                        "const ops = {\n"
+                                        "  ''() { work(); },\n"
+                                        "  '\"\"'() { halt(); },\n"
+                                        "  'a.b'() { work(); }\n"
+                                        "};\n"
+                                        "const alt = {\n"
+                                        "  ''() { halt(); },\n"
+                                        "  '\"\"'() { work(); },\n"
+                                        "  'a.b'() { halt(); }\n"
+                                        "};\n",
+                                        NULL};
+    static const struct {
+        int line;
+        const char *name, *qn, *target;
+    } cases[] = {{3, "\"\"", "main.ops.\"\"", "main.ops.\"\" -> main.work"},
+                 {4, "\"\"", "main.ops.%22%22", "main.ops.%22%22 -> main.halt"},
+                 {5, "a.b", "main.ops.a%2Eb", "main.ops.a%2Eb -> main.work"},
+                 {8, "\"\"", "main.alt.\"\"", "main.alt.\"\" -> main.halt"},
+                 {9, "\"\"", "main.alt.%22%22", "main.alt.%22%22 -> main.work"},
+                 {10, "a.b", "main.alt.a%2Eb", "main.alt.a%2Eb -> main.halt"}};
+    bool ok = true;
+    for (int mode = 0; mode < 2; mode++) {
+        js_exact_run_t run;
+        ASSERT_TRUE(js_exact_index(&run, files, mode != 0));
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            char got[1024];
+            js_twin_qn_at(run.db, run.project, "main.js", cases[i].name, cases[i].line, got,
+                          sizeof(got));
+            ok = js_twin_expect("quoted key QN", got, cases[i].qn) && ok;
+            js_twin_calls_at(run.db, run.project, "main.js", cases[i].line, got, sizeof(got));
+            ok = js_twin_expect("quoted key caller", got, cases[i].target) && ok;
+        }
+        js_exact_done(&run);
     }
     ASSERT_TRUE(ok);
     PASS();
@@ -39209,6 +39411,10 @@ SUITE(pipeline) {
 
     RUN_TEST(pipeline_x9d_default_export_binding);
 
+    RUN_TEST(pipeline_unknown_member_write_preserves_local_types);
+    RUN_TEST(pipeline_member_self_calls_reject_indirect_writes);
+    RUN_TEST(pipeline_js_self_edge_requires_unwritten_binding);
+    RUN_TEST(pipeline_js_empty_and_quote_keys_are_distinct);
     RUN_TEST(pipeline_x9c_named_class_static_members_are_values);
     RUN_TEST(pipeline_x9c_return_import_work_is_linear);
 

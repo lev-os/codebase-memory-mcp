@@ -205,6 +205,10 @@ typedef struct {
      * anchor, `value` the edge type (NULL = any), `exists_dir` the direction
      * (0 = outbound, 1 = inbound, 2 = any). */
     int exists_dir;
+    bool exists_exclude_self; /* explicit WHERE other <> anchor inside EXISTS */
+    const char *exists_anchor_label;
+    const char *exists_far_label;
+    const char *exists_far_variable; /* only set when the far endpoint is also bound */
     /* Multi-arg scalar function on the LHS, e.g. coalesce(f.depth, 0) >= 2
      * (#874). NULL func = plain variable/property LHS. */
     const char *func;

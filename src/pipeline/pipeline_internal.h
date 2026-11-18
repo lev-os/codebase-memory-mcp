@@ -1832,8 +1832,13 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *     escaped in a literal key's QN segment. */
 /* 31: constructor proofs, captured writes and default/literal values changed
  *     CALLS for unchanged importers; rebuild stored graphs once. */
-/* Default-export identity and return proofs also change unchanged importers. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 32 };
+/* 32: self edges require unwritten member/global/alias targets; unchanged
+ *     files rebuild to remove spelling-only recursion and repair literal keys. */
+/* 33: unknown member keys no longer invalidate lexical type proofs; member
+ *     self calls require complete property-write evidence on unchanged files. */
+/* 34: default-export identity, await adoption, member stability and literal
+ *     object members change CALLS for unchanged importers. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 34 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
