@@ -3227,18 +3227,35 @@ static const CBMType *ts_method_signature_for_receiver(TSLSPContext *ctx, const 
 /* Return the function signature selected at this call site.  This is the
  * single boundary shared by chained return typing and contextual callback
  * typing; both must observe the same overload as edge resolution. */
+/* A literal bracket key denotes the same member as its plain spelling.
+ * Dynamic and escaped keys remain unproved. */
+static char *ts_member_key(TSLSPContext *ctx, TSNode member) {
+    if (node_kind_is(member, "member_expression"))
+        return node_text(ctx, ts_node_child_by_field_name(member, "property", 8));
+    if (!node_kind_is(member, "subscript_expression"))
+        return NULL;
+    TSNode index = ts_node_child_by_field_name(member, "index", 5);
+    if (!node_kind_is(index, "string") && !node_kind_is(index, "number"))
+        return NULL;
+    const char *raw = node_text(ctx, index);
+    if (!raw || strchr(raw, '\\'))
+        return NULL;
+    if (node_kind_is(index, "number") &&
+        (strspn(raw, "0123456789") != strlen(raw) || (raw[0] == '0' && raw[1])))
+        return NULL;
+    return cbm_js_literal_key_name(ctx->arena, index, ctx->source);
+}
+
 static const CBMType *ts_signature_for_call(TSLSPContext *ctx, TSNode function, TSNode args) {
     if (!ctx || ts_node_is_null(function))
         return NULL;
 
-    if (node_kind_is(function, "member_expression")) {
+    if (node_kind_is(function, "member_expression") || node_kind_is(function, "subscript_expression")) {
         TSNode object = ts_node_child_by_field_name(function, "object", TS_LSP_FIELD_LEN("object"));
-        TSNode property =
-            ts_node_child_by_field_name(function, "property", TS_LSP_FIELD_LEN("property"));
-        if (ts_node_is_null(object) || ts_node_is_null(property))
+        if (ts_node_is_null(object))
             return NULL;
 
-        char *method_name = node_text(ctx, property);
+        char *method_name = ts_member_key(ctx, function);
         if (!method_name)
             return NULL;
 
@@ -3396,10 +3413,9 @@ const CBMType *ts_eval_expr_type(TSLSPContext *ctx, TSNode node) {
     } else if (strcmp(kind, "member_expression") == 0 ||
                strcmp(kind, "subscript_expression") == 0) {
         TSNode obj = ts_node_child_by_field_name(node, "object", TS_LSP_FIELD_LEN("object"));
-        TSNode prop = ts_node_child_by_field_name(node, "property", TS_LSP_FIELD_LEN("property"));
-        if (!ts_node_is_null(obj) && !ts_node_is_null(prop)) {
+        if (!ts_node_is_null(obj)) {
             const CBMType *recv = ts_eval_expr_type(ctx, obj);
-            char *pname = node_text(ctx, prop);
+            char *pname = ts_member_key(ctx, node);
             if (pname)
                 result = lookup_member_type(ctx, recv, pname);
         }
@@ -4456,11 +4472,10 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
     const char *fk = ts_node_type(fn);
 
     // member_expression: obj.method(...)
-    if (strcmp(fk, "member_expression") == 0) {
+    if (strcmp(fk, "member_expression") == 0 || strcmp(fk, "subscript_expression") == 0) {
         TSNode obj = ts_node_child_by_field_name(fn, "object", TS_LSP_FIELD_LEN("object"));
-        TSNode prop = ts_node_child_by_field_name(fn, "property", TS_LSP_FIELD_LEN("property"));
-        if (!ts_node_is_null(obj) && !ts_node_is_null(prop)) {
-            char *mname = node_text(ctx, prop);
+        if (!ts_node_is_null(obj)) {
+            char *mname = ts_member_key(ctx, fn);
             if (mname) {
                 // Identifier as namespace import: `name.fn()` or `mod.fn()`.
                 if (node_kind_is(obj, "identifier")) {

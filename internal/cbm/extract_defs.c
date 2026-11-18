@@ -15912,6 +15912,58 @@ static int js_def_start_cmp(const void *pa, const void *pb) {
 
 /* Callable QNs are final only after twin splitting. Match a literal's own
  * function syntax by byte position, never by its method's leaf name. */
+/* A shorthand member reads a stable lexical function/const binding. */
+static TSNode js_shorthand_callable(CBMExtractCtx *ctx, TSNode member, const char *name) {
+    TSNode binding = cbm_ts_lexical_binding_at(member, ctx->source, name, NULL);
+    if (ts_node_is_null(binding))
+        return (TSNode){0};
+    TSNode fn = binding;
+    const char *kind = ts_node_type(binding);
+    if (strcmp(kind, "variable_declarator") == 0) {
+        TSNode declaration = ts_node_parent(binding);
+        if (strcmp(ts_node_type(declaration), "lexical_declaration") != 0 ||
+            !js_node_text_is(ts_node_child(declaration, 0), ctx->source, "const"))
+            return (TSNode){0};
+        fn = cbm_ts_unwrap_value(ts_node_child_by_field_name(binding, "value", 5));
+    } else if (strcmp(kind, "function_declaration") != 0 &&
+               strcmp(kind, "generator_function_declaration") != 0) {
+        return (TSNode){0};
+    }
+    if (ts_node_is_null(fn) || !js_twin_bodied_kind(ts_node_type(fn)))
+        return (TSNode){0};
+    /* A same-spelled write in another scope can only withhold the fact. */
+    CBMHashTable *writes = cbm_ht_create(4);
+    bool stable = writes != NULL;
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    while (stable) {
+        TSNode node = ts_tree_cursor_current_node(&cursor), target = {0};
+        const char *nk = ts_node_type(node);
+        if (strcmp(nk, "with_statement") == 0 || cbm_ts_direct_eval(node, ctx->source)) {
+            stable = false;
+            break;
+        }
+        if (strcmp(nk, "assignment_expression") == 0 ||
+            strcmp(nk, "augmented_assignment_expression") == 0 ||
+            (strcmp(nk, "for_in_statement") == 0 &&
+             ts_node_is_null(ts_node_child_by_field_name(node, "kind", 4))))
+            target = ts_node_child_by_field_name(node, "left", 4);
+        else if (strcmp(nk, "update_expression") == 0)
+            target = ts_node_named_child(node, 0);
+        if (!js_return_write_pattern(ctx, writes, target, 0) || cbm_ht_has(writes, name)) {
+            stable = false;
+            break;
+        }
+        if (ts_tree_cursor_goto_first_child(&cursor)) continue;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) goto done;
+        }
+    }
+done:
+    ts_tree_cursor_delete(&cursor);
+    cbm_ht_free(writes);
+    return stable ? fn : (TSNode){0};
+}
+
 static const char **js_object_members(CBMExtractCtx *ctx, TSNode object, CBMDefinition **defs,
                                       int count) {
     uint32_t n = ts_node_named_child_count(object);
@@ -15945,13 +15997,10 @@ static const char **js_object_members(CBMExtractCtx *ctx, TSNode object, CBMDefi
                 key = cbm_node_text(ctx->arena, name, ctx->source);
             } else if (strcmp(nk, "string") == 0) {
                 const char *raw = cbm_node_text(ctx->arena, name, ctx->source);
-                size_t len = raw ? strlen(raw) : 0;
-                if (len >= 2 && !strchr(raw, '\\'))
-                    key = cbm_arena_strndup(ctx->arena, raw + 1, len - 2);
-                fn = (TSNode){0};
+                if (raw && !strchr(raw, '\\'))
+                    key = cbm_js_literal_key_name(ctx->arena, name, ctx->source);
             } else if (strcmp(nk, "number") == 0) {
-                key = cbm_node_text(ctx->arena, name, ctx->source);
-                fn = (TSNode){0};
+                key = cbm_js_literal_key_name(ctx->arena, name, ctx->source);
             }
         }
         /* A computed key can replace any earlier member. Every property,
@@ -15965,6 +16014,8 @@ static const char **js_object_members(CBMExtractCtx *ctx, TSNode object, CBMDefi
             members = NULL;
             break;
         }
+        if (strcmp(kind, "shorthand_property_identifier") == 0)
+            fn = js_shorthand_callable(ctx, member, key);
         if (ts_node_is_null(fn))
             continue;
         uint32_t start = ts_node_start_byte(fn);

@@ -39131,7 +39131,33 @@ TEST(pipeline_x9d_member_edit_incremental) {
     PASS();
 }
 
+TEST(pipeline_x9d_literal_members) {
+    const char *sources[] = {
+        "export const api2 = { 'run'() {} };",
+        "export const api2 = { 7() {} };",
+        "function run() {} export const api2 = { run };",
+        "const run = () => {}; export const api2 = { run };",
+        "let run = () => {}; run = replacement; export const api2 = { run };",
+        "function outer() { function run() {} } export const api2 = { run };",
+        "function run() {} run = replacement; export const api2 = { run };",
+        "function run() {} export const api2 = { 'run'() {} };",
+        "function run() {} run! = replacement; export const api2 = { run };",
+    };
+    const char *calls[] = {"api2.run();", "api2[7]();", "api2.run();",
+                           "api2.run();", "api2.run();", "api2.run();", "api2.run();", "api2.run();", "api2.run();"};
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        ok = x9d_calls(sources[i], calls[i], i < 4
+                        ? (i == 1 ? "main.use -> lib.7" : "main.use -> lib.run")
+                        : (i == 7 ? "main.use -> lib.api2.run" : "")) && ok;
+    ok = x9d_calls(sources[0], "api2['run']();", "main.use -> lib.run") && ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_x9d_literal_members);
+
     RUN_TEST(pipeline_x9d_mutated_members);
     RUN_TEST(pipeline_x9d_member_edit_incremental);
 
